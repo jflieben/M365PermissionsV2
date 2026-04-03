@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET 8
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Restore dependencies
+      run: dotnet restore M365PermissionsV2.sln
+
+    - name: Build
+      run: dotnet build M365PermissionsV2.sln -c Release --no-restore
+
+    - name: Run C# tests
+      run: dotnet test M365PermissionsV2.sln -c Release --no-build --verbosity normal
+
+    - name: Build module
+      shell: pwsh
+      run: ./build/Build-Module.ps1 -Configuration Release
+
+    - name: Run Pester tests
+      shell: pwsh
+      run: |
+        Install-Module -Name Pester -MinimumVersion 5.0 -Force -Scope CurrentUser
+        $result = Invoke-Pester -Path ./tests/M365PermissionsV2.Tests.ps1 -PassThru -Output Detailed
+        if ($result.FailedCount -gt 0) { exit 1 }
+
+    - name: Upload module artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: M365PermissionsV2-module
+        path: module/
