@@ -8,7 +8,7 @@
     <AssemblyName>M365Permissions.Engine</AssemblyName>
     <Version>2.0.0</Version>
     <Authors>Jos Lieben</Authors>
-    <Description>Core engine for M365PermissionsV2 — SQLite storage, HTTP server, Graph/REST API clients, scanning, export</Description>
+    <Description>Core engine for M365Permissions — SQLite storage, HTTP server, Graph/REST API clients, scanning, export</Description>
   </PropertyGroup>
 
   <ItemGroup>

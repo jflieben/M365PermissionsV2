@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Publishes M365PermissionsV2 module to PSGallery.
+    Publishes M365Permissions module to PSGallery.
 .PARAMETER NuGetApiKey
     PSGallery API key.
 .PARAMETER WhatIf
@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 
 # Validate module loads
 Write-Host "Validating module manifest..." -ForegroundColor Cyan
-$manifest = Test-ModuleManifest -Path (Join-Path $ModulePath 'M365PermissionsV2.psd1')
+$manifest = Test-ModuleManifest -Path (Join-Path $ModulePath 'M365Permissions.psd1')
 Write-Host "Module: $($manifest.Name) v$($manifest.Version)" -ForegroundColor Green
 
 # Check lib/ exists

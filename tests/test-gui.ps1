@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Manual smoke test for the M365PermissionsV2 GUI.
+    Manual smoke test for the M365Permissions GUI.
 .DESCRIPTION
     Starts the GUI server and runs basic HTTP checks against all API endpoints.
 .PARAMETER Port
@@ -14,7 +14,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $baseUrl = "http://localhost:$Port"
 
-Write-Host "Testing M365PermissionsV2 GUI at $baseUrl" -ForegroundColor Cyan
+Write-Host "Testing M365Permissions GUI at $baseUrl" -ForegroundColor Cyan
 Write-Host "=" * 60
 
 function Test-Endpoint {

@@ -1,4 +1,4 @@
--- M365PermissionsV2 SQLite Schema
+-- M365Permissions SQLite Schema
 -- Applied automatically on first run via SqliteDb.Initialize()
 
 CREATE TABLE IF NOT EXISTS config (

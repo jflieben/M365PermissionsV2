@@ -11,7 +11,7 @@ using M365Permissions.Engine.Scanning;
 namespace M365Permissions.Engine;
 
 /// <summary>
-/// Main entry point / facade for the M365PermissionsV2 engine.
+/// Main entry point / facade for the M365Permissions engine.
 /// Wires together all subsystems: database, auth, HTTP server, scanning, export.
 /// Called from the PowerShell module wrapper.
 /// </summary>

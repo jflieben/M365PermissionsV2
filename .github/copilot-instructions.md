@@ -1,4 +1,4 @@
-# M365PermissionsV2 — Copilot Instructions
+# M365Permissions — Copilot Instructions
 
 PowerShell module with a compiled .NET 8 engine that scans Microsoft 365 permissions across SharePoint, Entra ID, Exchange Online, OneDrive, Power BI, Power Platform, Azure RBAC, and Azure DevOps.
 
@@ -15,8 +15,8 @@ PowerShell module with a compiled .NET 8 engine that scans Microsoft 365 permiss
 
 ## Project Structure
 ```
-M365PermissionsV2/
-  M365PermissionsV2.sln           # Solution file
+M365Permissions/
+  M365Permissions.sln           # Solution file
   src/
     M365Permissions.Engine/        # .NET 8 class library
       Models/                      # PermissionEntry, ScanInfo, AppConfig, etc.
@@ -29,8 +29,8 @@ M365PermissionsV2/
       Engine.cs                    # Main facade wiring all subsystems
     M365Permissions.Engine.Tests/  # xUnit tests
   module/                          # PowerShell module (published to PSGallery)
-    M365PermissionsV2.psd1         # Module manifest
-    M365PermissionsV2.psm1         # Entry point (loads DLLs, auto-starts GUI)
+    M365Permissions.psd1         # Module manifest
+    M365Permissions.psm1         # Entry point (loads DLLs, auto-starts GUI)
     public/                        # 12 exported cmdlet wrappers
     gui/static/                    # SPA frontend (index.html, app.js, style.css)
     lib/                           # Compiled DLLs (created by Build-Module.ps1)
@@ -40,10 +40,10 @@ M365PermissionsV2/
 
 ## Development Workflow
 1. Make code changes in `src/M365Permissions.Engine/`
-2. Build: `dotnet build M365PermissionsV2.sln`
-3. Test C#: `dotnet test M365PermissionsV2.sln`
+2. Build: `dotnet build M365Permissions.sln`
+3. Test C#: `dotnet test M365Permissions.sln`
 4. Build module: `pwsh ./build/Build-Module.ps1` (or `-Configuration Debug` for dev)
-5. Test PowerShell: `pwsh -c "Invoke-Pester ./tests/M365PermissionsV2.Tests.ps1"`
+5. Test PowerShell: `pwsh -c "Invoke-Pester ./tests/M365Permissions.Tests.ps1"`
 8. Ensure all changes made would work efficiently and accurately and retries effectively in larger tenants
 9. Test GUI manually: Import module → verify pages work in browser
 10. Run all scans and verify results
@@ -56,7 +56,7 @@ The module requires compiled DLLs in `module/lib/` before it can be imported. Wi
 **Quick local test cycle:**
 ```powershell
 dotnet publish src/M365Permissions.Engine -c Debug -o module/lib
-pwsh -NoProfile -c "Import-Module ./module/M365PermissionsV2.psd1 -Force; Get-M365Config"
+pwsh -NoProfile -c "Import-Module ./module/M365Permissions.psd1 -Force; Get-M365Config"
 ```
 
 **IMPORTANT: DLL locking**
@@ -197,7 +197,7 @@ C# `JsonNamingPolicy.CamelCase` produces these names. JS must match exactly:
 
 ## Validation
 - After C# changes: `dotnet build && dotnet test`
-- After PS changes: `Invoke-Pester ./tests/M365PermissionsV2.Tests.ps1`
+- After PS changes: `Invoke-Pester ./tests/M365Permissions.Tests.ps1`
 - Before publishing: Run full build pipeline via `./build/Build-Module.ps1`
 - GUI changes: Refresh browser (no build step needed)
 - After lifecycle/cleanup changes: Test full load → remove → re-import cycle in a single pwsh session

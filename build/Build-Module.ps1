@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds the M365PermissionsV2 module — compiles .NET engine, copies DLLs + GUI to module/lib/.
+    Builds the M365Permissions module — compiles .NET engine, copies DLLs + GUI to module/lib/.
 .DESCRIPTION
     Runs dotnet publish on the Engine project and assembles the final module folder.
     If module/lib/ DLLs are locked (e.g. module is loaded in another PS session), the script
@@ -18,7 +18,7 @@ $engineProject = Join-Path $repoRoot 'src' 'M365Permissions.Engine' 'M365Permiss
 $publishDir = Join-Path $repoRoot 'src' 'M365Permissions.Engine' 'bin' $Configuration 'net8.0' 'publish'
 
 # Sync version from psd1 (single source of truth) → csproj
-$psd1Path = Join-Path $repoRoot 'module' 'M365PermissionsV2.psd1'
+$psd1Path = Join-Path $repoRoot 'module' 'M365Permissions.psd1'
 $manifest = Import-PowerShellDataFile $psd1Path
 $version = $manifest.ModuleVersion
 $csprojContent = Get-Content $engineProject -Raw
@@ -36,8 +36,8 @@ if (Test-Path $lockTarget) {
     }
     catch {
         Write-Host "`nERROR: module/lib/ DLLs are locked by another process." -ForegroundColor Red
-        Write-Host "This usually means M365PermissionsV2 is imported in another PowerShell session.`n" -ForegroundColor Yellow
-        Write-Host "Fix: close that PS session (or run Remove-Module M365PermissionsV2), then retry." -ForegroundColor Yellow
+        Write-Host "This usually means M365Permissions is imported in another PowerShell session.`n" -ForegroundColor Yellow
+        Write-Host "Fix: close that PS session (or run Remove-Module M365Permissions), then retry." -ForegroundColor Yellow
         throw "Cannot overwrite locked DLLs in $OutputPath. Close the PowerShell session that has the module loaded."
     }
 }

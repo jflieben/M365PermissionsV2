@@ -4,7 +4,7 @@
 
 Add-Type -AssemblyName System.Security
 
-$rtPath = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'LiebenConsultancy' 'M365PermissionsV2' '.rt'
+$rtPath = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'LiebenConsultancy' 'M365Permissions' '.rt'
 if (-not (Test-Path $rtPath)) { Write-Error "No refresh token found at $rtPath"; exit 1 }
 
 $encrypted = [System.IO.File]::ReadAllBytes($rtPath)

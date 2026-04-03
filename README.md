@@ -1,4 +1,4 @@
-# M365PermissionsV2
+# M365Permissions
 
 A PowerShell module that scans and reports on Microsoft 365 permissions across **SharePoint**, **Entra ID**, **Exchange Online**, **OneDrive**, **Power BI**, **Power Platform**, **Azure RBAC**, and **Azure DevOps**.
 
@@ -18,14 +18,14 @@ Built on a compiled .NET 8 engine with embedded SQLite database and web-based GU
 ## Installation
 
 ```powershell
-Install-PSResource -Name M365PermissionsV2 -Repository PSGallery
+Install-PSResource -Name M365Permissions -Repository PSGallery
 ```
 
 ## Quick Start
 
 ```powershell
 # Import module — the GUI opens automatically in your browser
-Import-Module M365PermissionsV2
+Import-Module M365Permissions
 ```
 
 Everything happens in the browser: connect to a tenant, configure scans, view results, export reports, and compare scans. You can scan multiple tenants by disconnecting from one and connecting to another — each scan records which tenant it belongs to.
@@ -56,7 +56,7 @@ To switch tenants, use the disconnect button (⏏) in the navigation bar or dash
 
 ## Configuration
 
-Settings are managed through the GUI's Settings page and stored in `%APPDATA%/LiebenConsultancy/M365PermissionsV2/`:
+Settings are managed through the GUI's Settings page and stored in `%APPDATA%/LiebenConsultancy/M365Permissions/`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|

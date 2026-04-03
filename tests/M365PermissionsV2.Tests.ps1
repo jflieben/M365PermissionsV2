@@ -1,10 +1,10 @@
 #Requires -Modules Pester
 
-Describe 'M365PermissionsV2 Module' {
+Describe 'M365Permissions Module' {
 
     BeforeAll {
         $modulePath = Join-Path $PSScriptRoot '..' 'module'
-        $manifestPath = Join-Path $modulePath 'M365PermissionsV2.psd1'
+        $manifestPath = Join-Path $modulePath 'M365Permissions.psd1'
     }
 
     Context 'Module Manifest' {
@@ -14,7 +14,7 @@ Describe 'M365PermissionsV2 Module' {
 
         It 'Has the correct module name' {
             $manifest = Test-ModuleManifest -Path $manifestPath
-            $manifest.Name | Should -Be 'M365PermissionsV2'
+            $manifest.Name | Should -Be 'M365Permissions'
         }
 
         It 'Exports expected functions' {
@@ -49,7 +49,7 @@ Describe 'M365PermissionsV2 Module' {
         }
 
         It 'Module psm1 has valid syntax' {
-            $psm1Path = Join-Path $modulePath 'M365PermissionsV2.psm1'
+            $psm1Path = Join-Path $modulePath 'M365Permissions.psm1'
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile($psm1Path, [ref]$null, [ref]$errors)
             $errors | Should -BeNullOrEmpty

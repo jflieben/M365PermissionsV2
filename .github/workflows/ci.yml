@@ -19,13 +19,13 @@ jobs:
         dotnet-version: '8.0.x'
 
     - name: Restore dependencies
-      run: dotnet restore M365PermissionsV2.sln
+      run: dotnet restore M365Permissions.sln
 
     - name: Build
-      run: dotnet build M365PermissionsV2.sln -c Release --no-restore
+      run: dotnet build M365Permissions.sln -c Release --no-restore
 
     - name: Run C# tests
-      run: dotnet test M365PermissionsV2.sln -c Release --no-build --verbosity normal
+      run: dotnet test M365Permissions.sln -c Release --no-build --verbosity normal
 
     - name: Build module
       shell: pwsh
@@ -35,11 +35,11 @@ jobs:
       shell: pwsh
       run: |
         Install-Module -Name Pester -MinimumVersion 5.0 -Force -Scope CurrentUser
-        $result = Invoke-Pester -Path ./tests/M365PermissionsV2.Tests.ps1 -PassThru -Output Detailed
+        $result = Invoke-Pester -Path ./tests/M365Permissions.Tests.ps1 -PassThru -Output Detailed
         if ($result.FailedCount -gt 0) { exit 1 }
 
     - name: Upload module artifact
       uses: actions/upload-artifact@v4
       with:
-        name: M365PermissionsV2-module
+        name: M365Permissions-module
         path: module/
