@@ -707,6 +707,23 @@
                     'Area / iteration path security',
                 ],
             },
+            {
+                val: 'Purview',
+                icon: '🛡️',
+                label: 'Purview Compliance',
+                checked: false,
+                scans: [
+                    'Compliance Center role groups (Get-RoleGroup)',
+                    'Role group members (Get-RoleGroupMember)',
+                    'Built-in and custom compliance role groups',
+                ],
+                notScanned: [
+                    'Sensitivity label policies and assignments',
+                    'Data Loss Prevention (DLP) policies',
+                    'Retention policies and labels',
+                    'eDiscovery case-level permissions',
+                ],
+            },
         ];
 
         app.innerHTML = `
@@ -1147,7 +1164,7 @@
         const option = sel.selectedOptions[0];
         if (!option) return;
         const text = option.textContent;
-        const allTypes = ['SharePoint', 'Entra', 'Exchange', 'OneDrive', 'PowerBI', 'PowerAutomate', 'Azure', 'AzureDevOps'];
+        const allTypes = ['SharePoint', 'Entra', 'Exchange', 'OneDrive', 'PowerBI', 'PowerAutomate', 'Azure', 'AzureDevOps', 'Purview'];
         const missing = allTypes.filter(t => !text.includes(t));
         if (missing.length > 0) {
             notice.innerHTML = `<div class="notice notice-info">This scan did not include: <strong>${missing.join(', ')}</strong>. Results for those services will not appear.</div>`;

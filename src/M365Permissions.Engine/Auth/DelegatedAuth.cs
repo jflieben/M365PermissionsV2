@@ -248,6 +248,7 @@ public sealed class DelegatedAuth
         "graph" => GraphScope,
         "sharepoint" => $"https://{GetSharePointHost()}/.default offline_access",
         "exchange" => "https://outlook.office365.com/.default offline_access",
+        "compliance" => "https://ps.compliance.protection.outlook.com/.default offline_access",
         "powerbi" => "https://analysis.windows.net/powerbi/api/.default offline_access",
         // BAP + PowerApps APIs use service.powerapps.com audience
         "powerapps" => "https://service.powerapps.com/.default offline_access",

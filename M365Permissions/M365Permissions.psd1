@@ -1,6 +1,6 @@
 @{
     RootModule           = 'M365Permissions.psm1'
-    ModuleVersion        = '2.0.0'
+    ModuleVersion        = '2.0.1'
     CompatiblePSEditions = @('Core')
     GUID                 = '748c97a1-b861-4bc5-8455-53494b565526'
     Author               = 'Jos Lieben (jos@lieben.nu)'

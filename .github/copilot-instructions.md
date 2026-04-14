@@ -179,6 +179,7 @@ C# `JsonNamingPolicy.CamelCase` produces these names. JS must match exactly:
 - **Power Platform**: Environment roles, flow ownership/sharing, app permissions, connectors
 - **Azure RBAC**: Subscription and resource group role assignments
 - **Azure DevOps**: Organization and project-level security group memberships (delegated auth only — SPN org enumeration not supported)
+- **Purview**: Security & Compliance Center role groups and members via compliance endpoint (ps.compliance.protection.outlook.com)
 
 ## Azure DevOps Scanner Details
 - Uses Azure DevOps REST API with OAuth2 delegated authentication
@@ -190,6 +191,17 @@ C# `JsonNamingPolicy.CamelCase` produces these names. JS must match exactly:
 - Reports project-level roles (Contributors, Readers, Project Administrators, etc.) and org-level roles (Project Collection Administrators)
 - SPN-based org enumeration is NOT supported by Azure DevOps — requires delegated auth
 - **Setup**: In Entra ID → App registrations → `0ee7aa45-310d-4b82-9cb5-11cc01ad38e4` → API permissions → Add → Azure DevOps → Delegated → user_impersonation → Grant admin consent
+
+## Purview Scanner Details
+- Scans Security & Compliance Center role groups via the compliance-specific endpoint (`ps.compliance.protection.outlook.com`)
+- Uses `Get-RoleGroup` and `Get-RoleGroupMember` via InvokeCommand REST pattern
+- Uses regional discovery: initial request to `ps.compliance.protection.outlook.com` returns 302 redirect revealing the regional server (e.g., `nam12b.ps.compliance.protection.outlook.com`)
+- Uses the authenticated user's tenant ID in the API URL path
+- OAuth scope: `https://ps.compliance.protection.outlook.com/.default offline_access` (separate from Exchange scope)
+- Requires Exchange Administrator or Compliance Administrator role
+- Reports both built-in and custom compliance role groups with their members
+- Does NOT scan Entra directory roles (those are covered by the Entra scanner)
+- **Setup**: No additional app registration permissions needed — the compliance scope uses the same app registration
 
 ## Future Phases
 - Phase 2: Devices

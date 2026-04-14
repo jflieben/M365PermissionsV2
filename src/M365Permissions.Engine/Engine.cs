@@ -180,6 +180,7 @@ public sealed class Engine : IDisposable
         _orchestrator.RegisterProvider(new PowerAutomateScanner(_auth));
         _orchestrator.RegisterProvider(new AzureScanner(_auth));
         _orchestrator.RegisterProvider(new AzureDevOpsScanner(_auth));
+        _orchestrator.RegisterProvider(new PurviewScanner(_auth));
     }
 
     // ── Configuration ───────────────────────────────────────────

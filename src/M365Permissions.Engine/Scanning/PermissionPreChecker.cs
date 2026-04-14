@@ -78,6 +78,10 @@ public sealed class PermissionPreChecker
                     case "azuredevops":
                         await CheckAzureDevOpsAsync(issues, ct);
                         break;
+                    case "purview":
+                        await CheckPurviewAsync(issues, ct);
+                        CheckPurviewRoles(issues, userRoles);
+                        break;
                 }
             }
             catch (Exception ex)
@@ -428,5 +432,53 @@ public sealed class PermissionPreChecker
         issues.Add("Missing role: Power Platform Administrator (or Global Administrator). " +
             "Without this role the BAP admin API for environment enumeration may be restricted. " +
             "Only environments and flows you own or have been shared with will be scanned.");
+    }
+
+    private async Task CheckPurviewAsync(List<string> issues, CancellationToken ct)
+    {
+        // Check compliance endpoint access (ps.compliance.protection.outlook.com)
+        try
+        {
+            var tenantId = _auth.TenantId ?? _auth.TenantDomain ?? "";
+            using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
+            var token = await _auth.GetAccessTokenAsync("compliance", ct);
+
+            var body = new Dictionary<string, object>
+            {
+                ["CmdletInput"] = new
+                {
+                    CmdletName = "Get-RoleGroup",
+                    Parameters = new Dictionary<string, object> { ["ResultSize"] = "1" }
+                }
+            };
+
+            using var request = new HttpRequestMessage(HttpMethod.Post,
+                $"https://ps.compliance.protection.outlook.com/adminapi/beta/{tenantId}/InvokeCommand");
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+            request.Headers.Add("X-CmdletName", "Get-RoleGroup");
+            request.Headers.Add("X-ClientApplication", "ExoManagementModule");
+            request.Content = new StringContent(
+                JsonSerializer.Serialize(body), System.Text.Encoding.UTF8, "application/json");
+
+            var response = await http.SendAsync(request, ct);
+            // 302 redirect is expected (regional discovery) — that means the endpoint is reachable
+            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+            {
+                issues.Add("Cannot access Purview Compliance role groups (HTTP 403). Exchange Administrator or Compliance Administrator role is required.");
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            issues.Add("Cannot acquire compliance token. Purview scanning will be skipped. Ensure the compliance scope (ps.compliance.protection.outlook.com) is configured on the app registration.");
+        }
+    }
+
+    private static void CheckPurviewRoles(List<string> issues, HashSet<string> userRoles)
+    {
+        if (HasRole(userRoles, RoleTemplateIds.GlobalAdministrator, RoleTemplateIds.ExchangeAdministrator))
+            return;
+
+        issues.Add("Missing role: Exchange Administrator or Global Administrator. " +
+            "Without this role, Purview Compliance Center role group enumeration may return limited results.");
     }
 }

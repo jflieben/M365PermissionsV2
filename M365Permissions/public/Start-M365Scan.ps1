@@ -11,7 +11,7 @@ function Start-M365Scan {
     #>
     [CmdletBinding()]
     param(
-        [ValidateSet('SharePoint', 'Entra', 'Exchange')]
+        [ValidateSet('SharePoint', 'Entra', 'Exchange', 'OneDrive', 'PowerBI', 'PowerAutomate', 'Azure', 'AzureDevOps', 'Purview')]
         [string[]]$ScanTypes = @('SharePoint', 'Entra', 'Exchange')
     )
 

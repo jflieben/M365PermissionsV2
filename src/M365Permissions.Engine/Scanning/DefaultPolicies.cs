@@ -11,6 +11,9 @@ public static class DefaultPolicies
     private const string CriticalAdminRolesRegex =
         @"^(Global Administrator|Company Administrator|Exchange Administrator|SharePoint Administrator|Teams Administrator|Security Administrator|Privileged Role Administrator|Privileged Authentication Administrator|User Administrator|Application Administrator|Cloud Application Administrator|Intune Administrator|Authentication Administrator|Billing Administrator|Conditional Access Administrator|Compliance Administrator)$";
 
+    private const string CriticalPurviewRolesRegex = @"(?i)^(Organization Management|eDiscovery Manager|eDiscovery Administrator|Compliance Administrator)$";
+    private const string HighPurviewRoleGroupsRegex = @"(?i)(Compliance Management|Security Administrator|Information Protection|Data Loss Prevention|Records Management|Insider Risk Management|Data Investigator|Communication Compliance)";
+
     private const string CriticalAzureRolesRegex = @"^(Owner|Contributor|User Access Administrator)$";
 
     private const string CriticalDevOpsRolesRegex = @"(?i)(Project Collection Administrators|Project Collection Service Accounts)";
@@ -287,7 +290,35 @@ public static class DefaultPolicies
                 new() { Field = "principal_role", Operator = "equals", Value = "Owner" }
             }
         },
+        // ── Purview Critical ────────────────────────────────
+        new Policy
+        {
+            Name = "Critical Purview compliance role group member",
+            Description = "Member of a critical Compliance Center role group (Organization Management, eDiscovery Manager, etc.)",
+            Severity = "Critical",
+            CategoryFilter = "Purview",
+            IsDefault = true,
+            Conditions = new()
+            {
+                new() { Field = "through", Operator = "equals", Value = "RoleGroupMember" },
+                new() { Field = "principal_role", Operator = "regex", Value = CriticalPurviewRolesRegex }
+            }
+        },
 
+        // ── Purview High ────────────────────────────────────
+        new Policy
+        {
+            Name = "High-privilege Purview role group member",
+            Description = "Member of a high-privilege Compliance Center role group (Compliance Management, Data Loss Prevention, etc.)",
+            Severity = "High",
+            CategoryFilter = "Purview",
+            IsDefault = true,
+            Conditions = new()
+            {
+                new() { Field = "through", Operator = "equals", Value = "RoleGroupMember" },
+                new() { Field = "principal_role", Operator = "regex", Value = HighPurviewRoleGroupsRegex }
+            }
+        },
         // ── Low ─────────────────────────────────────────────────
         new Policy
         {
