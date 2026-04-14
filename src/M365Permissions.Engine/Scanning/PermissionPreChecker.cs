@@ -144,6 +144,12 @@ public sealed class PermissionPreChecker
             "group membership scanning",
             async () => await _graphClient.GetAsync("groups?$top=1&$select=id", ct: ct));
 
+        // Optional: Subscription.Read.All for webhook subscription enumeration
+        await RunCheck(issues, "Subscription.Read.All",
+            "Graph webhook subscription scanning (subscription scanning will be skipped without this)",
+            async () => await _graphClient.GetAsync("subscriptions", ct: ct),
+            optional: true);
+
         // PIM is optional — not all tenants have it
         await RunCheck(issues, "RoleEligibilitySchedule.Read.Directory",
             "PIM eligible role assignments (PIM scanning will be skipped without this)",

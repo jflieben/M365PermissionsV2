@@ -281,6 +281,78 @@ public sealed class EntraScanner : IScanProvider
         context.ReportProgress($"Found {grantCount} OAuth2 grants.", 3);
         context.CompleteTarget();
 
+        // --- Graph Subscriptions (webhook change notifications) ---
+        context.ReportProgress("Scanning Graph webhook subscriptions...", 3);
+
+        var subscriptionEntries = new List<PermissionEntry>();
+        try
+        {
+            await foreach (var sub in _graphClient.GetPaginatedAsync(
+                "subscriptions", ct: ct))
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var subId = sub.TryGetProperty("id", out var sid) ? sid.GetString() ?? "" : "";
+                var resource = sub.TryGetProperty("resource", out var res) ? res.GetString() ?? "" : "";
+                var changeType = sub.TryGetProperty("changeType", out var ctp) ? ctp.GetString() ?? "" : "";
+                var notificationUrl = sub.TryGetProperty("notificationUrl", out var nu) ? nu.GetString() ?? "" : "";
+                var expirationStr = sub.TryGetProperty("expirationDateTime", out var exp) ? exp.GetString() ?? "" : "";
+                var applicationId = sub.TryGetProperty("applicationId", out var appId) ? appId.GetString() ?? "" : "";
+                var creatorId = sub.TryGetProperty("creatorId", out var cid) ? cid.GetString() ?? "" : "";
+                var includeResourceData = sub.TryGetProperty("includeResourceData", out var ird)
+                    && ird.ValueKind == JsonValueKind.True;
+
+                // Resolve application name from SP cache if available
+                var appName = "";
+                if (!string.IsNullOrEmpty(applicationId))
+                    spCache.TryGetValue(applicationId, out appName);
+                appName ??= "";
+
+                // Determine tenure from expiration
+                var tenure = "Permanent";
+                if (!string.IsNullOrEmpty(expirationStr) && DateTimeOffset.TryParse(expirationStr, out var expDate))
+                {
+                    tenure = expDate > DateTimeOffset.UtcNow
+                        ? $"Expires {expDate:yyyy-MM-dd HH:mm} UTC"
+                        : $"Expired {expDate:yyyy-MM-dd HH:mm} UTC";
+                }
+
+                // Extract notification domain for readability
+                var notifDomain = "";
+                if (Uri.TryCreate(notificationUrl, UriKind.Absolute, out var notifUri))
+                    notifDomain = notifUri.Host;
+
+                var targetLabel = !string.IsNullOrEmpty(appName) ? appName : applicationId;
+
+                subscriptionEntries.Add(new PermissionEntry
+                {
+                    TargetPath = $"Subscription/{targetLabel}/{resource}",
+                    TargetType = "Subscription",
+                    TargetId = subId,
+                    PrincipalEntraId = applicationId,
+                    PrincipalSysId = creatorId,
+                    PrincipalSysName = !string.IsNullOrEmpty(appName) ? appName : applicationId,
+                    PrincipalType = "Application",
+                    PrincipalRole = changeType,
+                    Through = !string.IsNullOrEmpty(notifDomain) ? $"Webhook → {notifDomain}" : "Webhook",
+                    AccessType = includeResourceData ? "IncludesResourceData" : "NotificationOnly",
+                    Tenure = tenure
+                });
+            }
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Forbidden ||
+                                                ex.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            context.ReportProgress("Cannot list Graph subscriptions — Subscription.Read.All permission may be missing. Skipping.", 3);
+        }
+        catch (Exception ex)
+        {
+            context.ReportProgress($"Graph subscription enumeration failed: {ex.Message}", 3);
+        }
+
+        foreach (var e in subscriptionEntries) yield return e;
+        context.ReportProgress($"Found {subscriptionEntries.Count} Graph webhook subscriptions.", 3);
+
         // --- Group memberships (security groups + M365 groups) ---
         context.ReportProgress("Enumerating groups...", 3);
 

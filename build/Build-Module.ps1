@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-    Builds the M365Permissions module — compiles .NET engine, copies DLLs + GUI to module/lib/.
+    Builds the M365Permissions module — compiles .NET engine, copies DLLs + GUI to M365Permissions/lib/.
 .DESCRIPTION
     Runs dotnet publish on the Engine project and assembles the final module folder.
-    If module/lib/ DLLs are locked (e.g. module is loaded in another PS session), the script
+    If M365Permissions/lib/ DLLs are locked (e.g. module is loaded in another PS session), the script
     will report the locking process and exit with guidance.
 #>
 [CmdletBinding()]
 param(
     [string]$Configuration = 'Release',
-    [string]$OutputPath = (Join-Path $PSScriptRoot '..' 'module' 'lib')
+    [string]$OutputPath = (Join-Path $PSScriptRoot '..' 'M365Permissions' 'lib')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,7 +18,7 @@ $engineProject = Join-Path $repoRoot 'src' 'M365Permissions.Engine' 'M365Permiss
 $publishDir = Join-Path $repoRoot 'src' 'M365Permissions.Engine' 'bin' $Configuration 'net8.0' 'publish'
 
 # Sync version from psd1 (single source of truth) → csproj
-$psd1Path = Join-Path $repoRoot 'module' 'M365Permissions.psd1'
+$psd1Path = Join-Path $repoRoot 'M365Permissions' 'M365Permissions.psd1'
 $manifest = Import-PowerShellDataFile $psd1Path
 $version = $manifest.ModuleVersion
 $csprojContent = Get-Content $engineProject -Raw
@@ -35,7 +35,7 @@ if (Test-Path $lockTarget) {
         [IO.File]::Open($lockTarget, 'Open', 'ReadWrite', 'None').Close()
     }
     catch {
-        Write-Host "`nERROR: module/lib/ DLLs are locked by another process." -ForegroundColor Red
+        Write-Host "`nERROR: M365Permissions/lib/ DLLs are locked by another process." -ForegroundColor Red
         Write-Host "This usually means M365Permissions is imported in another PowerShell session.`n" -ForegroundColor Yellow
         Write-Host "Fix: close that PS session (or run Remove-Module M365Permissions), then retry." -ForegroundColor Yellow
         throw "Cannot overwrite locked DLLs in $OutputPath. Close the PowerShell session that has the module loaded."

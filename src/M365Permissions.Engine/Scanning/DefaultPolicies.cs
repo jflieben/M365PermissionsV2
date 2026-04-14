@@ -19,6 +19,9 @@ public static class DefaultPolicies
     private const string HighRiskAppPermsRegex =
         @"(Mail\.ReadWrite|Mail\.Send|Files\.ReadWrite\.All|Sites\.ReadWrite\.All|Sites\.FullControl\.All|Directory\.ReadWrite\.All|RoleManagement\.ReadWrite\.Directory|AppRoleAssignment\.ReadWrite\.All|Application\.ReadWrite\.All|User\.ReadWrite\.All|Group\.ReadWrite\.All|MailboxSettings\.ReadWrite|Calendars\.ReadWrite|Exchange\.ManageAsApp)";
 
+    private const string SensitiveSubscriptionResourcesRegex =
+        @"(?i)(message|mail|chatMessage|security|user|group|callRecord|driveItem)";
+
     private const string BroadPrincipalsRegex =
         @"(?i)(Everyone|Everyone except external users|All Users|AllInternalUsers|Anonymous|c:0\(\.s\|true|c:0-\.f\|rolemanager\|spo-grid-all-users)";
 
@@ -191,6 +194,33 @@ public static class DefaultPolicies
                 new() { Field = "through", Operator = "equals", Value = "OAuth2Grant" },
                 new() { Field = "tenure", Operator = "equals", Value = "AllPrincipals" },
                 new() { Field = "principal_role", Operator = "regex", Value = HighRiskAppPermsRegex }
+            }
+        },
+        new Policy
+        {
+            Name = "Subscription to sensitive resource with data",
+            Description = "Graph webhook subscription monitoring a sensitive resource (mail, chat, files, users, security) with includeResourceData enabled — actual content is sent to the notification endpoint",
+            Severity = "High",
+            CategoryFilter = "Entra",
+            IsDefault = true,
+            Conditions = new()
+            {
+                new() { Field = "target_type", Operator = "equals", Value = "Subscription" },
+                new() { Field = "target_path", Operator = "regex", Value = SensitiveSubscriptionResourcesRegex },
+                new() { Field = "access_type", Operator = "equals", Value = "IncludesResourceData" }
+            }
+        },
+        new Policy
+        {
+            Name = "Subscription to sensitive resource",
+            Description = "Graph webhook subscription monitoring a sensitive resource (mail, chat, files, users, security). Notification-only but reveals activity patterns and metadata.",
+            Severity = "Medium",
+            CategoryFilter = "Entra",
+            IsDefault = true,
+            Conditions = new()
+            {
+                new() { Field = "target_type", Operator = "equals", Value = "Subscription" },
+                new() { Field = "target_path", Operator = "regex", Value = SensitiveSubscriptionResourcesRegex }
             }
         },
 

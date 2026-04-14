@@ -172,7 +172,7 @@ C# `JsonNamingPolicy.CamelCase` produces these names. JS must match exactly:
 
 ## Scanning Scope (Phase 1)
 - **SharePoint**: Site admins, role assignments, Graph site permissions, drive item permissions
-- **Entra**: Directory roles, app registrations (API permissions), OAuth2 grants, group memberships
+- **Entra**: Directory roles, app registrations (API permissions), OAuth2 grants, PIM eligible assignments, Graph webhook subscriptions, group memberships
 - **Exchange**: Mailbox permissions (FullAccess), recipient permissions (SendAs), SendOnBehalf
 - **OneDrive**: Site administrators, sharing permissions, external sharing
 - **Power BI**: Workspace role assignments (Admin, Member, Contributor, Viewer)
