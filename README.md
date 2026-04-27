@@ -112,8 +112,8 @@ Settings are managed through the GUI's Settings page and stored in `%APPDATA%/Li
 
 ## License
 
-Free for non-commercial use. See [LICENSE](LICENSE) for details.
+Free for non-commercial use. 
 
 Commercial use: https://www.lieben.nu/liebensraum/commercial-use/
 
-Enterprise version: https://www.m365permissions.com
+Audit / Enterprise version: https://www.m365permissions.com
