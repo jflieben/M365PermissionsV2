@@ -68,3 +68,5 @@ if (Test-Path $nativeDir) {
 
 $dllCount = (Get-ChildItem -Path $OutputPath -Filter '*.dll').Count
 Write-Host "Build complete — $dllCount DLLs in $OutputPath" -ForegroundColor Green
+
+Import-Module C:\git\M365PermissionsV2\M365Permissions\M365Permissions.psd1 -Force

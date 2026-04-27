@@ -230,6 +230,11 @@ public sealed class DelegatedAuth
                 var token = _tokenCache.Get(resource);
                 if (token != null) return token;
             }
+            catch (ResourcePrincipalNotFoundException)
+            {
+                // SPN missing — surface immediately so caller can skip this scan
+                throw;
+            }
             catch
             {
                 // Refresh token expired or invalid — fall through to interactive
@@ -303,7 +308,10 @@ public sealed class DelegatedAuth
         var json = await response.Content.ReadAsStringAsync(ct);
 
         if (!response.IsSuccessStatusCode)
+        {
+            ThrowIfResourcePrincipalMissing(cacheKey, json);
             throw new InvalidOperationException($"Token acquisition for '{cacheKey}' failed: {json}");
+        }
 
         var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
@@ -320,6 +328,49 @@ public sealed class DelegatedAuth
             else
                 _tokenCache.SetRefreshToken(rt.GetString()!, rtExpiry);
         }
+    }
+
+    /// <summary>
+    /// If the AAD error response indicates the resource service principal is missing in
+    /// the user's tenant (e.g. PowerBI / Azure DevOps / ASM never used in this tenant),
+    /// throw a typed <see cref="ResourcePrincipalNotFoundException"/> so callers can skip
+    /// that resource gracefully. Otherwise return without throwing.
+    /// </summary>
+    private static void ThrowIfResourcePrincipalMissing(string resource, string errorJson)
+    {
+        // AAD error codes that indicate the resource SPN is not provisioned in the tenant
+        // (or otherwise not consentable for this tenant):
+        //  - AADSTS500011: The resource principal named X was not found in the tenant
+        //  - AADSTS650052: The app needs access to a service that your organization has not subscribed to
+        //  - AADSTS650057: Invalid resource
+        //  - AADSTS500341: The user account has been deleted from the directory (different — don't catch)
+        string? code = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(errorJson);
+            if (doc.RootElement.TryGetProperty("error", out var errElem) && errElem.ValueKind == JsonValueKind.String)
+                code = errElem.GetString();
+            // AAD returns the AADSTS code embedded in error_description
+            if (doc.RootElement.TryGetProperty("error_description", out var descElem))
+            {
+                var desc = descElem.GetString() ?? string.Empty;
+                if (desc.Contains("AADSTS500011", StringComparison.Ordinal)
+                    || desc.Contains("AADSTS650052", StringComparison.Ordinal)
+                    || desc.Contains("AADSTS650057", StringComparison.Ordinal))
+                {
+                    var aadCode = desc.Contains("AADSTS500011") ? "AADSTS500011"
+                                : desc.Contains("AADSTS650052") ? "AADSTS650052"
+                                : "AADSTS650057";
+                    throw new ResourcePrincipalNotFoundException(resource, aadCode,
+                        $"The service principal for '{resource}' is not available in this tenant ({aadCode}). " +
+                        "This usually means the service is not licensed or has never been used. " +
+                        "Skipping this scan.");
+                }
+            }
+        }
+        catch (ResourcePrincipalNotFoundException) { throw; }
+        catch { /* not JSON or unexpected — fall through to generic exception */ }
+        _ = code;
     }
 
     /// <summary>
@@ -381,7 +432,10 @@ public sealed class DelegatedAuth
             var json = await response.Content.ReadAsStringAsync(ct);
 
             if (!response.IsSuccessStatusCode)
+            {
+                ThrowIfResourcePrincipalMissing(cacheKey, json);
                 throw new InvalidOperationException($"Token exchange for '{cacheKey}' failed: {json}");
+            }
 
             var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;

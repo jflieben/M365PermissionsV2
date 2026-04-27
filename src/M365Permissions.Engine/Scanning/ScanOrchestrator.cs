@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using M365Permissions.Engine.Auth;
 using M365Permissions.Engine.Database;
 using M365Permissions.Engine.Models;
 
@@ -197,6 +198,7 @@ public sealed class ScanOrchestrator
 
         var batch = new List<PermissionEntry>();
         var policies = _policyRepo.GetEnabled();
+        var finalStatus = "Completed";
 
         try
         {
@@ -217,6 +219,25 @@ public sealed class ScanOrchestrator
                 }
             }
         }
+        catch (OperationCanceledException)
+        {
+            // Cancellation should propagate to the orchestrator so it can mark the whole scan cancelled
+            finalStatus = "Cancelled";
+            throw;
+        }
+        catch (ResourcePrincipalNotFoundException ex)
+        {
+            // The resource (e.g. PowerBI, Azure DevOps, ASM) is not provisioned in this tenant.
+            // Skip this scan but allow other scans to continue.
+            finalStatus = "Skipped";
+            AddLog($"[{scanType}] Skipped — {ex.Message}", 2);
+        }
+        catch (Exception ex)
+        {
+            // Per-scan failure: log and continue with other scan types.
+            finalStatus = "Failed";
+            AddLog($"[{scanType}] Failed: {ex.Message}", 1);
+        }
         finally
         {
             if (batch.Count > 0)
@@ -234,9 +255,9 @@ public sealed class ScanOrchestrator
         }
 
         if (_progress.TryGetValue(scanType, out var progressFinal))
-            progressFinal.Status = "Completed";
+            progressFinal.Status = finalStatus;
 
-        AddLog($"Completed {scanType} scan.", 3);
+        AddLog($"{(finalStatus == "Completed" ? "Completed" : finalStatus)} {scanType} scan.", finalStatus == "Completed" ? 3 : 2);
     }
 
     private void AddLog(string message, int level)

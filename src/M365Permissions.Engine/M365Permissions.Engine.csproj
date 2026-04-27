@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>M365Permissions.Engine</RootNamespace>
     <AssemblyName>M365Permissions.Engine</AssemblyName>
-    <Version>2.0.0</Version>
+    <Version>2.0.2</Version>
     <Authors>Jos Lieben</Authors>
     <Description>Core engine for M365Permissions — SQLite storage, HTTP server, Graph/REST API clients, scanning, export</Description>
   </PropertyGroup>
