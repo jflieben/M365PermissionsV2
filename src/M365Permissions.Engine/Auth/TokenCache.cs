@@ -15,10 +15,13 @@ public sealed class TokenCache
     private DateTimeOffset? _refreshTokenExpiresAt;
     private string? _ppRefreshToken;
     private DateTimeOffset? _ppRefreshTokenExpiresAt;
+    private HashSet<string>? _consentedGraphScopes;
+    private readonly object _consentedScopesLock = new();
     private readonly string? _persistPath;
     private string? PpPersistPath => _persistPath != null ? Path.Combine(Path.GetDirectoryName(_persistPath)!, ".pprt") : null;
     private string? ExpiryPath => _persistPath != null ? _persistPath + ".exp" : null;
     private string? PpExpiryPath => PpPersistPath != null ? PpPersistPath + ".exp" : null;
+    private string? ConsentedScopesPath => _persistPath != null ? Path.Combine(Path.GetDirectoryName(_persistPath)!, ".graphscopes") : null;
 
     /// <summary>Actual refresh token expiry if known from token response, otherwise estimated 90 days from file timestamp.</summary>
     public DateTimeOffset? RefreshTokenExpiry => _refreshTokenExpiresAt;
@@ -94,10 +97,60 @@ public sealed class TokenCache
         _ppRefreshToken = null;
         _refreshTokenExpiresAt = null;
         _ppRefreshTokenExpiresAt = null;
+        lock (_consentedScopesLock) { _consentedGraphScopes = null; }
         DeletePersistedToken(_persistPath);
         DeletePersistedToken(PpPersistPath);
         DeletePersistedToken(ExpiryPath);
         DeletePersistedToken(PpExpiryPath);
+        DeletePersistedToken(ConsentedScopesPath);
+    }
+
+    /// <summary>
+    /// Get the set of Graph delegated permissions the user has consented to so far.
+    /// Loaded from disk on first access. Always contains at least 'User.Read' once any
+    /// sign-in has happened. Returns an empty set if nothing has been consented yet.
+    /// </summary>
+    public HashSet<string> GetConsentedGraphScopes()
+    {
+        lock (_consentedScopesLock)
+        {
+            if (_consentedGraphScopes != null)
+                return new HashSet<string>(_consentedGraphScopes, StringComparer.OrdinalIgnoreCase);
+
+            _consentedGraphScopes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (ConsentedScopesPath != null && File.Exists(ConsentedScopesPath))
+            {
+                try
+                {
+                    foreach (var line in File.ReadAllLines(ConsentedScopesPath))
+                    {
+                        var s = line.Trim();
+                        if (!string.IsNullOrEmpty(s)) _consentedGraphScopes.Add(s);
+                    }
+                }
+                catch { /* best effort */ }
+            }
+            return new HashSet<string>(_consentedGraphScopes, StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>Add the given scopes to the consented set and persist.</summary>
+    public void AddConsentedGraphScopes(IEnumerable<string> scopes)
+    {
+        lock (_consentedScopesLock)
+        {
+            _consentedGraphScopes ??= GetConsentedGraphScopes();
+            foreach (var s in scopes)
+            {
+                if (!string.IsNullOrWhiteSpace(s))
+                    _consentedGraphScopes.Add(s.Trim());
+            }
+            if (ConsentedScopesPath != null)
+            {
+                try { File.WriteAllLines(ConsentedScopesPath, _consentedGraphScopes); }
+                catch { /* best effort */ }
+            }
+        }
     }
 
     private static void PersistToken(string token, string? path)

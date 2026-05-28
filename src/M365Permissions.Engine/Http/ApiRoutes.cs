@@ -46,7 +46,26 @@ public static class ApiRoutes
         {
             try
             {
-                await engine.ReconsentAsync();
+                var body = await WebServer.ReadJson<JsonElement>(ctx.Request);
+                var scanTypes = new List<string>();
+                var includeGraph = true;
+
+                if (body.ValueKind == JsonValueKind.Object)
+                {
+                    if (body.TryGetProperty("scanTypes", out var st) && st.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var t in st.EnumerateArray())
+                            if (t.GetString() is string s) scanTypes.Add(s);
+                    }
+
+                    if (body.TryGetProperty("includeGraph", out var ig) &&
+                        (ig.ValueKind == JsonValueKind.True || ig.ValueKind == JsonValueKind.False))
+                    {
+                        includeGraph = ig.GetBoolean();
+                    }
+                }
+
+                await engine.ReconsentAsync(scanTypes.Count > 0 ? scanTypes : null, includeGraph);
                 var status = engine.GetStatus();
                 await WebServer.WriteJson(ctx.Response, 200, ApiResponse<StatusResponse>.Ok(status));
             }

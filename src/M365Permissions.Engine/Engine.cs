@@ -40,6 +40,11 @@ public sealed class Engine : IDisposable
 
     private AppConfig _config;
     private readonly Task _sessionRestoreTask;
+    private static readonly List<string> AllReconsentCategories = new()
+    {
+        "SharePoint", "OneDrive", "Exchange", "PowerBI",
+        "PowerAutomate", "Azure", "AzureDevOps", "Purview"
+    };
 
     public Engine(string databasePath)
     {
@@ -159,10 +164,26 @@ public sealed class Engine : IDisposable
     /// Trigger admin consent flow to re-grant permissions for the app registration.
     /// Opens browser with prompt=consent, then refreshes clients with new tokens.
     /// </summary>
+    public async Task ReconsentAsync(List<string>? scanTypes = null, bool includeGraph = true, CancellationToken ct = default)
+    {
+        // Targeted re-consent (includeGraph=false) still needs an authenticated base session.
+        // If not connected yet, bootstrap with Graph sign-in first.
+        if (includeGraph || !_auth.IsConnected)
+            await _auth.ReconsentAsync(ct);
+
+        var categories = scanTypes is { Count: > 0 }
+            ? scanTypes
+            : AllReconsentCategories;
+
+        // Re-consent selected non-Graph resources with explicit resource-specific prompts.
+        await _auth.ReconsentResourcesForCategoriesAsync(categories, ct);
+
+        InitializeClients();
+    }
+
     public async Task ReconsentAsync(CancellationToken ct = default)
     {
-        await _auth.ReconsentAsync(ct);
-        InitializeClients();
+        await ReconsentAsync(scanTypes: null, includeGraph: true, ct);
     }
 
     private void InitializeClients()
@@ -235,13 +256,21 @@ public sealed class Engine : IDisposable
 
     // ── Scanning ────────────────────────────────────────────────
 
-    public Task<long> StartScanAsync(List<string> scanTypes, CancellationToken ct = default)
+    public async Task<long> StartScanAsync(List<string> scanTypes, CancellationToken ct = default)
     {
         if (!_auth.IsConnected)
             throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
 
         if (_orchestrator == null)
             InitializeClients();
+
+        // Make sure the user has consented to the Graph permissions each selected scan needs.
+        // This may open a browser tab for incremental consent on first use of a category.
+        await _auth.EnsureGraphConsentForCategoriesAsync(scanTypes, ct);
+
+        // Non-Graph APIs (Exchange, Azure, Power BI, DevOps, etc.) require separate resource consent.
+        // Acquire these up front so scans don't fail later without ever prompting the user.
+        await _auth.EnsureResourceConsentForCategoriesAsync(scanTypes, ct);
 
         var scan = new ScanInfo
         {
@@ -271,7 +300,7 @@ public sealed class Engine : IDisposable
 
         _orchestrator!.StartScan(context, scanTypes);
         _auditRepo.Log("ScanStarted", _auth.UserPrincipalName ?? "", $"Scan started: {string.Join(", ", scanTypes)}", scanId);
-        return Task.FromResult(scanId);
+        return scanId;
     }
 
     public void CancelScan() => _orchestrator?.CancelScan();
@@ -286,8 +315,31 @@ public sealed class Engine : IDisposable
         if (!_auth.IsConnected || _graphClient == null)
             throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
 
+        // Make sure each requested scan's Graph scopes are consented before running pre-check probes,
+        // otherwise the probes themselves would fail with 403/AADSTS errors that aren't really
+        // permission gaps — they're just "user hasn't clicked Accept yet".
+        await _auth.EnsureGraphConsentForCategoriesAsync(scanTypes, ct);
+
+        // Also ensure non-Graph resource consent up front so pre-check reflects real access state.
+        await _auth.EnsureResourceConsentForCategoriesAsync(scanTypes, ct);
+
         var checker = new PermissionPreChecker(_graphClient, _auth);
         return await checker.CheckAsync(scanTypes, ct);
+    }
+
+    /// <summary>
+    /// Return the set of Graph delegated scopes required for the given scan categories that
+    /// have NOT yet been consented. Empty list = no consent prompt is needed.
+    /// </summary>
+    public List<string> GetMissingGraphScopesForCategories(IEnumerable<string> categories)
+    {
+        var consented = _tokenCache.GetConsentedGraphScopes();
+        var needed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in categories)
+            foreach (var s in DelegatedAuth.GetRequiredGraphScopesForCategory(c))
+                if (!consented.Contains(s))
+                    needed.Add(s);
+        return needed.OrderBy(s => s).ToList();
     }
 
     // ── Results ─────────────────────────────────────────────────

@@ -187,16 +187,29 @@ public sealed class PermissionPreChecker
                 JsonSerializer.Serialize(body), System.Text.Encoding.UTF8, "application/json");
 
             var response = await http.SendAsync(request, ct);
-            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
-            {
-                issues.Add("Missing permission: Exchange.ManageAsApp or Exchange Administrator role (needed for Exchange mailbox scanning)");
-            }
+            if (response.IsSuccessStatusCode)
+                return;
+
+            var issue = GetExchangePermissionIssue(response.StatusCode);
+            if (issue != null)
+                issues.Add(issue);
+            else
+                issues.Add($"Exchange mailbox probe returned HTTP {(int)response.StatusCode} {(response.ReasonPhrase ?? "Unknown")}");
         }
         catch (InvalidOperationException)
         {
             issues.Add("Cannot acquire Exchange token. The app registration may not have Exchange permissions configured.");
         }
     }
+
+    public static string? GetExchangePermissionIssue(System.Net.HttpStatusCode statusCode) => statusCode switch
+    {
+        System.Net.HttpStatusCode.Unauthorized =>
+            "Unauthorized: Exchange mailbox access returned HTTP 401. Exchange Administrator role, admin consent for Exchange.ManageAsApp, or a valid Exchange service principal is required for mailbox scanning.",
+        System.Net.HttpStatusCode.Forbidden =>
+            "Missing permission: Exchange.ManageAsApp or Exchange Administrator role (needed for Exchange mailbox scanning)",
+        _ => null
+    };
 
     private async Task CheckOneDriveAsync(List<string> issues, CancellationToken ct)
     {

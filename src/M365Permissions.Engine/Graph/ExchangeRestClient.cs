@@ -81,6 +81,18 @@ public sealed class ExchangeRestClient
                     if (!response.IsSuccessStatusCode)
                     {
                         var errorBody = await response.Content.ReadAsStringAsync(ct);
+                        var statusCode = response.StatusCode;
+
+                        if (statusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
+                        {
+                            var hint = statusCode == System.Net.HttpStatusCode.Unauthorized
+                                ? "Exchange mailbox access is unauthorized. Exchange Administrator role or admin consent for Exchange.ManageAsApp may be missing."
+                                : "Exchange mailbox access is forbidden. Exchange Administrator role or admin consent for Exchange.ManageAsApp may be missing.";
+
+                            throw new HttpRequestException(
+                                $"EXO {(int)statusCode} {response.ReasonPhrase} [{cmdletName}]: {hint} {Truncate(errorBody, 500)}",
+                                null, statusCode);
+                        }
 
                         // Check if this is a known transient Exchange error (even on HTTP 400)
                         var isTransient = TransientErrorCodes.Any(code =>

@@ -1781,9 +1781,16 @@
         },
 
         async reconsentPermissions() {
-            showToast('Opening browser for admin consent...', 'info');
+            const checkboxes = document.querySelectorAll('.scan-cat-card input:checked');
+            const types = Array.from(checkboxes).map(c => c.value);
+            const payload = types.length > 0
+                ? { scanTypes: types, includeGraph: false }
+                : { includeGraph: true };
+
+            const consentTarget = types.length > 0 ? `selected targets (${types.join(', ')})` : 'all configured targets';
+            showToast(`Opening browser consent for ${consentTarget}...`, 'info');
             try {
-                const res = await api.post('/reconsent');
+                const res = await api.post('/reconsent', payload);
                 if (res.success) {
                     showToast('Permissions re-consented successfully! Run the pre-check again to verify.', 'success');
                     await refreshStatus();
@@ -1801,6 +1808,7 @@
             if (types.length === 0) { showToast('Select at least one scan type', 'error'); return; }
 
             try {
+                showToast('Starting scan — a browser tab may open if a new category needs consent', 'info');
                 const res = await api.post('/scan/start', { scanTypes: types });
                 if (res.success) {
                     state.scanRunning = true;
