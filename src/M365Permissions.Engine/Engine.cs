@@ -40,11 +40,6 @@ public sealed class Engine : IDisposable
 
     private AppConfig _config;
     private readonly Task _sessionRestoreTask;
-    private static readonly List<string> AllReconsentCategories = new()
-    {
-        "SharePoint", "OneDrive", "Exchange", "PowerBI",
-        "PowerAutomate", "Azure", "AzureDevOps", "Purview"
-    };
 
     public Engine(string databasePath)
     {
@@ -173,10 +168,11 @@ public sealed class Engine : IDisposable
 
         var categories = scanTypes is { Count: > 0 }
             ? scanTypes
-            : AllReconsentCategories;
+            : new List<string>();
 
         // Re-consent selected non-Graph resources with explicit resource-specific prompts.
-        await _auth.ReconsentResourcesForCategoriesAsync(categories, ct);
+        if (categories.Count > 0)
+            await _auth.ReconsentResourcesForCategoriesAsync(categories, ct);
 
         InitializeClients();
     }

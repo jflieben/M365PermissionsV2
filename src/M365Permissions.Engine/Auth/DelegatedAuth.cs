@@ -257,11 +257,7 @@ public sealed class DelegatedAuth
     /// </summary>
     public async Task EnsureResourceConsentForCategoriesAsync(IEnumerable<string> categories, CancellationToken ct = default)
     {
-        var resources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var category in categories)
-            foreach (var resource in GetRequiredResourceKeysForCategory(category))
-                resources.Add(resource);
-
+        var resources = GetOrderedResourceKeysForCategories(categories);
         foreach (var resource in resources)
             await EnsureResourceTokenAsync(resource, ct);
     }
@@ -273,13 +269,43 @@ public sealed class DelegatedAuth
     /// </summary>
     public async Task ReconsentResourcesForCategoriesAsync(IEnumerable<string> categories, CancellationToken ct = default)
     {
-        var resources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var category in categories)
-            foreach (var resource in GetRequiredResourceKeysForCategory(category))
-                resources.Add(resource);
+        var resources = GetOrderedResourceKeysForCategories(categories);
+        var failures = new List<string>();
 
         foreach (var resource in resources)
-            await ReconsentResourceAsync(resource, ct);
+        {
+            try
+            {
+                await ReconsentResourceAsync(resource, ct);
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{resource}: {ex.Message}");
+            }
+        }
+
+        if (failures.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "One or more selected resource consents failed: " + string.Join(" | ", failures));
+        }
+    }
+
+    private static List<string> GetOrderedResourceKeysForCategories(IEnumerable<string> categories)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var ordered = new List<string>();
+
+        foreach (var category in categories)
+        {
+            foreach (var resource in GetRequiredResourceKeysForCategory(category))
+            {
+                if (seen.Add(resource))
+                    ordered.Add(resource);
+            }
+        }
+
+        return ordered;
     }
 
     /// <summary>
