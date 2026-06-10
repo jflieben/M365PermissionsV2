@@ -63,21 +63,44 @@ public sealed class SharePointScanner : IScanProvider
 
             context.ReportProgress($"Scanning: {displayName}", 4);
 
+            // Site collection admin elevation should target the site collection root, not a subsite URL.
+            var elevationUrl = GetSiteCollectionRootUrl(webUrl);
+            var siteCollectionId = SharePointRestClient.TryExtractSiteCollectionId(siteId);
+
             // --- Temporarily add scanning user as site admin if needed (like V1) ---
             bool wasAdded = false;
+            bool wasAddedViaTenant = false;
             var userUpn = _auth.UserPrincipalName;
 
             if (!string.IsNullOrEmpty(userUpn))
             {
                 try
                 {
-                    wasAdded = await _spClient.EnsureSiteAdminAsync(webUrl, userUpn, ct);
+                    wasAdded = await _spClient.EnsureSiteAdminAsync(elevationUrl, userUpn, ct);
                     if (wasAdded)
                         context.ReportProgress($"Temporarily added {userUpn} as site admin for: {displayName}", 4);
                 }
                 catch (Exception ex)
                 {
-                    context.ReportProgress($"Could not ensure site admin for {displayName}: {ex.Message}", 3);
+                    // Fallback to tenant admin API for site collections where direct site REST elevation is blocked.
+                    if (ShouldTryTenantElevationFallback(ex))
+                    {
+                        try
+                        {
+                            wasAdded = await _spClient.EnsureSiteAdminViaTenantAsync(elevationUrl, userUpn, ct, siteCollectionId);
+                            wasAddedViaTenant = wasAdded;
+                            if (wasAdded)
+                                context.ReportProgress($"Temporarily added {userUpn} as site admin via tenant API for: {displayName}", 4);
+                        }
+                        catch (Exception tenantEx)
+                        {
+                            context.ReportProgress($"Could not ensure site admin for {displayName}: {tenantEx.Message}", 3);
+                        }
+                    }
+                    else
+                    {
+                        context.ReportProgress($"Could not ensure site admin for {displayName}: {ex.Message}", 3);
+                    }
                 }
             }
 
@@ -85,6 +108,7 @@ public sealed class SharePointScanner : IScanProvider
             {
                 // --- Site admins ---
                 List<JsonElement> admins;
+                bool adminQueryUnauthorized = false;
                 try
                 {
                     admins = await _spClient.GetSiteAdminsAsync(webUrl, ct);
@@ -92,6 +116,7 @@ public sealed class SharePointScanner : IScanProvider
                 catch (Exception ex)
                 {
                     context.ReportProgress($"Failed to get admins for {displayName}: {ex.Message}", 2);
+                    adminQueryUnauthorized = IsUnauthorized(ex);
                     admins = new();
                 }
 
@@ -105,6 +130,7 @@ public sealed class SharePointScanner : IScanProvider
 
                 // --- Role assignments ---
                 List<JsonElement> roleAssignments;
+                bool roleQueryUnauthorized = false;
                 try
                 {
                     roleAssignments = await _spClient.GetRoleAssignmentsAsync(webUrl, ct);
@@ -112,7 +138,16 @@ public sealed class SharePointScanner : IScanProvider
                 catch (Exception ex)
                 {
                     context.ReportProgress($"Failed to get role assignments for {displayName}: {ex.Message}", 2);
-                    context.FailTarget();
+                    roleQueryUnauthorized = IsUnauthorized(ex);
+                    roleAssignments = new();
+                }
+
+                // If we cannot query either admins or role assignments due authorization,
+                // skip this site gracefully and continue with the scan.
+                if (adminQueryUnauthorized && roleQueryUnauthorized)
+                {
+                    context.ReportProgress($"Skipping {displayName}: no SharePoint REST access after elevation attempt.", 2);
+                    context.CompleteTarget();
                     continue;
                 }
 
@@ -140,7 +175,10 @@ public sealed class SharePointScanner : IScanProvider
                     }
                     catch (Exception ex)
                     {
-                        context.ReportProgress($"Failed to get Graph permissions for {displayName}: {ex.Message}", 4);
+                        if (IsGraphSitePermissionsNotSupported(ex))
+                            context.ReportProgress($"Graph site permissions endpoint not supported for {displayName}; skipping app-only grants for this site.", 4);
+                        else
+                            context.ReportProgress($"Failed to get Graph permissions for {displayName}: {ex.Message}", 4);
                     }
 
                     foreach (var gp in graphPerms)
@@ -156,7 +194,11 @@ public sealed class SharePointScanner : IScanProvider
                 {
                     try
                     {
-                        await _spClient.RemoveSiteAdminAsync(webUrl, userUpn, ct);
+                        if (wasAddedViaTenant)
+                            await _spClient.RemoveSiteAdminViaTenantAsync(elevationUrl, userUpn, ct, siteCollectionId);
+                        else
+                            await _spClient.RemoveSiteAdminAsync(elevationUrl, userUpn, ct);
+
                         context.ReportProgress($"Removed temporary site admin from: {displayName}", 4);
                     }
                     catch (Exception ex)
@@ -307,6 +349,34 @@ public sealed class SharePointScanner : IScanProvider
         return "Unknown";
     }
 
+    private static bool IsUnauthorized(Exception ex)
+    {
+        if (ex is HttpRequestException hre)
+        {
+            return hre.StatusCode is System.Net.HttpStatusCode.Forbidden or System.Net.HttpStatusCode.Unauthorized;
+        }
+
+        return ex.Message.Contains("403", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("UnauthorizedAccessException", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldTryTenantElevationFallback(Exception ex)
+    {
+        if (IsUnauthorized(ex))
+            return true;
+
+        // Some SPO endpoints return 500 SPException instead of 403 when elevation is required.
+        return ex.Message.Contains("You need to be a site collection administrator to set this property", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("SPException", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGraphSitePermissionsNotSupported(Exception ex)
+    {
+        return ex.Message.Contains("notSupported", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("Operation not supported", StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>Detect if a URL is a subsite (has path segments beyond /sites/{name}).</summary>
     private static bool IsSubsite(string webUrl)
     {
@@ -324,6 +394,35 @@ public sealed class SharePointScanner : IScanProvider
         catch
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// For elevation actions, target the site collection root URL instead of subsite URLs.
+    /// Example: https://tenant.sharepoint.com/sites/A/B/C -> https://tenant.sharepoint.com/sites/A
+    /// </summary>
+    private static string GetSiteCollectionRootUrl(string webUrl)
+    {
+        if (string.IsNullOrWhiteSpace(webUrl)) return webUrl;
+
+        try
+        {
+            var uri = new Uri(webUrl);
+            var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+            if (segments.Length >= 2 &&
+                (segments[0].Equals("sites", StringComparison.OrdinalIgnoreCase)
+                 || segments[0].Equals("teams", StringComparison.OrdinalIgnoreCase)
+                 || segments[0].Equals("personal", StringComparison.OrdinalIgnoreCase)))
+            {
+                return $"{uri.Scheme}://{uri.Host}/{segments[0]}/{segments[1]}";
+            }
+
+            return webUrl.TrimEnd('/');
+        }
+        catch
+        {
+            return webUrl;
         }
     }
 }

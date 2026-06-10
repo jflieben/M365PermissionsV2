@@ -347,10 +347,10 @@ public sealed class SharePointRestClient
     /// This works on OneDrive personal sites where the scanning user has no direct access.
     /// Returns true if the user was added, false if already an admin.
     /// </summary>
-    public async Task<bool> EnsureSiteAdminViaTenantAsync(string siteUrl, string userUpn, CancellationToken ct = default)
+    public async Task<bool> EnsureSiteAdminViaTenantAsync(string siteUrl, string userUpn, CancellationToken ct = default, string? siteCollectionId = null)
     {
         var adminUrl = _auth.GetSharePointAdminUrl();
-        var siteCollectionId = await GetSiteCollectionIdAsync(siteUrl, ct);
+        siteCollectionId ??= await GetSiteCollectionIdAsync(siteUrl, ct);
         var loginName = $"i:0#.f|membership|{userUpn}";
 
         // Get current secondary admins
@@ -410,18 +410,20 @@ public sealed class SharePointRestClient
     /// <summary>
     /// Remove a user from site collection admins via the SharePoint tenant admin API.
     /// </summary>
-    public async Task RemoveSiteAdminViaTenantAsync(string siteUrl, string userUpn, CancellationToken ct = default)
+    public async Task RemoveSiteAdminViaTenantAsync(string siteUrl, string userUpn, CancellationToken ct = default, string? siteCollectionId = null)
     {
         var adminUrl = _auth.GetSharePointAdminUrl();
 
-        string siteCollectionId;
-        try
+        if (string.IsNullOrEmpty(siteCollectionId))
         {
-            siteCollectionId = await GetSiteCollectionIdAsync(siteUrl, ct);
-        }
-        catch
-        {
-            return; // Can't resolve site — nothing to remove
+            try
+            {
+                siteCollectionId = await GetSiteCollectionIdAsync(siteUrl, ct);
+            }
+            catch
+            {
+                return; // Can't resolve site — nothing to remove
+            }
         }
 
         // Get current secondary admins
@@ -475,5 +477,18 @@ public sealed class SharePointRestClient
 
         await PostAdminRestAsync(adminUrl,
             "_api/SPOInternalUseOnly.Tenant/SetSiteSecondaryAdministrators", setBody, ct);
+    }
+
+    /// <summary>
+    /// Try to extract the site collection GUID from a Graph composite site ID:
+    /// hostname,siteCollectionId,webId.
+    /// </summary>
+    public static string? TryExtractSiteCollectionId(string? graphSiteId)
+    {
+        if (string.IsNullOrWhiteSpace(graphSiteId)) return null;
+        var parts = graphSiteId.Split(',');
+        if (parts.Length >= 2 && !string.IsNullOrWhiteSpace(parts[1]))
+            return parts[1];
+        return null;
     }
 }
