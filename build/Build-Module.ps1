@@ -9,7 +9,8 @@
 [CmdletBinding()]
 param(
     [string]$Configuration = 'Release',
-    [string]$OutputPath = (Join-Path $PSScriptRoot '..' 'M365Permissions' 'lib')
+    [string]$OutputPath = (Join-Path $PSScriptRoot '..' 'M365Permissions' 'lib'),
+    [switch]$NoImport
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,4 +70,6 @@ if (Test-Path $nativeDir) {
 $dllCount = (Get-ChildItem -Path $OutputPath -Filter '*.dll').Count
 Write-Host "Build complete — $dllCount DLLs in $OutputPath" -ForegroundColor Green
 
-Import-Module C:\git\M365PermissionsV2\M365Permissions\M365Permissions.psd1 -Force
+if (-not $NoImport) {
+    Import-Module C:\git\M365PermissionsV2\M365Permissions\M365Permissions.psd1 -Force
+}

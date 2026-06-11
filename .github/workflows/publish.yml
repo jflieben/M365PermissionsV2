@@ -1,0 +1,48 @@
+name: Publish to PowerShell Gallery
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  publish:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Read release type
+        id: config
+        shell: pwsh
+        run: |
+          $releaseType = (Get-Content "build/release-type.txt" -Raw).Trim().ToLower()
+          if ($releaseType -notin @('preview', 'production')) {
+            throw "Invalid release type '$releaseType' in build/release-type.txt. Must be 'preview' or 'production'."
+          }
+          Write-Host "Release type: $releaseType"
+          "type=$releaseType" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build module
+        shell: pwsh
+        run: ./build/Build-Module.ps1 -NoImport
+
+      - name: Apply preview prerelease tag
+        if: steps.config.outputs.type == 'preview'
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $prerelease = "prev$sha"
+          Write-Host "Marking as prerelease: $prerelease"
+          Update-ModuleManifest -Path "M365Permissions/M365Permissions.psd1" -Prerelease $prerelease
+
+      - name: Publish to PowerShell Gallery
+        shell: pwsh
+        env:
+          PSGALL: ${{ secrets.PSGALL }}
+        run: |
+          Publish-Module -Path "M365Permissions" -NuGetApiKey $env:PSGALL -Verbose

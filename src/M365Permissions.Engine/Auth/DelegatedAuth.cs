@@ -69,6 +69,7 @@ public sealed class DelegatedAuth
     private readonly TokenCache _tokenCache;
     private string? _tenantId;
     private string? _tenantDomain;
+    private string? _sharePointTenant;
     private string? _userPrincipalName;
 
     public bool IsConnected => _tokenCache.HasValidToken("graph") || _tokenCache.GetRefreshToken() != null;
@@ -483,25 +484,17 @@ public sealed class DelegatedAuth
     /// <summary>Derive the tenant's SharePoint hostname (e.g. contoso.sharepoint.com).</summary>
     private string GetSharePointHost()
     {
-        // Use tenant domain to derive SPO host: lieben.nu → lieben.sharepoint.com
-        // Convention: take the first label of the verified domain
-        if (!string.IsNullOrEmpty(_tenantDomain))
-        {
-            var label = _tenantDomain.Split('.')[0];
-            return $"{label}.sharepoint.com";
-        }
-        throw new InvalidOperationException("Tenant domain not available. Ensure you're connected first.");
+        if (!string.IsNullOrEmpty(_sharePointTenant))
+            return $"{_sharePointTenant}.sharepoint.com";
+        throw new InvalidOperationException("SharePoint tenant not available. Ensure you're connected first.");
     }
 
     /// <summary>Derive the tenant's SharePoint admin hostname (e.g. contoso-admin.sharepoint.com).</summary>
     private string GetSharePointAdminHost()
     {
-        if (!string.IsNullOrEmpty(_tenantDomain))
-        {
-            var label = _tenantDomain.Split('.')[0];
-            return $"{label}-admin.sharepoint.com";
-        }
-        throw new InvalidOperationException("Tenant domain not available. Ensure you're connected first.");
+        if (!string.IsNullOrEmpty(_sharePointTenant))
+            return $"{_sharePointTenant}-admin.sharepoint.com";
+        throw new InvalidOperationException("SharePoint tenant not available. Ensure you're connected first.");
     }
 
     /// <summary>Get the SharePoint admin site URL (e.g. https://contoso-admin.sharepoint.com).</summary>
@@ -777,6 +770,16 @@ public sealed class DelegatedAuth
                     break;
                 }
             }
+        }
+
+        // Discover the actual SharePoint tenant prefix from the root site webUrl
+        // (the verified domain prefix may differ from the SharePoint tenant name)
+        var rootSiteResponse = await http.GetStringAsync("https://graph.microsoft.com/v1.0/sites/root", ct);
+        var rootSiteDoc = JsonDocument.Parse(rootSiteResponse);
+        if (rootSiteDoc.RootElement.TryGetProperty("webUrl", out var webUrlProp))
+        {
+            var webUrl = webUrlProp.GetString() ?? "";
+            _sharePointTenant = webUrl.Replace("https://", "", StringComparison.OrdinalIgnoreCase).Split('.')[0];
         }
     }
 
