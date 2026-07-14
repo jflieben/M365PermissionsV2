@@ -39,6 +39,5 @@ coverage/
 appsettings.*.json
 
 # Non public
-CHANGELOG.MD
 READMEINTERNAL.MD
 
