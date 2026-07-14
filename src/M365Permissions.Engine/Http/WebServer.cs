@@ -1,4 +1,5 @@
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -20,6 +21,13 @@ public sealed class WebServer : IDisposable
 
     public int Port { get; }
     public bool IsRunning => _listener.IsListening;
+
+    /// <summary>
+    /// Per-session random token. Required on every /api/* request via the X-M365-Token
+    /// header. Injected into index.html at serve time so the same-origin GUI can send it,
+    /// while cross-origin pages (which cannot read the localhost HTML body) cannot obtain it.
+    /// </summary>
+    public string SessionToken { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
 
     public WebServer(int port, string staticFilesPath)
     {
@@ -90,13 +98,25 @@ public sealed class WebServer : IDisposable
         var path = request.Url?.AbsolutePath ?? "/";
         var method = request.HttpMethod.ToUpperInvariant();
 
-        // CORS headers for local GUI
-        context.Response.Headers.Add("Access-Control-Allow-Origin", "*");
-        context.Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        context.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
+        // Baseline hardening headers. No CORS is emitted: the GUI is same-origin, so no
+        // Access-Control-Allow-Origin is needed, and its absence means a malicious website
+        // cannot read any /api/* response (S1).
+        context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+        context.Response.Headers["X-Frame-Options"] = "DENY";
+        context.Response.Headers["Referrer-Policy"] = "no-referrer";
+
+        // Reject requests that don't originate from the local GUI origin. The Host header is
+        // always present; the Origin header is present on state-changing/cross-origin fetches.
+        if (!IsLocalRequest(request))
+        {
+            context.Response.StatusCode = 403;
+            context.Response.Close();
+            return;
+        }
 
         if (method == "OPTIONS")
         {
+            // Same-origin requests never preflight; respond harmlessly without CORS headers.
             context.Response.StatusCode = 204;
             context.Response.Close();
             return;
@@ -105,6 +125,15 @@ public sealed class WebServer : IDisposable
         // Try API routes first
         if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase))
         {
+            // Every /api/* call must carry the per-session token. This blocks CSRF and any
+            // cross-origin read attempt (the token cannot be sent cross-origin without a
+            // preflight, which we do not grant) (S1).
+            if (!IsTokenValid(request))
+            {
+                await WriteJson(context.Response, 401, Models.ApiResponse.Fail("Missing or invalid session token"));
+                return;
+            }
+
             var (handler, routeParams) = MatchRoute(method, path);
             if (handler != null)
             {
@@ -115,8 +144,40 @@ public sealed class WebServer : IDisposable
             return;
         }
 
-        // Static files for GUI
-        await StaticFiles.Serve(context, _staticFilesPath);
+        // Static files for GUI (index.html gets the session token injected)
+        await StaticFiles.Serve(context, _staticFilesPath, SessionToken);
+    }
+
+    /// <summary>Validates Host (always) and Origin (when present) against the local GUI origin.</summary>
+    private bool IsLocalRequest(HttpListenerRequest request)
+    {
+        var host = request.Headers["Host"];
+        if (string.IsNullOrEmpty(host) || !IsAllowedAuthority(host))
+            return false;
+
+        var origin = request.Headers["Origin"];
+        if (!string.IsNullOrEmpty(origin))
+        {
+            if (!Uri.TryCreate(origin, UriKind.Absolute, out var originUri))
+                return false;
+            if (!originUri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) ||
+                !IsAllowedAuthority(originUri.Authority))
+                return false;
+        }
+        return true;
+    }
+
+    private bool IsAllowedAuthority(string authority) =>
+        authority.Equals($"localhost:{Port}", StringComparison.OrdinalIgnoreCase) ||
+        authority.Equals($"127.0.0.1:{Port}", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsTokenValid(HttpListenerRequest request)
+    {
+        var provided = request.Headers["X-M365-Token"];
+        if (string.IsNullOrEmpty(provided)) return false;
+        var a = Encoding.UTF8.GetBytes(provided);
+        var b = Encoding.UTF8.GetBytes(SessionToken);
+        return CryptographicOperations.FixedTimeEquals(a, b);
     }
 
     private (RouteHandler? handler, Dictionary<string, string> routeParams) MatchRoute(string method, string path)

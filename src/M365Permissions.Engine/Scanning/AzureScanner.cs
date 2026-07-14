@@ -114,8 +114,10 @@ public sealed class AzureScanner : IScanProvider
                 continue;
             }
 
-            // Resolve role definitions for this subscription
-            if (roleCache.Count == 0)
+            // Resolve role definitions for THIS subscription. Custom roles are scoped per
+            // subscription (distinct GUIDs), so loading only once left custom roles in other
+            // subscriptions rendered as raw GUIDs (B16). Built-in role GUIDs are shared, so
+            // merging repeatedly into the cache is harmless.
             {
                 try
                 {
@@ -153,6 +155,77 @@ public sealed class AzureScanner : IScanProvider
             context.ReportProgress($"Found {assignments.Count} role assignments in '{subName}'.", 4);
         }
 
+        // --- Management group role assignments (often where tenant-wide Owner lives) — A5 ---
+        try
+        {
+            var token = await _auth.GetAccessTokenAsync("azure", ct);
+            var mgs = await GetManagementGroupsAsync(token, ct);
+            if (mgs.Count > 0)
+                context.ReportProgress($"Scanning {mgs.Count} management group(s)...", 3);
+            foreach (var (mgName, mgDisplay) in mgs)
+            {
+                ct.ThrowIfCancellationRequested();
+                var url = $"https://management.azure.com/providers/Microsoft.Management/managementGroups/{Uri.EscapeDataString(mgName)}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()";
+                foreach (var a in await QueryArmValueAsync(url, token, ct))
+                {
+                    if (!a.TryGetProperty("properties", out var props)) continue;
+                    var roleDefId = props.TryGetProperty("roleDefinitionId", out var rdi) ? rdi.GetString() ?? "" : "";
+                    var principalId = props.TryGetProperty("principalId", out var pid) ? pid.GetString() ?? "" : "";
+                    var principalType = props.TryGetProperty("principalType", out var pt) ? pt.GetString() ?? "" : "";
+                    var scope = props.TryGetProperty("scope", out var scp) ? scp.GetString() ?? "" : "";
+                    allEntries.Add(new PermissionEntry
+                    {
+                        TargetPath = $"Azure/ManagementGroup/{(string.IsNullOrEmpty(mgDisplay) ? mgName : mgDisplay)}",
+                        TargetType = "ManagementGroup",
+                        TargetId = scope,
+                        PrincipalEntraId = principalId,
+                        PrincipalType = MapPrincipalType(principalType),
+                        PrincipalRole = ResolveRoleName(roleDefId, roleCache),
+                        Through = "AzureRBAC",
+                        AccessType = "Allow",
+                        Tenure = "Permanent"
+                    });
+                }
+            }
+        }
+        catch (Exception ex) { context.ReportProgress($"Management group scan skipped: {ex.Message}", 3); }
+
+        // --- Azure PIM eligible role assignments (per subscription) — A5 ---
+        try
+        {
+            var token = await _auth.GetAccessTokenAsync("azure", ct);
+            foreach (var (subId, subName) in subscriptions)
+            {
+                ct.ThrowIfCancellationRequested();
+                var url = $"https://management.azure.com/subscriptions/{subId}/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01";
+                var eligible = await QueryArmValueAsync(url, token, ct);
+                foreach (var e in eligible)
+                {
+                    if (!e.TryGetProperty("properties", out var props)) continue;
+                    var roleDefId = props.TryGetProperty("roleDefinitionId", out var rdi) ? rdi.GetString() ?? "" : "";
+                    var principalId = props.TryGetProperty("principalId", out var pid) ? pid.GetString() ?? "" : "";
+                    var principalType = props.TryGetProperty("principalType", out var pt) ? pt.GetString() ?? "" : "";
+                    var scope = props.TryGetProperty("scope", out var scp) ? scp.GetString() ?? "" : "";
+                    var endTime = props.TryGetProperty("endDateTime", out var et) && et.ValueKind == JsonValueKind.String ? et.GetString() ?? "" : "";
+                    allEntries.Add(new PermissionEntry
+                    {
+                        TargetPath = $"Azure/{subName}{FormatScope(scope, subId)}",
+                        TargetType = DetermineTargetType(scope),
+                        TargetId = scope,
+                        PrincipalEntraId = principalId,
+                        PrincipalType = MapPrincipalType(principalType),
+                        PrincipalRole = ResolveRoleName(roleDefId, roleCache),
+                        Through = "AzurePIM-Eligible",
+                        AccessType = "Allow",
+                        Tenure = string.IsNullOrEmpty(endTime) ? "Eligible-Permanent" : $"Eligible (until {endTime})"
+                    });
+                }
+                if (eligible.Count > 0)
+                    context.ReportProgress($"Found {eligible.Count} PIM-eligible Azure assignment(s) in '{subName}'.", 4);
+            }
+        }
+        catch (Exception ex) { context.ReportProgress($"Azure PIM scan skipped: {ex.Message}", 3); }
+
         // Resolve principal display names via Graph API
         if (allEntries.Count > 0)
         {
@@ -181,6 +254,40 @@ public sealed class AzureScanner : IScanProvider
             yield return entry;
 
         context.ReportProgress("Completed Azure RBAC scan.", 3);
+    }
+
+    /// <summary>Enumerate management groups the user can see (A5).</summary>
+    private async Task<List<(string Name, string DisplayName)>> GetManagementGroupsAsync(string token, CancellationToken ct)
+    {
+        var result = new List<(string, string)>();
+        const string url = "https://management.azure.com/providers/Microsoft.Management/managementGroups?api-version=2020-05-01";
+        foreach (var mg in await QueryArmValueAsync(url, token, ct))
+        {
+            var name = mg.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+            var disp = mg.TryGetProperty("properties", out var p) && p.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
+            if (!string.IsNullOrEmpty(name)) result.Add((name, disp));
+        }
+        return result;
+    }
+
+    /// <summary>GET an ARM collection endpoint, following nextLink, returning the "value" array items.</summary>
+    private async Task<List<JsonElement>> QueryArmValueAsync(string url, string token, CancellationToken ct)
+    {
+        var results = new List<JsonElement>();
+        string? next = url;
+        while (!string.IsNullOrEmpty(next))
+        {
+            ct.ThrowIfCancellationRequested();
+            using var req = new HttpRequestMessage(HttpMethod.Get, next);
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            var resp = await _http.SendAsync(req, ct);
+            if (!resp.IsSuccessStatusCode) break;
+            var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
+                foreach (var v in val.EnumerateArray()) results.Add(v.Clone());
+            next = doc.RootElement.TryGetProperty("nextLink", out var nl) ? nl.GetString() : null;
+        }
+        return results;
     }
 
     private async Task LoadRoleDefinitionsAsync(string subscriptionId, Dictionary<string, string> cache, CancellationToken ct)

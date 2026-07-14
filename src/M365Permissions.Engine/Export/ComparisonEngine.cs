@@ -69,14 +69,23 @@ public sealed class ComparisonEngine
     private static Dictionary<string, PermissionEntry> BuildLookup(List<PermissionEntry> entries)
     {
         var dict = new Dictionary<string, PermissionEntry>();
+        // Track how many times each base key has been seen so genuine duplicates (e.g. the same
+        // principal with two distinct sharing links on one path) get distinct keys. Previously
+        // TryAdd collapsed them, so removing the 2nd of two identical grants was invisible (A7).
+        var occurrences = new Dictionary<string, int>();
         foreach (var entry in entries)
         {
             var principalKey = !string.IsNullOrEmpty(entry.PrincipalEntraId)
                 ? entry.PrincipalEntraId
                 : entry.PrincipalSysId;
-            var key = $"{entry.Category}|{entry.TargetPath}|{principalKey}|{entry.PrincipalRole}|{entry.Through}";
+            // target_id disambiguates same-path/different-resource grants that share a display path.
+            var baseKey = $"{entry.Category}|{entry.TargetPath}|{entry.TargetId}|{principalKey}|{entry.PrincipalRole}|{entry.Through}";
 
-            dict.TryAdd(key, entry);
+            var seen = occurrences.GetValueOrDefault(baseKey, 0);
+            occurrences[baseKey] = seen + 1;
+            var key = seen == 0 ? baseKey : $"{baseKey}#{seen}";
+
+            dict[key] = entry;
         }
         return dict;
     }

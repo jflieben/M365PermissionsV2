@@ -94,16 +94,11 @@ public sealed class ExchangeRestClient
                                 null, statusCode);
                         }
 
-                        // Check if this is a known transient Exchange error (even on HTTP 400)
-                        var isTransient = TransientErrorCodes.Any(code =>
-                            errorBody.Contains(code, StringComparison.OrdinalIgnoreCase));
-
-                        if (isTransient && attempt < MaxRetries - 1)
-                        {
-                            await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt + 1)), ct);
-                            break; // Break inner pagination loop to retry from scratch
-                        }
-
+                        // Non-auth failure: throw so the outer retry loop handles it. Previously a
+                        // transient error broke out of pagination and fell through to `return
+                        // results`, returning partial data as success. Now transient Exchange errors
+                        // (even on HTTP 400) are matched by the catch filter below, which resets all
+                        // pagination state and retries from scratch (B7).
                         throw new HttpRequestException(
                             $"EXO {(int)response.StatusCode} {response.ReasonPhrase} [{cmdletName}]: {Truncate(errorBody, 500)}",
                             null, response.StatusCode);
@@ -139,7 +134,11 @@ public sealed class ExchangeRestClient
                 (ex.StatusCode == null || (int)ex.StatusCode >= 500 ||
                  (ex.Message != null && TransientErrorCodes.Any(code => ex.Message.Contains(code, StringComparison.OrdinalIgnoreCase)))))
             {
-                results.Clear(); // Reset partial results before retry
+                // Reset ALL pagination state before retrying from scratch: both the accumulated
+                // results and the nextLink cursor. Otherwise the retry resumed mid-pagination
+                // having discarded pages 1..n-1 (B7).
+                results.Clear();
+                nextLink = null;
                 await Task.Delay(TimeSpan.FromSeconds((attempt + 1) * 2), ct);
             }
         }

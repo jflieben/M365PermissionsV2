@@ -13,6 +13,7 @@ M365Permissions - Microsoft 365 & Azure Permission Scanner
 For the enterprise Azure-native version, see https://www.m365permissions.com
 
 This module reports on permissions across SharePoint, Entra ID, Exchange Online, OneDrive, Power BI, Power Platform, Azure RBAC, and Azure DevOps.
+It can compare over time, scan multiple tenants and show an overview of all permissions for e.g. a specific user.
 
 INSTALLATION:
     Install-PSResource -Name M365Permissions -Repository PSGallery
@@ -42,7 +43,13 @@ Free for non-commercial use. See https://www.lieben.nu/liebensraum/commercial-us
         'Start-M365Scan',
         'Stop-M365Scan',
         'Start-M365GUI',
-        'Stop-M365GUI'
+        'Stop-M365GUI',
+        'Get-M365Permissions',
+        'Export-M365Permissions',
+        'Compare-M365Scans',
+        'Get-M365Config',
+        'Set-M365Config',
+        'Get-M365ScanStatus'
     )
 
     CmdletsToExport      = @()
@@ -51,10 +58,10 @@ Free for non-commercial use. See https://www.lieben.nu/liebensraum/commercial-us
 
     PrivateData          = @{
         PSData = @{
-            Tags         = @('M365', 'Permissions', 'SharePoint', 'Entra', 'Exchange', 'Security', 'Audit')
+            Tags         = @('M365Permissions', 'Microsoft365', 'SharePoint', 'Entra', 'Exchange', 'Security', 'Audit', 'Azure', 'PowerBI', 'PowerPlatform', 'DevOps')
             LicenseUri   = 'https://www.lieben.nu/liebensraum/commercial-use/'
             ProjectUri   = 'https://lieben.nu/liebensraum/m365permissions'
-            ReleaseNotes = 'Initial release - V2 rewrite'
+            ReleaseNotes = 'See https://github.com/jflieben/M365PermissionsV2'
         }
     }
 }

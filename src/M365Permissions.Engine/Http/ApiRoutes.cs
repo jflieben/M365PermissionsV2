@@ -1,4 +1,5 @@
 using System.Text.Json;
+using M365Permissions.Engine.Database;
 using M365Permissions.Engine.Graph;
 using M365Permissions.Engine.Models;
 using M365Permissions.Engine.Scanning;
@@ -128,6 +129,37 @@ public static class ApiRoutes
         {
             engine.CancelScan();
             await WebServer.WriteJson(ctx.Response, 200, ApiResponse.Ok());
+        });
+
+        // Persisted per-category progress + logs (survive engine restarts / long scans).
+        server.Route("GET", "/api/scans/:id/progress", async (ctx, p) =>
+        {
+            var scanId = long.Parse(p["id"]);
+            await WebServer.WriteJson(ctx.Response, 200,
+                ApiResponse<List<ScanProgress>>.Ok(engine.GetPersistedProgress(scanId)));
+        });
+
+        server.Route("GET", "/api/scans/:id/logs", async (ctx, p) =>
+        {
+            var scanId = long.Parse(p["id"]);
+            var q = ctx.Request.QueryString;
+            int? maxLevel = int.TryParse(q["level"], out var lv) ? lv : null;
+            var category = q["category"];
+            await WebServer.WriteJson(ctx.Response, 200,
+                ApiResponse<List<LogEntry>>.Ok(engine.GetScanLogs(scanId, maxLevel, category)));
+        });
+
+        server.Route("GET", "/api/scans/:id/risk-delta", async (ctx, p) =>
+        {
+            var scanId = long.Parse(p["id"]);
+            await WebServer.WriteJson(ctx.Response, 200,
+                ApiResponse<RiskDelta>.Ok(engine.GetRiskDelta(scanId)));
+        });
+
+        server.Route("GET", "/api/version", async (ctx, _) =>
+        {
+            var info = await engine.CheckForUpdateAsync();
+            await WebServer.WriteJson(ctx.Response, 200, ApiResponse<VersionInfo>.Ok(info));
         });
 
         server.Route("GET", "/api/scan/throttle", async (ctx, _) =>

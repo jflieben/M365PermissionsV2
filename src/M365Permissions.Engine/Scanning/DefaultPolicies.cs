@@ -41,8 +41,9 @@ public static class DefaultPolicies
             Conditions = new()
             {
                 new() { Field = "tenure", Operator = "equals", Value = "Permanent" },
-                new() { Field = "through", Operator = "regex", Value = @"^(DirectoryRole|Direct)$" },
-                new() { Field = "target_path", Operator = "regex", Value = CriticalAdminRolesRegex }
+                new() { Field = "through", Operator = "equals", Value = "DirectoryRoleAssignment" },
+                // Scanners emit the bare role name in principal_role; target_path is prefixed "DirectoryRole/".
+                new() { Field = "principal_role", Operator = "regex", Value = CriticalAdminRolesRegex }
             }
         },
         new Policy
@@ -73,6 +74,19 @@ public static class DefaultPolicies
         },
         new Policy
         {
+            Name = "Azure management-group Owner/Contributor",
+            Description = "Critical Azure RBAC role at management-group scope — applies tenant-wide across all child subscriptions",
+            Severity = "Critical",
+            CategoryFilter = "Azure",
+            IsDefault = true,
+            Conditions = new()
+            {
+                new() { Field = "principal_role", Operator = "regex", Value = CriticalAzureRolesRegex },
+                new() { Field = "target_type", Operator = "equals", Value = "ManagementGroup" }
+            }
+        },
+        new Policy
+        {
             Name = "Azure DevOps Project Collection Administrator",
             Description = "Member of Project Collection Administrators — has full control over the entire Azure DevOps organization",
             Severity = "Critical",
@@ -95,8 +109,9 @@ public static class DefaultPolicies
             IsDefault = true,
             Conditions = new()
             {
-                new() { Field = "tenure", Operator = "equals", Value = "Eligible" },
-                new() { Field = "target_path", Operator = "regex", Value = CriticalAdminRolesRegex }
+                // Scanner emits "Eligible-Permanent" or "Eligible (until …)".
+                new() { Field = "tenure", Operator = "startswith", Value = "Eligible" },
+                new() { Field = "principal_role", Operator = "regex", Value = CriticalAdminRolesRegex }
             }
         },
         new Policy
@@ -158,7 +173,8 @@ public static class DefaultPolicies
             IsDefault = true,
             Conditions = new()
             {
-                new() { Field = "through", Operator = "contains", Value = "Anonymous" }
+                // Anonymous link scope is recorded in principal_type, not through.
+                new() { Field = "principal_type", Operator = "equals", Value = "Anonymous" }
             }
         },
         new Policy
@@ -194,8 +210,9 @@ public static class DefaultPolicies
             IsDefault = true,
             Conditions = new()
             {
-                new() { Field = "through", Operator = "equals", Value = "OAuth2Grant" },
-                new() { Field = "tenure", Operator = "equals", Value = "AllPrincipals" },
+                // Scanner emits "OAuth2Grant" or "OAuth2Grant → {resource}"; AllPrincipals lands in principal_type.
+                new() { Field = "through", Operator = "startswith", Value = "OAuth2Grant" },
+                new() { Field = "principal_type", Operator = "equals", Value = "AllPrincipals" },
                 new() { Field = "principal_role", Operator = "regex", Value = HighRiskAppPermsRegex }
             }
         },
@@ -249,9 +266,9 @@ public static class DefaultPolicies
             Conditions = new()
             {
                 new() { Field = "tenure", Operator = "equals", Value = "Permanent" },
-                new() { Field = "through", Operator = "equals", Value = "DirectoryRole" },
+                new() { Field = "through", Operator = "equals", Value = "DirectoryRoleAssignment" },
                 new() { Field = "target_type", Operator = "equals", Value = "DirectoryRole" },
-                new() { Field = "target_path", Operator = "regex", Value = @"^(?!(Global Administrator|Company Administrator|Exchange Administrator|SharePoint Administrator|Teams Administrator|Security Administrator|Privileged Role Administrator|Privileged Authentication Administrator|User Administrator|Application Administrator|Cloud Application Administrator|Intune Administrator|Authentication Administrator|Billing Administrator|Conditional Access Administrator|Compliance Administrator)$)" }
+                new() { Field = "principal_role", Operator = "regex", Value = @"^(?!(Global Administrator|Company Administrator|Exchange Administrator|SharePoint Administrator|Teams Administrator|Security Administrator|Privileged Role Administrator|Privileged Authentication Administrator|User Administrator|Application Administrator|Cloud Application Administrator|Intune Administrator|Authentication Administrator|Billing Administrator|Conditional Access Administrator|Compliance Administrator)$)" }
             }
         },
         new Policy
@@ -263,7 +280,8 @@ public static class DefaultPolicies
             IsDefault = true,
             Conditions = new()
             {
-                new() { Field = "through", Operator = "contains", Value = "Organization" }
+                // Organization-wide link scope maps to principal_type "AllInternalUsers".
+                new() { Field = "principal_type", Operator = "equals", Value = "AllInternalUsers" }
             }
         },
         new Policy

@@ -56,6 +56,13 @@ public sealed class StatusResponse
 
     [JsonPropertyName("refreshTokenExpiry")]
     public string? RefreshTokenExpiry { get; set; }
+
+    // License clarity in-product — converts the compliance-minded audience ($5).
+    [JsonPropertyName("licenseNote")]
+    public string LicenseNote { get; set; } = "Free for non-commercial use.";
+
+    [JsonPropertyName("licenseUrl")]
+    public string LicenseUrl { get; set; } = "https://www.lieben.nu/liebensraum/commercial-use/";
 }
 
 /// <summary>

@@ -69,13 +69,18 @@ public sealed class OneDriveScanner : IScanProvider
         {
             ct.ThrowIfCancellationRequested();
 
-            // Determine the OneDrive site URL via Graph drive API
+            // Determine the OneDrive site URL via Graph drive API. Fetch the drive id here too so
+            // the item-level scan below doesn't re-fetch users/{id}/drive a second time (B16).
             var oneDriveUrl = "";
+            var driveId = "";
+            var driveWebUrl = "";
             try
             {
-                var driveResponse = await _graphClient.GetAsync($"users/{userId}/drive?$select=webUrl", ct: ct);
+                var driveResponse = await _graphClient.GetAsync($"users/{userId}/drive?$select=id,webUrl", ct: ct);
                 if (driveResponse != null && driveResponse.Value.TryGetProperty("webUrl", out var wUrl))
                 {
+                    driveId = driveResponse.Value.TryGetProperty("id", out var didEnum) ? didEnum.GetString() ?? "" : "";
+                    driveWebUrl = wUrl.GetString() ?? "";
                     // webUrl is like https://tenant-my.sharepoint.com/personal/user_domain_com/Documents
                     // We need the site URL (remove /Documents or similar trailing path)
                     var webUrlStr = wUrl.GetString() ?? "";
@@ -161,16 +166,11 @@ public sealed class OneDriveScanner : IScanProvider
                         yield return entry;
                 }
 
-                // --- Item-level sharing via Graph drive API ---
+                // --- Item-level sharing via Graph drive API (reuses driveId from enumeration) ---
                 var itemEntries = new List<PermissionEntry>();
                 try
                 {
-                    var driveResponse = await _graphClient.GetAsync($"users/{userId}/drive?$select=id,webUrl", ct: ct);
-                    if (driveResponse != null)
                     {
-                        var driveId = driveResponse.Value.TryGetProperty("id", out var did) ? did.GetString() ?? "" : "";
-                        var driveUrl = driveResponse.Value.TryGetProperty("webUrl", out var dUrl) ? dUrl.GetString() ?? "" : "";
-
                         if (!string.IsNullOrEmpty(driveId))
                         {
                             await foreach (var item in _graphClient.GetPaginatedAsync(
@@ -203,7 +203,7 @@ public sealed class OneDriveScanner : IScanProvider
 
                                 foreach (var perm in itemPerms)
                                 {
-                                    var entry = MapDriveItemPermission(perm, driveUrl, itemName, itemUrl, userUpn, userId, driveId, scannerFilter);
+                                    var entry = MapDriveItemPermission(perm, driveWebUrl, itemName, itemUrl, userUpn, userId, driveId, scannerFilter);
                                     if (entry != null) itemEntries.Add(entry);
                                 }
                             }
@@ -222,16 +222,20 @@ public sealed class OneDriveScanner : IScanProvider
             }
             finally
             {
+                // Use a fresh short-timeout token (not the scan token, which may already be
+                // cancelled) so the scanning account is not left elevated on the user's
+                // OneDrive after a cancelled scan (B8).
                 if (wasAdded && !string.IsNullOrEmpty(scannerUpn))
                 {
+                    using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
                     try
                     {
-                        await _spClient.RemoveSiteAdminViaTenantAsync(oneDriveUrl, scannerUpn, ct);
+                        await _spClient.RemoveSiteAdminViaTenantAsync(oneDriveUrl, scannerUpn, cleanupCts.Token);
                         context.ReportProgress($"Removed temporary admin from OneDrive: {displayName}", 4);
                     }
                     catch (Exception ex)
                     {
-                        context.ReportProgress($"WARNING: Failed to remove temp admin from OneDrive of {displayName}: {ex.Message}", 2);
+                        context.ReportProgress($"WARNING: Failed to remove temp admin from OneDrive of {displayName} — account may remain elevated on {oneDriveUrl}: {ex.Message}", 2);
                     }
                 }
             }

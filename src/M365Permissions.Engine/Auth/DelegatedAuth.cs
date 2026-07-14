@@ -34,6 +34,7 @@ public sealed class DelegatedAuth
         ["sharepoint"] = new[] { "Sites.Read.All" },
         ["onedrive"]   = new[] { "User.Read.All", "Sites.Read.All", "Files.Read.All" },
         ["entra"]      = new[] { "Directory.Read.All", "Application.Read.All", "Group.Read.All", "GroupMember.Read.All", "RoleManagement.Read.Directory" },
+        ["teams"]      = new[] { "Team.ReadBasic.All", "TeamMember.Read.All", "Channel.ReadBasic.All", "ChannelMember.Read.All" },
         ["exchange"]   = new[] { "User.Read.All" },
         ["powerbi"]    = new[] { "User.Read.All" },
         ["powerautomate"] = new[] { "User.Read.All" },
@@ -92,13 +93,11 @@ public sealed class DelegatedAuth
         // Generate PKCE challenge
         var codeVerifier = GenerateCodeVerifier();
         var codeChallenge = GenerateCodeChallenge(codeVerifier);
+        var state = GenerateState();
 
-        // Loopback listener on fixed port
-        var listener = new HttpListener();
-        const int redirectPort = 1985;
-        var redirectUri = $"http://localhost:{redirectPort}/";
-        listener.Prefixes.Add(redirectUri);
-        listener.Start();
+        // Loopback listener on the fixed redirect port (1985 — the only URI on the Entra app).
+        var redirectUri = "http://localhost:1985/";
+        var listener = StartLoopbackListener(redirectUri);
 
         try
         {
@@ -109,30 +108,15 @@ public sealed class DelegatedAuth
                 $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
                 $"&response_mode=query" +
                 $"&scope={Uri.EscapeDataString(MinimalGraphScope)}" +
+                $"&state={Uri.EscapeDataString(state)}" +
                 $"&code_challenge={codeChallenge}" +
                 $"&code_challenge_method=S256";
 
-            // Open browser
             OpenBrowser(authUrl);
 
-            // Wait for callback
-            var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromMinutes(5), ct);
-            var code = context.Request.QueryString["code"];
-            var error = context.Request.QueryString["error"];
-            var errorDescription = context.Request.QueryString["error_description"];
-
-            // Send response to browser
-            var responseHtml = code != null
-                ? "<html><body><h2>Authentication successful!</h2><p>You can close this window.</p></body></html>"
-                : $"<html><body style='font-family:sans-serif'><h2>Authentication failed</h2><p><b>{System.Net.WebUtility.HtmlEncode(error)}</b></p><pre style='white-space:pre-wrap'>{System.Net.WebUtility.HtmlEncode(errorDescription)}</pre></body></html>";
-            var buffer = System.Text.Encoding.UTF8.GetBytes(responseHtml);
-            context.Response.ContentType = "text/html";
-            context.Response.ContentLength64 = buffer.Length;
-            await context.Response.OutputStream.WriteAsync(buffer, ct);
-            context.Response.Close();
-
-            if (string.IsNullOrEmpty(code))
-                throw new InvalidOperationException($"Authentication failed: {error} — {errorDescription}");
+            var code = await WaitForOAuthCallbackAsync(listener, state,
+                "<html><body><h2>Authentication successful!</h2><p>You can close this window.</p></body></html>",
+                "Authentication failed", ct);
 
             // Exchange code for tokens
             await ExchangeCodeForTokens(code, redirectUri, codeVerifier, ct);
@@ -164,12 +148,10 @@ public sealed class DelegatedAuth
     {
         var codeVerifier = GenerateCodeVerifier();
         var codeChallenge = GenerateCodeChallenge(codeVerifier);
+        var state = GenerateState();
 
-        var listener = new HttpListener();
-        const int redirectPort = 1985;
-        var redirectUri = $"http://localhost:{redirectPort}/";
-        listener.Prefixes.Add(redirectUri);
-        listener.Start();
+        var redirectUri = "http://localhost:1985/";
+        var listener = StartLoopbackListener(redirectUri);
 
         try
         {
@@ -180,27 +162,15 @@ public sealed class DelegatedAuth
                 $"&response_mode=query" +
                 $"&scope={Uri.EscapeDataString(MinimalGraphScope)}" +
                 $"&prompt=consent" +
+                $"&state={Uri.EscapeDataString(state)}" +
                 $"&code_challenge={codeChallenge}" +
                 $"&code_challenge_method=S256";
 
             OpenBrowser(authUrl);
 
-            var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromMinutes(5), ct);
-            var code = context.Request.QueryString["code"];
-            var error = context.Request.QueryString["error"];
-            var errorDescription = context.Request.QueryString["error_description"];
-
-            var responseHtml = code != null
-                ? "<html><body><h2>Consent granted!</h2><p>Permissions have been updated. You can close this window.</p></body></html>"
-                : $"<html><body style='font-family:sans-serif'><h2>Consent failed</h2><p><b>{System.Net.WebUtility.HtmlEncode(error)}</b></p><pre style='white-space:pre-wrap'>{System.Net.WebUtility.HtmlEncode(errorDescription)}</pre></body></html>";
-            var buffer = System.Text.Encoding.UTF8.GetBytes(responseHtml);
-            context.Response.ContentType = "text/html";
-            context.Response.ContentLength64 = buffer.Length;
-            await context.Response.OutputStream.WriteAsync(buffer, ct);
-            context.Response.Close();
-
-            if (string.IsNullOrEmpty(code))
-                throw new InvalidOperationException($"Consent failed: {error} — {errorDescription}");
+            var code = await WaitForOAuthCallbackAsync(listener, state,
+                "<html><body><h2>Consent granted!</h2><p>Permissions have been updated. You can close this window.</p></body></html>",
+                "Consent failed", ct);
 
             // Exchange code for fresh tokens with the newly consented permissions
             await ExchangeCodeForTokens(code, redirectUri, codeVerifier, ct);
@@ -517,6 +487,15 @@ public sealed class DelegatedAuth
 
         if (!response.IsSuccessStatusCode)
         {
+            // If the PRIMARY refresh token is expired/revoked, the whole session is dead. Clear it
+            // so IsConnected (and the GUI badge) reflect reality instead of staying "connected"
+            // because a stale .rt file still exists on disk.
+            if (!isPP && cacheKey == "graph" && IsInvalidGrant(json))
+            {
+                SignOut();
+                throw new InvalidOperationException(
+                    "Your saved sign-in has expired or was revoked. Please connect again.");
+            }
             ThrowIfResourcePrincipalMissing(cacheKey, json);
             throw new InvalidOperationException($"Token acquisition for '{cacheKey}' failed: {json}");
         }
@@ -536,6 +515,23 @@ public sealed class DelegatedAuth
             else
                 _tokenCache.SetRefreshToken(rt.GetString()!, rtExpiry);
         }
+    }
+
+    /// <summary>
+    /// Detect a token-endpoint error that means the refresh token itself is no longer usable
+    /// (expired, revoked, password change, MFA/session invalidation) — as opposed to a per-resource
+    /// consent/provisioning problem. Used to clear a dead primary session.
+    /// </summary>
+    private static bool IsInvalidGrant(string errorJson)
+    {
+        // AADSTS700082: RT expired due to inactivity. AADSTS70008: expired/revoked.
+        // AADSTS50173: session revoked (password change). AADSTS50078/50076: MFA required again.
+        // AADSTS700084: RT was issued to a different session. oauth error: "invalid_grant".
+        string[] codes = { "invalid_grant", "AADSTS700082", "AADSTS70008", "AADSTS50173", "AADSTS50078", "AADSTS700084" };
+        foreach (var c in codes)
+            if (errorJson.Contains(c, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
     }
 
     /// <summary>
@@ -616,12 +612,10 @@ public sealed class DelegatedAuth
     {
         var codeVerifier = GenerateCodeVerifier();
         var codeChallenge = GenerateCodeChallenge(codeVerifier);
+        var state = GenerateState();
 
-        var listener = new HttpListener();
-        const int redirectPort = 1985;
-        var redirectUri = $"http://localhost:{redirectPort}/";
-        listener.Prefixes.Add(redirectUri);
-        listener.Start();
+        var redirectUri = "http://localhost:1985/";
+        var listener = StartLoopbackListener(redirectUri);
 
         try
         {
@@ -632,27 +626,15 @@ public sealed class DelegatedAuth
                 $"&response_mode=query" +
                 $"&scope={Uri.EscapeDataString(scope)}" +
                 (forceConsentPrompt ? "&prompt=consent" : "") +
+                $"&state={Uri.EscapeDataString(state)}" +
                 $"&code_challenge={codeChallenge}" +
                 $"&code_challenge_method=S256";
 
             OpenBrowser(authUrl);
 
-            var context = await listener.GetContextAsync().WaitAsync(TimeSpan.FromMinutes(5), ct);
-            var code = context.Request.QueryString["code"];
-            var error = context.Request.QueryString["error"];
-            var errorDescription = context.Request.QueryString["error_description"];
-
-            var responseHtml = code != null
-                ? "<html><body><h2>Authentication successful!</h2><p>You can close this window.</p></body></html>"
-                : $"<html><body style='font-family:sans-serif'><h2>Authentication failed</h2><p><b>{System.Net.WebUtility.HtmlEncode(error)}</b></p><pre style='white-space:pre-wrap'>{System.Net.WebUtility.HtmlEncode(errorDescription)}</pre></body></html>";
-            var buffer = System.Text.Encoding.UTF8.GetBytes(responseHtml);
-            context.Response.ContentType = "text/html";
-            context.Response.ContentLength64 = buffer.Length;
-            await context.Response.OutputStream.WriteAsync(buffer, ct);
-            context.Response.Close();
-
-            if (string.IsNullOrEmpty(code))
-                throw new InvalidOperationException($"Interactive auth failed for '{cacheKey}': {error} — {errorDescription}");
+            var code = await WaitForOAuthCallbackAsync(listener, state,
+                "<html><body><h2>Authentication successful!</h2><p>You can close this window.</p></body></html>",
+                $"Interactive auth failed for '{cacheKey}'", ct);
 
             using var http = new HttpClient();
             var body = new FormUrlEncodedContent(new Dictionary<string, string>
@@ -781,6 +763,100 @@ public sealed class DelegatedAuth
             var webUrl = webUrlProp.GetString() ?? "";
             _sharePointTenant = webUrl.Replace("https://", "", StringComparison.OrdinalIgnoreCase).Split('.')[0];
         }
+    }
+
+    /// <summary>Random opaque value bound to one authorize request; verified on the callback.</summary>
+    private static string GenerateState() => Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+
+    /// <summary>
+    /// Wait for the OAuth redirect on the loopback listener and return the authorization code.
+    /// The listener stays open across stray requests (favicon fetches, other local tools polling
+    /// the same port, duplicate/stale redirects): anything without our exact <c>state</c> is
+    /// answered and ignored rather than aborting the flow. Only a request carrying the matching
+    /// state is acted on — that preserves the login-CSRF protection (S2) while being robust to
+    /// noise on the fixed port 1985 (the Entra app registration only redirects there).
+    /// </summary>
+    private static async Task<string> WaitForOAuthCallbackAsync(
+        HttpListener listener, string expectedState, string successHtml, string failureTitle, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddMinutes(5);
+        while (true)
+        {
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                throw new TimeoutException("Timed out waiting for the sign-in redirect. Please try connecting again.");
+
+            var context = await listener.GetContextAsync().WaitAsync(remaining, ct);
+            var query = context.Request.QueryString;
+            var returnedState = query["state"];
+            var code = query["code"];
+            var error = query["error"];
+            var errorDescription = query["error_description"];
+
+            // Not our callback (no OAuth params at all) — a favicon fetch or another tool polling
+            // this port. Answer politely and keep waiting for the real redirect.
+            if (string.IsNullOrEmpty(returnedState) && string.IsNullOrEmpty(code) && string.IsNullOrEmpty(error))
+            {
+                await WriteBrowserResponseAsync(context, "<html><body>Waiting for sign-in…</body></html>", ct);
+                continue;
+            }
+
+            // Carries state (or an error) but the state doesn't match ours: a stale/duplicate
+            // redirect or a forgery attempt. Reject it but keep listening for the legitimate one.
+            if (!string.Equals(returnedState, expectedState, StringComparison.Ordinal))
+            {
+                await WriteBrowserResponseAsync(context,
+                    "<html><body>Unexpected sign-in response — ignoring. You can close this tab.</body></html>", ct);
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(error))
+            {
+                await WriteBrowserResponseAsync(context,
+                    $"<html><body style='font-family:sans-serif'><h2>{failureTitle}</h2><p><b>{WebUtility.HtmlEncode(error)}</b></p><pre style='white-space:pre-wrap'>{WebUtility.HtmlEncode(errorDescription)}</pre></body></html>", ct);
+                throw new InvalidOperationException($"{failureTitle}: {error} — {errorDescription}");
+            }
+
+            if (!string.IsNullOrEmpty(code))
+            {
+                await WriteBrowserResponseAsync(context, successHtml, ct);
+                return code;
+            }
+
+            // Matching state but neither code nor error — unusual; keep waiting.
+            await WriteBrowserResponseAsync(context, "<html><body>Waiting for sign-in…</body></html>", ct);
+        }
+    }
+
+    private static async Task WriteBrowserResponseAsync(HttpListenerContext context, string html, CancellationToken ct)
+    {
+        var buffer = System.Text.Encoding.UTF8.GetBytes(html);
+        context.Response.ContentType = "text/html";
+        context.Response.ContentLength64 = buffer.Length;
+        await context.Response.OutputStream.WriteAsync(buffer, ct);
+        context.Response.Close();
+    }
+
+    /// <summary>
+    /// Bind the loopback listener on the fixed redirect port (1985, the only URI registered on the
+    /// Entra app). Fails fast with an actionable message if the port is already in use (R4/S6).
+    /// </summary>
+    private static HttpListener StartLoopbackListener(string redirectUri)
+    {
+        var listener = new HttpListener();
+        listener.Prefixes.Add(redirectUri);
+        try
+        {
+            listener.Start();
+        }
+        catch (HttpListenerException ex)
+        {
+            throw new InvalidOperationException(
+                "Cannot start the sign-in listener on http://localhost:1985 — the port is in use by " +
+                "another application. Free port 1985 and try connecting again. (The Entra app only " +
+                $"permits this redirect URI.) Details: {ex.Message}", ex);
+        }
+        return listener;
     }
 
     private static string GenerateCodeVerifier()

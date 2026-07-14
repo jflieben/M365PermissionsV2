@@ -284,20 +284,28 @@ public sealed class PurviewScanner : IScanProvider
                 if (group.TryGetProperty("Roles", out var rolesVal))
                 {
                     if (rolesVal.ValueKind == JsonValueKind.Array)
+                    {
                         foreach (var r in rolesVal.EnumerateArray())
                             if (r.ValueKind == JsonValueKind.String)
                                 roles.Add(r.GetString()!);
+                    }
                     else if (rolesVal.ValueKind == JsonValueKind.String)
+                    {
                         roles.Add(rolesVal.GetString()!);
+                    }
                 }
                 if (group.TryGetProperty("RoleAssignments", out var raVal))
                 {
                     if (raVal.ValueKind == JsonValueKind.Array)
+                    {
                         foreach (var r in raVal.EnumerateArray())
                             if (r.ValueKind == JsonValueKind.String)
                                 roles.Add(r.GetString()!);
+                    }
                     else if (raVal.ValueKind == JsonValueKind.String)
+                    {
                         roles.Add(raVal.GetString()!);
+                    }
                 }
 
                 // Determine if this is a built-in or custom role group

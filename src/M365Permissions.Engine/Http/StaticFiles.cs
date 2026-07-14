@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text;
 
 namespace M365Permissions.Engine.Http;
 
@@ -22,7 +23,7 @@ public static class StaticFiles
         [".ttf"] = "font/ttf",
     };
 
-    public static async Task Serve(HttpListenerContext context, string rootPath)
+    public static async Task Serve(HttpListenerContext context, string rootPath, string? sessionToken = null)
     {
         var requestPath = context.Request.Url?.AbsolutePath ?? "/";
 
@@ -62,9 +63,43 @@ public static class StaticFiles
         else
             context.Response.Headers.Add("Cache-Control", "no-cache");
 
-        var bytes = await File.ReadAllBytesAsync(fullPath).ConfigureAwait(false);
+        byte[] bytes;
+        if (ext == ".html" && !string.IsNullOrEmpty(sessionToken))
+        {
+            // Inject the per-session token and a fetch wrapper that attaches it to every
+            // /api request, so the same-origin GUI authenticates without editing app.js (S1).
+            var html = await File.ReadAllTextAsync(fullPath).ConfigureAwait(false);
+            html = InjectSessionToken(html, sessionToken);
+            bytes = Encoding.UTF8.GetBytes(html);
+        }
+        else
+        {
+            bytes = await File.ReadAllBytesAsync(fullPath).ConfigureAwait(false);
+        }
         context.Response.ContentLength64 = bytes.Length;
         await context.Response.OutputStream.WriteAsync(bytes).ConfigureAwait(false);
         context.Response.Close();
+    }
+
+    /// <summary>
+    /// Inserts the session token and a fetch wrapper immediately after the &lt;head&gt; tag so
+    /// it runs before any other script. The wrapper adds the X-M365-Token header to every
+    /// request whose URL begins with "/api". The token is JSON-encoded to be JS-safe.
+    /// </summary>
+    private static string InjectSessionToken(string html, string sessionToken)
+    {
+        var script =
+            "<script>window.__M365_TOKEN=" + System.Text.Json.JsonSerializer.Serialize(sessionToken) + ";" +
+            "(function(){var f=window.fetch;window.fetch=function(u,o){try{" +
+            "var s=typeof u===\"string\"?u:(u&&u.url)||\"\";" +
+            "if(s.indexOf(\"/api\")===0){o=o||{};var h=new Headers(o.headers||{});" +
+            "h.set(\"X-M365-Token\",window.__M365_TOKEN);o.headers=h;}}catch(e){}" +
+            "return f.call(this,u,o);};})();</script>";
+
+        var idx = html.IndexOf("<head>", StringComparison.OrdinalIgnoreCase);
+        if (idx >= 0)
+            return html.Insert(idx + "<head>".Length, script);
+        // No <head> found: prepend so the wrapper still installs before app scripts.
+        return script + html;
     }
 }

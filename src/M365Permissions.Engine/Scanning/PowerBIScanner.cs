@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text.Json;
 using M365Permissions.Engine.Auth;
+using M365Permissions.Engine.Graph;
 using M365Permissions.Engine.Models;
 
 namespace M365Permissions.Engine.Scanning;
@@ -14,12 +15,12 @@ public sealed class PowerBIScanner : IScanProvider
     public string Category => "PowerBI";
 
     private readonly DelegatedAuth _auth;
-    private readonly HttpClient _http;
+    private readonly ResilientHttpClient _http;
 
     public PowerBIScanner(DelegatedAuth auth)
     {
         _auth = auth;
-        _http = new HttpClient();
+        _http = new ResilientHttpClient(auth);
     }
 
     public async IAsyncEnumerable<PermissionEntry> ScanAsync(
@@ -33,11 +34,13 @@ public sealed class PowerBIScanner : IScanProvider
         try
         {
             var token = await _auth.GetAccessTokenAsync("powerbi", ct);
-            using var req = new HttpRequestMessage(HttpMethod.Get,
-                "https://api.powerbi.com/v1.0/myorg/admin/groups?$top=5000&$expand=users");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-            var resp = await _http.SendAsync(req, ct);
+            using var resp = await _http.SendAsync(() =>
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get,
+                    "https://api.powerbi.com/v1.0/myorg/admin/groups?$top=5000&$expand=users");
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                return req;
+            }, ct);
             if (resp.IsSuccessStatusCode)
             {
                 var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
@@ -88,11 +91,13 @@ public sealed class PowerBIScanner : IScanProvider
             try
             {
                 var token = await _auth.GetAccessTokenAsync("powerbi", ct);
-                using var req = new HttpRequestMessage(HttpMethod.Get,
-                    "https://api.powerbi.com/v1.0/myorg/groups?$expand=users");
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-                var resp = await _http.SendAsync(req, ct);
+                using var resp = await _http.SendAsync(() =>
+                {
+                    var req = new HttpRequestMessage(HttpMethod.Get,
+                        "https://api.powerbi.com/v1.0/myorg/groups?$expand=users");
+                    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                    return req;
+                }, ct);
                 if (resp.IsSuccessStatusCode)
                 {
                     var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);

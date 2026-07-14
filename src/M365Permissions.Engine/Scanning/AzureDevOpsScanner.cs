@@ -35,6 +35,12 @@ public sealed class AzureDevOpsScanner : IScanProvider
         {
             memberId = await GetMemberIdAsync(ct);
         }
+        catch (ResourcePrincipalNotFoundException)
+        {
+            // DevOps not usable in this context (HTML sign-in page / no org). Let the orchestrator
+            // mark the category Skipped with a clear reason rather than a cryptic JSON crash.
+            throw;
+        }
         catch (Exception ex)
         {
             context.ReportProgress($"Cannot access Azure DevOps profile: {ex.Message}", 2);
@@ -192,11 +198,31 @@ public sealed class AzureDevOpsScanner : IScanProvider
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
         var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
+        using var doc = await TryReadJsonAsync(resp, ct);
+        if (doc == null)
+            throw new ResourcePrincipalNotFoundException("azuredevops", "AzureDevOpsNotAccessible",
+                "Azure DevOps returned a sign-in page instead of data — the delegated token was not accepted. " +
+                "This usually means the organization requires interactive sign-in (MFA/Conditional Access) or the " +
+                "user has no Azure DevOps organization. Skipping Azure DevOps.");
 
-        var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-        return doc.RootElement.GetProperty("publicAlias").GetString()
-            ?? throw new InvalidOperationException("Could not determine Azure DevOps member ID");
+        return doc.RootElement.TryGetProperty("publicAlias", out var alias) ? alias.GetString() ?? ""
+            : throw new ResourcePrincipalNotFoundException("azuredevops", "AzureDevOpsNoProfile",
+                "Azure DevOps profile did not include a member id. Skipping Azure DevOps.");
+    }
+
+    /// <summary>
+    /// Read a response body as JSON, tolerating the non-JSON responses Azure DevOps sometimes
+    /// returns with a 2xx status (an HTML sign-in/error page). Returns null when the body is not
+    /// JSON or the request failed, so callers can skip gracefully instead of crashing on '&lt;'.
+    /// </summary>
+    private static async Task<JsonDocument?> TryReadJsonAsync(HttpResponseMessage resp, CancellationToken ct)
+    {
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        var trimmed = body.TrimStart();
+        if (!resp.IsSuccessStatusCode || trimmed.Length == 0 || trimmed[0] is '<')
+            return null;
+        try { return JsonDocument.Parse(body); }
+        catch { return null; }
     }
 
     /// <summary>
@@ -211,10 +237,9 @@ public sealed class AzureDevOpsScanner : IScanProvider
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
         var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
-
         var results = new List<(string, string, string)>();
-        var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+        using var doc = await TryReadJsonAsync(resp, ct);
+        if (doc == null) return results;
 
         if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
         {
@@ -248,9 +273,8 @@ public sealed class AzureDevOpsScanner : IScanProvider
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
             var resp = await _http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode) break;
-
-            var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            using var doc = await TryReadJsonAsync(resp, ct);
+            if (doc == null) break;
             if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
             {
                 foreach (var proj in val.EnumerateArray())
@@ -305,9 +329,8 @@ public sealed class AzureDevOpsScanner : IScanProvider
             req.Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
 
             var resp = await _http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode) continue;
-
-            var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            using var doc = await TryReadJsonAsync(resp, ct);
+            if (doc == null) continue;
             if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Object)
             {
                 foreach (var prop in val.EnumerateObject())
@@ -345,9 +368,8 @@ public sealed class AzureDevOpsScanner : IScanProvider
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
             var resp = await _http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode) break;
-
-            var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            using var doc = await TryReadJsonAsync(resp, ct);
+            if (doc == null) break;
             if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
             {
                 foreach (var group in val.EnumerateArray())
@@ -446,11 +468,9 @@ public sealed class AzureDevOpsScanner : IScanProvider
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
         var resp = await _http.SendAsync(req, ct);
-        if (!resp.IsSuccessStatusCode)
-            return new List<string>();
-
         var results = new List<string>();
-        var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+        using var doc = await TryReadJsonAsync(resp, ct);
+        if (doc == null) return results;
         if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
         {
             foreach (var membership in val.EnumerateArray())

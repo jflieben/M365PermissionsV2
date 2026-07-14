@@ -71,5 +71,5 @@ $dllCount = (Get-ChildItem -Path $OutputPath -Filter '*.dll').Count
 Write-Host "Build complete — $dllCount DLLs in $OutputPath" -ForegroundColor Green
 
 if (-not $NoImport) {
-    Import-Module C:\git\M365PermissionsV2\M365Permissions\M365Permissions.psd1 -Force
+    Import-Module $psd1Path -Force
 }

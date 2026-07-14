@@ -15,8 +15,8 @@ PowerShell module with a compiled .NET 8 engine that scans Microsoft 365 permiss
 
 ## Project Structure
 ```
-M365Permissions/
-  M365Permissions.sln           # Solution file
+M365PermissionsV2/
+  M365PermissionsV2.sln          # Solution file
   src/
     M365Permissions.Engine/        # .NET 8 class library
       Models/                      # PermissionEntry, ScanInfo, AppConfig, etc.
@@ -28,8 +28,8 @@ M365Permissions/
       Export/                      # ExcelExporter, CsvExporter, ComparisonEngine
       Engine.cs                    # Main facade wiring all subsystems
     M365Permissions.Engine.Tests/  # xUnit tests
-  module/                          # PowerShell module (published to PSGallery)
-    M365Permissions.psd1         # Module manifest
+  M365Permissions/                 # PowerShell module (published to PSGallery)
+    M365Permissions.psd1         # Module manifest (12 exported cmdlets)
     M365Permissions.psm1         # Entry point (loads DLLs, auto-starts GUI)
     public/                        # 12 exported cmdlet wrappers
     gui/static/                    # SPA frontend (index.html, app.js, style.css)
@@ -40,8 +40,8 @@ M365Permissions/
 
 ## Development Workflow
 1. Make code changes in `src/M365Permissions.Engine/`
-2. Build: `dotnet build M365Permissions.sln`
-3. Test C#: `dotnet test M365Permissions.sln`
+2. Build: `dotnet build M365PermissionsV2.sln`
+3. Test C#: `dotnet test M365PermissionsV2.sln`
 4. Build module: `pwsh ./build/Build-Module.ps1` (or `-Configuration Debug` for dev)
 5. Test PowerShell: `pwsh -c "Invoke-Pester ./tests/M365Permissions.Tests.ps1"`
 8. Ensure all changes made would work efficiently and accurately and retries effectively in larger tenants
@@ -51,17 +51,17 @@ M365Permissions/
 
 
 ### Local Module Testing
-The module requires compiled DLLs in `module/lib/` before it can be imported. Without them, you'll get "Could not load file or assembly" errors.
+The module requires compiled DLLs in `M365Permissions/lib/` before it can be imported. Without them, you'll get "Could not load file or assembly" errors. Prefer `./build/Build-Module.ps1` which also copies the native SQLite `runtimes/`.
 
 **Quick local test cycle:**
 ```powershell
-dotnet publish src/M365Permissions.Engine -c Debug -o module/lib
-pwsh -NoProfile -c "Import-Module ./module/M365Permissions.psd1 -Force; Get-M365Config"
+./build/Build-Module.ps1 -NoImport
+pwsh -NoProfile -c "Import-Module ./M365Permissions/M365Permissions.psd1 -Force; Get-M365Config"
 ```
 
 **IMPORTANT: DLL locking**
 - .NET DLLs loaded by PowerShell are locked for the lifetime of that PS process
-- You CANNOT overwrite `module/lib/` DLLs while the module is loaded in any PS session
+- You CANNOT overwrite `M365Permissions/lib/` DLLs while the module is loaded in any PS session
 - `Remove-Module` frees PS references but does NOT release the .NET assembly lock
 - You must **close the PowerShell process** that loaded the module before rebuilding
 - The build script (`Build-Module.ps1`) pre-checks for locked DLLs and gives guidance and do so if necessary
@@ -117,8 +117,8 @@ pwsh -NoProfile -c "Import-Module ./module/M365Permissions.psd1 -Force; Get-M365
 - **Throttling**: 429 → Retry-After header, exponential backoff (5^attempt seconds)
 - **Batch requests**: 20 requests per Graph $batch call
 - **Exchange REST**: InvokeCommand pattern via `/adminapi/beta/{org}/InvokeCommand`
-- **Scan orchestrator**: Sequential categories, internal parallelism with SemaphoreSlim
-- **Permission entry key**: `{category}|{targetPath}|{principalKey}|{role}|{through}` for comparison
+- **Scan orchestrator**: Categories run in parallel; per-category concurrency via AdaptiveThrottleManager
+- **Permission entry key**: `{category}|{targetPath}|{targetId}|{principalKey}|{role}|{through}` (+duplicate discriminator) for comparison
 
 ## SQLite Native Library Loading
 SQLitePCLRaw's native `e_sqlite3.dll` is NOT automatically discovered when .NET assemblies are loaded inside PowerShell (unlike a standard .NET host). Two things are required in `SqliteDb.cs`:
@@ -126,7 +126,7 @@ SQLitePCLRaw's native `e_sqlite3.dll` is NOT automatically discovered when .NET 
 1. **`NativeLibrary.SetDllImportResolver`** on the `SQLitePCLRaw.provider.e_sqlite3` assembly to probe `runtimes/{rid}/native/` relative to the DLL location
 2. **`SQLitePCL.Batteries_V2.Init()`** called after the resolver is registered
 
-Both are guarded by a static `_nativeInitialized` flag. The resolver must be registered **before** `Batteries_V2.Init()`. The `runtimes/` directory must be copied alongside the managed DLLs in `module/lib/`.
+Both are guarded by a static `_nativeInitialized` flag. The resolver must be registered **before** `Batteries_V2.Init()`. The `runtimes/` directory must be copied alongside the managed DLLs in `M365Permissions/lib/`.
 
 ## Resource Lifecycle & Cleanup
 Proper cleanup is critical because the module runs an HTTP server and holds SQLite connections:

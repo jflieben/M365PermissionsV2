@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Threading.Channels;
 using M365Permissions.Engine.Auth;
 using M365Permissions.Engine.Graph;
 using M365Permissions.Engine.Models;
@@ -17,12 +18,26 @@ public sealed class SharePointScanner : IScanProvider
     private readonly GraphClient _graphClient;
     private readonly DelegatedAuth _auth;
 
-    // Site templates to skip (matches V1 ignore list)
-    private static readonly HashSet<string> IgnoredTemplates = new(StringComparer.OrdinalIgnoreCase)
+    // Graph's getAllSites endpoint does not return the site's WebTemplate, so we filter the
+    // clearly-system site collections by URL instead (B10). This avoids wasted scan time,
+    // noisy results, and — importantly — temporary-admin elevation writes on system sites.
+    // OneDrive personal sites (on the -my host) are excluded here because OneDriveScanner
+    // covers them; scanning them again in the SharePoint pass would double-elevate.
+    private static readonly string[] SystemSiteUrlMarkers =
     {
-        "REDIRECTSITE", "SRCHCEN", "SPSMSITEHOST", "APPCATALOG",
-        "POINTPUBLISHINGHUB", "EDISC", "STS#-1"
+        "/sites/appcatalog",
+        "/sites/contenttypehub",
+        "/portals/hub"
     };
+
+    private static bool IsSystemSite(string webUrl)
+    {
+        if (string.IsNullOrEmpty(webUrl)) return true;
+        if (webUrl.Contains("-my.sharepoint.com", StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (var marker in SystemSiteUrlMarkers)
+            if (webUrl.Contains(marker, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
 
     public SharePointScanner(SharePointRestClient spClient, GraphClient graphClient, DelegatedAuth auth)
     {
@@ -47,164 +62,176 @@ public sealed class SharePointScanner : IScanProvider
         context.SetTotalTargets(sites.Count);
         context.ReportProgress($"Found {sites.Count} sites to scan.", 3);
 
-        foreach (var site in sites)
+        // Scan sites in parallel (P1). Per-site work (elevation + REST round-trips) dominates
+        // wall-clock, so bounded concurrency turns days into hours on large tenants. Graph/SP
+        // calls remain governed by the shared throttle manager.
+        var dop = context.Config?.MaxThreads ?? 5;
+        await foreach (var entry in ParallelScan.RunAsync(sites, dop,
+            (site, writer, tok) => ScanSiteAsync(site, context, writer, tok), ct))
         {
-            ct.ThrowIfCancellationRequested();
+            yield return entry;
+        }
+    }
 
-            var webUrl = site.TryGetProperty("webUrl", out var wUrl) ? wUrl.GetString() ?? "" : "";
-            var siteId = site.TryGetProperty("id", out var sId) ? sId.GetString() ?? "" : "";
-            var displayName = site.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? webUrl : webUrl;
+    private async Task ScanSiteAsync(JsonElement site, ScanContext context,
+        ChannelWriter<PermissionEntry> writer, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
 
-            if (string.IsNullOrEmpty(webUrl))
-            {
-                context.CompleteTarget();
-                continue;
-            }
+        var webUrl = site.TryGetProperty("webUrl", out var wUrl) ? wUrl.GetString() ?? "" : "";
+        var siteId = site.TryGetProperty("id", out var sId) ? sId.GetString() ?? "" : "";
+        var displayName = site.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? webUrl : webUrl;
 
-            context.ReportProgress($"Scanning: {displayName}", 4);
+        if (string.IsNullOrEmpty(webUrl) || IsSystemSite(webUrl))
+        {
+            context.CompleteTarget();
+            return;
+        }
 
-            // Site collection admin elevation should target the site collection root, not a subsite URL.
-            var elevationUrl = GetSiteCollectionRootUrl(webUrl);
-            var siteCollectionId = SharePointRestClient.TryExtractSiteCollectionId(siteId);
+        context.ReportProgress($"Scanning: {displayName}", 4);
 
-            // --- Temporarily add scanning user as site admin if needed (like V1) ---
-            bool wasAdded = false;
-            bool wasAddedViaTenant = false;
-            var userUpn = _auth.UserPrincipalName;
+        // Site collection admin elevation should target the site collection root, not a subsite URL.
+        var elevationUrl = GetSiteCollectionRootUrl(webUrl);
+        var siteCollectionId = SharePointRestClient.TryExtractSiteCollectionId(siteId);
 
-            if (!string.IsNullOrEmpty(userUpn))
-            {
-                try
-                {
-                    wasAdded = await _spClient.EnsureSiteAdminAsync(elevationUrl, userUpn, ct);
-                    if (wasAdded)
-                        context.ReportProgress($"Temporarily added {userUpn} as site admin for: {displayName}", 4);
-                }
-                catch (Exception ex)
-                {
-                    // Fallback to tenant admin API for site collections where direct site REST elevation is blocked.
-                    if (ShouldTryTenantElevationFallback(ex))
-                    {
-                        try
-                        {
-                            wasAdded = await _spClient.EnsureSiteAdminViaTenantAsync(elevationUrl, userUpn, ct, siteCollectionId);
-                            wasAddedViaTenant = wasAdded;
-                            if (wasAdded)
-                                context.ReportProgress($"Temporarily added {userUpn} as site admin via tenant API for: {displayName}", 4);
-                        }
-                        catch (Exception tenantEx)
-                        {
-                            context.ReportProgress($"Could not ensure site admin for {displayName}: {tenantEx.Message}", 3);
-                        }
-                    }
-                    else
-                    {
-                        context.ReportProgress($"Could not ensure site admin for {displayName}: {ex.Message}", 3);
-                    }
-                }
-            }
+        // --- Temporarily add scanning user as site admin if needed (like V1) ---
+        bool wasAdded = false;
+        bool wasAddedViaTenant = false;
+        var userUpn = _auth.UserPrincipalName;
 
+        if (!string.IsNullOrEmpty(userUpn))
+        {
             try
             {
-                // --- Site admins ---
-                List<JsonElement> admins;
-                bool adminQueryUnauthorized = false;
-                try
-                {
-                    admins = await _spClient.GetSiteAdminsAsync(webUrl, ct);
-                }
-                catch (Exception ex)
-                {
-                    context.ReportProgress($"Failed to get admins for {displayName}: {ex.Message}", 2);
-                    adminQueryUnauthorized = IsUnauthorized(ex);
-                    admins = new();
-                }
-
-                var scannerFilter = wasAdded ? (userUpn ?? "") : "";
-
-                foreach (var admin in admins)
-                {
-                    var entry = MapSiteAdmin(admin, webUrl, siteId, scannerFilter);
-                    if (entry != null) yield return entry;
-                }
-
-                // --- Role assignments ---
-                List<JsonElement> roleAssignments;
-                bool roleQueryUnauthorized = false;
-                try
-                {
-                    roleAssignments = await _spClient.GetRoleAssignmentsAsync(webUrl, ct);
-                }
-                catch (Exception ex)
-                {
-                    context.ReportProgress($"Failed to get role assignments for {displayName}: {ex.Message}", 2);
-                    roleQueryUnauthorized = IsUnauthorized(ex);
-                    roleAssignments = new();
-                }
-
-                // If we cannot query either admins or role assignments due authorization,
-                // skip this site gracefully and continue with the scan.
-                if (adminQueryUnauthorized && roleQueryUnauthorized)
-                {
-                    context.ReportProgress($"Skipping {displayName}: no SharePoint REST access after elevation attempt.", 2);
-                    context.CompleteTarget();
-                    continue;
-                }
-
-                foreach (var ra in roleAssignments)
-                {
-                    var entries = MapRoleAssignment(ra, webUrl, siteId, scannerFilter);
-                    foreach (var entry in entries)
-                        yield return entry;
-                }
-
-                // --- Graph site permissions (apps, etc.) ---
-                // Graph sites/{siteId}/permissions is only supported for root sites in a site collection,
-                // not subsites. Detect subsites by checking if webUrl has a path beyond /sites/{name}.
-                var isSubsite = IsSubsite(webUrl);
-                if (!isSubsite)
-                {
-                    var graphPerms = new List<PermissionEntry>();
-                    try
-                    {
-                        await foreach (var perm in _spClient.GetSitePermissionsAsync(siteId, ct))
-                        {
-                            var entry = MapGraphSitePermission(perm, webUrl, siteId);
-                            if (entry != null) graphPerms.Add(entry);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        if (IsGraphSitePermissionsNotSupported(ex))
-                            context.ReportProgress($"Graph site permissions endpoint not supported for {displayName}; skipping app-only grants for this site.", 4);
-                        else
-                            context.ReportProgress($"Failed to get Graph permissions for {displayName}: {ex.Message}", 4);
-                    }
-
-                    foreach (var gp in graphPerms)
-                        yield return gp;
-                }
-
-                context.CompleteTarget();
+                wasAdded = await _spClient.EnsureSiteAdminAsync(elevationUrl, userUpn, ct);
+                if (wasAdded)
+                    context.ReportProgress($"Temporarily added {userUpn} as site admin for: {displayName}", 4);
             }
-            finally
+            catch (Exception ex)
             {
-                // Always remove temp admin rights, even if scan threw an exception
-                if (wasAdded && !string.IsNullOrEmpty(userUpn))
+                // Fallback to tenant admin API for site collections where direct site REST elevation is blocked.
+                if (ShouldTryTenantElevationFallback(ex))
                 {
                     try
                     {
-                        if (wasAddedViaTenant)
-                            await _spClient.RemoveSiteAdminViaTenantAsync(elevationUrl, userUpn, ct, siteCollectionId);
-                        else
-                            await _spClient.RemoveSiteAdminAsync(elevationUrl, userUpn, ct);
-
-                        context.ReportProgress($"Removed temporary site admin from: {displayName}", 4);
+                        wasAdded = await _spClient.EnsureSiteAdminViaTenantAsync(elevationUrl, userUpn, ct, siteCollectionId);
+                        wasAddedViaTenant = wasAdded;
+                        if (wasAdded)
+                            context.ReportProgress($"Temporarily added {userUpn} as site admin via tenant API for: {displayName}", 4);
                     }
-                    catch (Exception ex)
+                    catch (Exception tenantEx)
                     {
-                        context.ReportProgress($"WARNING: Failed to remove temp admin from {displayName}: {ex.Message}", 2);
+                        context.ReportProgress($"Could not ensure site admin for {displayName}: {tenantEx.Message}", 3);
                     }
+                }
+                else
+                {
+                    context.ReportProgress($"Could not ensure site admin for {displayName}: {ex.Message}", 3);
+                }
+            }
+        }
+
+        try
+        {
+            // --- Site admins ---
+            List<JsonElement> admins;
+            bool adminQueryUnauthorized = false;
+            try
+            {
+                admins = await _spClient.GetSiteAdminsAsync(webUrl, ct);
+            }
+            catch (Exception ex)
+            {
+                context.ReportProgress($"Failed to get admins for {displayName}: {ex.Message}", 2);
+                adminQueryUnauthorized = IsUnauthorized(ex);
+                admins = new();
+            }
+
+            var scannerFilter = wasAdded ? (userUpn ?? "") : "";
+
+            foreach (var admin in admins)
+            {
+                var entry = MapSiteAdmin(admin, webUrl, siteId, scannerFilter);
+                if (entry != null) await writer.WriteAsync(entry, ct);
+            }
+
+            // --- Role assignments ---
+            List<JsonElement> roleAssignments;
+            bool roleQueryUnauthorized = false;
+            try
+            {
+                roleAssignments = await _spClient.GetRoleAssignmentsAsync(webUrl, ct);
+            }
+            catch (Exception ex)
+            {
+                context.ReportProgress($"Failed to get role assignments for {displayName}: {ex.Message}", 2);
+                roleQueryUnauthorized = IsUnauthorized(ex);
+                roleAssignments = new();
+            }
+
+            // If we cannot query either admins or role assignments due authorization,
+            // skip this site gracefully and continue with the scan.
+            if (adminQueryUnauthorized && roleQueryUnauthorized)
+            {
+                context.ReportProgress($"Skipping {displayName}: no SharePoint REST access after elevation attempt.", 2);
+                context.CompleteTarget();
+                return;
+            }
+
+            foreach (var ra in roleAssignments)
+            {
+                var entries = MapRoleAssignment(ra, webUrl, siteId, scannerFilter);
+                foreach (var entry in entries)
+                    await writer.WriteAsync(entry, ct);
+            }
+
+            // --- Graph site permissions (apps, etc.) ---
+            // Graph sites/{siteId}/permissions is only supported for root sites in a site collection,
+            // not subsites. Detect subsites by checking if webUrl has a path beyond /sites/{name}.
+            var isSubsite = IsSubsite(webUrl);
+            if (!isSubsite)
+            {
+                try
+                {
+                    await foreach (var perm in _spClient.GetSitePermissionsAsync(siteId, ct))
+                    {
+                        var entry = MapGraphSitePermission(perm, webUrl, siteId);
+                        if (entry != null) await writer.WriteAsync(entry, ct);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (IsGraphSitePermissionsNotSupported(ex))
+                        context.ReportProgress($"Graph site permissions endpoint not supported for {displayName}; skipping app-only grants for this site.", 4);
+                    else
+                        context.ReportProgress($"Failed to get Graph permissions for {displayName}: {ex.Message}", 4);
+                }
+            }
+
+            context.CompleteTarget();
+        }
+        finally
+        {
+            // Always remove temp admin rights, even if scan threw an exception or was
+            // cancelled. Use a fresh short-timeout token (not the scan token, which may
+            // already be cancelled) so cleanup still runs and the scanning account is not
+            // left elevated as Site Collection Admin (B8).
+            if (wasAdded && !string.IsNullOrEmpty(userUpn))
+            {
+                using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var cleanupCt = cleanupCts.Token;
+                try
+                {
+                    if (wasAddedViaTenant)
+                        await _spClient.RemoveSiteAdminViaTenantAsync(elevationUrl, userUpn, cleanupCt, siteCollectionId);
+                    else
+                        await _spClient.RemoveSiteAdminAsync(elevationUrl, userUpn, cleanupCt);
+
+                    context.ReportProgress($"Removed temporary site admin from: {displayName}", 4);
+                }
+                catch (Exception ex)
+                {
+                    context.ReportProgress($"WARNING: Failed to remove temp admin from {displayName} — account may remain elevated on {elevationUrl}: {ex.Message}", 2);
                 }
             }
         }

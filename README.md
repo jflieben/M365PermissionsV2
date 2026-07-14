@@ -70,15 +70,18 @@ Settings are managed through the GUI's Settings page and stored in `%APPDATA%/Li
 
 ### SharePoint
 - Site collection administrators
-- Role assignments (permissions inherited and unique)
+- Web-level role assignments (inherited and unique)
 - Graph site permissions (app-only access)
-- Drive/item permissions (sharing links, direct grants)
+- _Item-level sharing links/grants are not scanned at the site level today (roadmap; available in the hosted version)._
 
 ### Entra ID
-- Directory role memberships
-- App registration API permissions (requiredResourceAccess)
+- Directory role memberships (fully paginated, incl. large roles)
+- App registration API permissions — both **requested** (requiredResourceAccess) and **granted** (appRoleAssignments), with permission names resolved
 - OAuth2 permission grants (delegated consent)
-- Group memberships
+- Group memberships **and owners**, with guest/external users flagged
+
+### OneDrive
+- Sharing links (anonymous / organization / direct) and direct grants
 
 ### Exchange Online
 - Mailbox permissions (FullAccess)

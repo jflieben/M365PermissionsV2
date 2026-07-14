@@ -182,15 +182,20 @@ public static class PolicyEngine
         };
     }
 
+    // Compiled-regex cache: policies are evaluated against every permission entry (potentially
+    // 1M+ rows), so compiling a Regex per entry per policy is a real hotspot (B16). Cache by
+    // pattern and reuse the compiled instance.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Regex?> RegexCache = new();
+
     private static bool TryRegexMatch(string input, string pattern)
     {
-        try
+        var regex = RegexCache.GetOrAdd(pattern, static p =>
         {
-            return Regex.IsMatch(input, pattern, RegexOptions.IgnoreCase, TimeSpan.FromSeconds(1));
-        }
-        catch
-        {
-            return false;
-        }
+            try { return new Regex(p, RegexOptions.IgnoreCase | RegexOptions.Compiled, TimeSpan.FromSeconds(1)); }
+            catch { return null; } // invalid pattern — cache the failure so we don't retry compiling
+        });
+        if (regex == null) return false;
+        try { return regex.IsMatch(input); }
+        catch { return false; } // e.g. regex timeout on pathological input
     }
 }

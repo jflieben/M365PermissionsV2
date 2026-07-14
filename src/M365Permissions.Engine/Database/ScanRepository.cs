@@ -69,7 +69,7 @@ public sealed class ScanRepository
         cmd.CommandText = @"
             UPDATE scans SET
                 status = @status,
-                completed_at = CASE WHEN @status IN ('Completed','Failed','Cancelled') THEN datetime('now') ELSE completed_at END,
+                completed_at = CASE WHEN @status IN ('Completed','CompletedWithErrors','Failed','Cancelled') THEN datetime('now') ELSE completed_at END,
                 error_message = COALESCE(@error, error_message),
                 total_permissions = COALESCE(@total, total_permissions)
             WHERE id = @id";
@@ -87,6 +87,78 @@ public sealed class ScanRepository
         cmd.CommandText = "DELETE FROM scans WHERE id = @id";
         cmd.Parameters.AddWithValue("@id", id);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Mark any scan left in Running/Pending as Failed on startup. A scan can only be in those
+    /// states while the engine that owns it is alive; if we're constructing a fresh engine and
+    /// find one, the previous process died mid-scan (B13).
+    /// </summary>
+    public int RecoverInterruptedScans()
+    {
+        using var conn = _db.CreateConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            UPDATE scans
+            SET status = 'Failed',
+                completed_at = datetime('now'),
+                error_message = CASE WHEN error_message = '' THEN 'Interrupted — engine restarted while scan was running' ELSE error_message END
+            WHERE status IN ('Running','Pending')";
+        return cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Insert or update the persisted per-category progress row for a scan (B15).</summary>
+    public void SaveProgress(ScanProgress p)
+    {
+        using var conn = _db.CreateConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            INSERT INTO scan_progress (scan_id, category, total_targets, completed_targets, failed_targets, permissions_found, current_target, status, started_at)
+            VALUES (@scan, @cat, @total, @done, @failed, @perms, @cur, @status, @started)
+            ON CONFLICT(scan_id, category) DO UPDATE SET
+                total_targets = excluded.total_targets,
+                completed_targets = excluded.completed_targets,
+                failed_targets = excluded.failed_targets,
+                permissions_found = excluded.permissions_found,
+                current_target = excluded.current_target,
+                status = excluded.status";
+        cmd.Parameters.AddWithValue("@scan", p.ScanId);
+        cmd.Parameters.AddWithValue("@cat", p.Category);
+        cmd.Parameters.AddWithValue("@total", p.TotalTargets);
+        cmd.Parameters.AddWithValue("@done", p.CompletedTargets);
+        cmd.Parameters.AddWithValue("@failed", p.FailedTargets);
+        cmd.Parameters.AddWithValue("@perms", p.PermissionsFound);
+        cmd.Parameters.AddWithValue("@cur", p.CurrentTarget);
+        cmd.Parameters.AddWithValue("@status", p.Status);
+        cmd.Parameters.AddWithValue("@started", p.StartedAt);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Read persisted per-category progress for a scan (survives engine restarts, B15).</summary>
+    public List<ScanProgress> GetProgress(long scanId)
+    {
+        var result = new List<ScanProgress>();
+        using var conn = _db.CreateConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM scan_progress WHERE scan_id = @scan ORDER BY category";
+        cmd.Parameters.AddWithValue("@scan", scanId);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            result.Add(new ScanProgress
+            {
+                ScanId = reader.GetInt64(reader.GetOrdinal("scan_id")),
+                Category = reader.GetString(reader.GetOrdinal("category")),
+                TotalTargets = reader.GetInt32(reader.GetOrdinal("total_targets")),
+                CompletedTargets = reader.GetInt32(reader.GetOrdinal("completed_targets")),
+                FailedTargets = reader.GetInt32(reader.GetOrdinal("failed_targets")),
+                PermissionsFound = reader.GetInt64(reader.GetOrdinal("permissions_found")),
+                CurrentTarget = reader.GetString(reader.GetOrdinal("current_target")),
+                Status = reader.GetString(reader.GetOrdinal("status")),
+                StartedAt = reader.GetString(reader.GetOrdinal("started_at"))
+            });
+        }
+        return result;
     }
 
     public void UpdateNotes(long id, string? notes, string? tags)

@@ -19,14 +19,16 @@ public sealed class GraphClient
     private const int DefaultMaxRetries = 5;
     private const int BatchSize = 20;
     private const string GraphBaseUrl = "https://graph.microsoft.com";
+    private readonly int _defaultMaxRetries;
 
     public AdaptiveThrottleManager ThrottleManager => _throttle;
 
-    public GraphClient(DelegatedAuth auth, int maxConcurrency = 5)
+    public GraphClient(DelegatedAuth auth, int maxConcurrency = 5, int maxRetries = DefaultMaxRetries)
     {
         _auth = auth;
         _http = new HttpClient();
         _throttle = new AdaptiveThrottleManager(maxConcurrency, maxConcurrency * 2);
+        _defaultMaxRetries = maxRetries > 0 ? maxRetries : DefaultMaxRetries;
     }
 
     /// <summary>
@@ -37,9 +39,10 @@ public sealed class GraphClient
         string url,
         string? version = "v1.0",
         bool eventualConsistency = false,
-        int maxRetries = DefaultMaxRetries,
+        int maxRetries = -1,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (maxRetries < 0) maxRetries = _defaultMaxRetries;
         var currentUrl = url.StartsWith("http", StringComparison.OrdinalIgnoreCase)
             ? url
             : $"{GraphBaseUrl}/{version}/{url.TrimStart('/')}";
@@ -70,8 +73,9 @@ public sealed class GraphClient
     /// </summary>
     public async Task<JsonElement?> GetAsync(string url, string? version = "v1.0",
         bool eventualConsistency = false,
-        int maxRetries = DefaultMaxRetries, CancellationToken ct = default)
+        int maxRetries = -1, CancellationToken ct = default)
     {
+        if (maxRetries < 0) maxRetries = _defaultMaxRetries;
         var fullUrl = url.StartsWith("http", StringComparison.OrdinalIgnoreCase)
             ? url
             : $"{GraphBaseUrl}/{version}/{url.TrimStart('/')}";
@@ -87,22 +91,53 @@ public sealed class GraphClient
     public async Task<Dictionary<string, JsonElement>> BatchAsync(
         List<BatchRequest> requests,
         string? version = "v1.0",
+        int maxRetries = -1,
         CancellationToken ct = default)
     {
+        if (maxRetries < 0) maxRetries = _defaultMaxRetries;
         var results = new Dictionary<string, JsonElement>();
-        var batchUrl = $"{GraphBaseUrl}/{version}/$batch";
 
-        // Process in chunks of BatchSize
+        // Process in chunks of BatchSize; each chunk may itself re-issue throttled sub-requests.
         for (int i = 0; i < requests.Count; i += BatchSize)
         {
             ct.ThrowIfCancellationRequested();
+            var chunk = requests.Skip(i).Take(BatchSize)
+                .Select((r, idx) => new BatchRequest
+                {
+                    Id = r.Id ?? (i + idx).ToString(),
+                    Method = r.Method,
+                    RelativeUrl = r.RelativeUrl,
+                    Headers = r.Headers
+                }).ToList();
 
-            var chunk = requests.Skip(i).Take(BatchSize).ToList();
+            await ExecuteBatchChunkAsync(chunk, version, maxRetries, results, ct);
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Send one ≤20-request batch, then re-issue any sub-requests that came back 429 until they
+    /// succeed or retries are exhausted. Handles both batch-level and per-sub-request throttling
+    /// with Retry-After (B11). Non-throttle failures are dropped from results (the sub-resource
+    /// genuinely errored) rather than silently masking the whole batch.
+    /// </summary>
+    private async Task ExecuteBatchChunkAsync(
+        List<BatchRequest> chunk, string? version, int maxRetries,
+        Dictionary<string, JsonElement> results, CancellationToken ct)
+    {
+        var batchUrl = $"{GraphBaseUrl}/{version}/$batch";
+        var pending = chunk;
+
+        for (int attempt = 0; attempt < maxRetries && pending.Count > 0; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+
             var batchBody = new
             {
-                requests = chunk.Select((r, idx) => new
+                requests = pending.Select(r => new
                 {
-                    id = r.Id ?? (i + idx).ToString(),
+                    id = r.Id,
                     method = r.Method,
                     url = r.RelativeUrl,
                     headers = r.Headers
@@ -112,39 +147,66 @@ public sealed class GraphClient
             var token = await _auth.GetAccessTokenAsync("graph", ct);
             using var request = new HttpRequestMessage(HttpMethod.Post, batchUrl);
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            request.Content = new StringContent(
-                JsonSerializer.Serialize(batchBody),
-                Encoding.UTF8, "application/json");
+            request.Content = new StringContent(JsonSerializer.Serialize(batchBody), Encoding.UTF8, "application/json");
 
+            HttpResponseMessage response;
             await _throttle.WaitAsync(ct);
             try
             {
                 _throttle.RecordRequest();
-                var response = await _http.SendAsync(request, ct);
-                var responseJson = await JsonDocument.ParseAsync(
-                    await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-
-                if (responseJson.RootElement.TryGetProperty("responses", out var responses))
-                {
-                    foreach (var resp in responses.EnumerateArray())
-                    {
-                        var id = resp.GetProperty("id").GetString()!;
-                        var status = resp.GetProperty("status").GetInt32();
-                        if (status >= 200 && status < 300 && resp.TryGetProperty("body", out var body))
-                        {
-                            results[id] = body.Clone();
-                        }
-                        // Failed items can be retried individually by the caller
-                    }
-                }
+                response = await _http.SendAsync(request, ct);
             }
             finally
             {
                 _throttle.Release();
             }
-        }
 
-        return results;
+            // Batch-level throttling: the whole $batch POST was throttled — back off and retry all.
+            if (response.StatusCode == (HttpStatusCode)429)
+            {
+                _throttle.ReportThrottle();
+                var retryAfter = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
+                response.Dispose();
+                await Task.Delay(retryAfter, ct);
+                continue;
+            }
+
+            response.EnsureSuccessStatusCode();
+            using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            response.Dispose();
+
+            if (!doc.RootElement.TryGetProperty("responses", out var responses))
+                return;
+
+            var byId = pending.ToDictionary(r => r.Id!, r => r);
+            var retryNext = new List<BatchRequest>();
+            var maxRetryAfter = TimeSpan.Zero;
+
+            foreach (var resp in responses.EnumerateArray())
+            {
+                var id = resp.GetProperty("id").GetString()!;
+                var status = resp.GetProperty("status").GetInt32();
+
+                if (status is >= 200 and < 300)
+                {
+                    if (resp.TryGetProperty("body", out var body)) results[id] = body.Clone();
+                }
+                else if (status == 429 && byId.TryGetValue(id, out var original))
+                {
+                    _throttle.ReportThrottle();
+                    retryNext.Add(original);
+                    if (resp.TryGetProperty("headers", out var h) && h.TryGetProperty("Retry-After", out var ra)
+                        && int.TryParse(ra.GetString(), out var secs))
+                        maxRetryAfter = TimeSpan.FromSeconds(Math.Max(maxRetryAfter.TotalSeconds, secs));
+                }
+                // Other non-2xx: a genuine per-resource failure — leave it out of results.
+            }
+
+            _throttle.ReportSuccess();
+            pending = retryNext;
+            if (pending.Count > 0)
+                await Task.Delay(maxRetryAfter > TimeSpan.Zero ? maxRetryAfter : TimeSpan.FromSeconds(Math.Pow(2, attempt + 1)), ct);
+        }
     }
 
     private async Task<(JsonElement? json, string? nextLink)> ExecuteWithRetry(
@@ -219,7 +281,11 @@ public sealed class GraphClient
             }
         }
 
-        return (null, null);
+        // Retries exhausted (sustained 429s or transient errors). Throw instead of returning
+        // null: a silent null makes GetPaginatedAsync stop mid-pagination and the scan gets
+        // marked Completed with a truncated dataset (B6). Let the category be marked Failed.
+        throw new GraphRetryExhaustedException(
+            $"Graph request failed after {maxRetries} attempts (throttling or transient errors): {url}");
     }
 
     private static bool IsTransientError(HttpRequestException ex)
@@ -231,6 +297,16 @@ public sealed class GraphClient
 
     private static string Truncate(string s, int max)
         => s.Length <= max ? s : s[..max] + "...";
+}
+
+/// <summary>
+/// Thrown when a Graph request exhausts all retry attempts (sustained throttling or transient
+/// failures). Signals that scan data would be incomplete, so the category must be marked Failed
+/// rather than silently truncated.
+/// </summary>
+public sealed class GraphRetryExhaustedException : Exception
+{
+    public GraphRetryExhaustedException(string message) : base(message) { }
 }
 
 public sealed class BatchRequest

@@ -451,6 +451,16 @@
                     }
                 </div>
             </div>
+            <div class="card" id="painCard" style="display:none;border-left:3px solid var(--accent)">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+                    <div>
+                        <strong>⚡ This scan worked hard.</strong>
+                        <p id="painText" style="margin:6px 0;color:var(--text-muted);font-size:0.9em"></p>
+                        <a href="https://m365permissions.com" target="_blank" rel="noopener" class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em;text-decoration:none">Learn about the hosted version</a>
+                    </div>
+                    <button class="btn-icon" title="Dismiss" onclick="window.m365.dismissPain()" style="background:none;border:none;cursor:pointer;font-size:1.2em;color:var(--text-muted)">✕</button>
+                </div>
+            </div>
             <div class="card" id="riskSummaryCard" style="display:none">
                 <h2>Risk Overview (Latest Scan)</h2>
                 <div class="stats-grid" id="riskStats"></div>
@@ -500,11 +510,34 @@
         try {
             const scans = await api.get('/scans' + tenantQuery());
             if (scans.success && scans.data.length > 0) {
-                const completedScans = scans.data.filter(s => s.status === 'Completed');
+                const isDone = s => s.status === 'Completed' || s.status === 'CompletedWithErrors';
+                const completedScans = scans.data.filter(isDone);
                 document.getElementById('statScans').textContent = completedScans.length;
                 const totalPerms = completedScans.reduce((sum, s) => sum + (s.totalPermissions || 0), 0);
                 document.getElementById('statPerms').textContent = totalPerms.toLocaleString();
                 document.getElementById('recentScansCard').style.display = '';
+
+                // $1: convert on experienced pain, quietly. A scan that took a long time or was very
+                // large is where the hosted (managed-identity, managed-infra) version pays off.
+                const latest = completedScans[0];
+                if (latest && !localStorage.getItem('m365_painDismissed_' + latest.id)) {
+                    const durMs = latest.completedAt && latest.startedAt
+                        ? (new Date(latest.completedAt) - new Date(latest.startedAt)) : 0;
+                    const hours = durMs / 3600000;
+                    const perms = latest.totalPermissions || 0;
+                    if (hours >= 2 || perms >= 250000) {
+                        const painCard = document.getElementById('painCard');
+                        const painText = document.getElementById('painText');
+                        if (painCard && painText) {
+                            const reason = hours >= 2
+                                ? `Scan #${latest.id} took ${hours.toFixed(1)} hours`
+                                : `Scan #${latest.id} found ${perms.toLocaleString()} permissions`;
+                            painText.textContent = `${reason}. The hosted version scans with managed identity auth on managed infrastructure — faster, unattended, and continuous.`;
+                            painCard.dataset.scanId = latest.id;
+                            painCard.style.display = '';
+                        }
+                    }
+                }
 
                 const tbody = document.getElementById('recentScansBody');
                 tbody.innerHTML = scans.data.slice(0, 10).map(s => `<tr>
@@ -512,7 +545,7 @@
                     <td title="${escapeAttr(s.tenantDomain || '')}" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(s.tenantDomain || '—')}</td>
                     <td>${new Date(s.startedAt).toLocaleString()}</td>
                     <td>${escapeHtml(s.scanTypes || '')}</td>
-                    <td><span style="color:${s.status === 'Completed' ? 'var(--success)' : s.status === 'Failed' ? 'var(--error)' : 'var(--text-muted)'}">${s.status}</span></td>
+                    <td><span style="color:${s.status === 'Completed' ? 'var(--success)' : s.status === 'CompletedWithErrors' ? 'var(--warning)' : s.status === 'Failed' ? 'var(--error)' : 'var(--text-muted)'}">${s.status}</span></td>
                     <td>${s.totalPermissions ? s.totalPermissions.toLocaleString() : '—'}</td>
                     <td>
                         <span class="scan-notes-text" id="scanNotes${s.id}" title="Click to edit"
@@ -594,7 +627,6 @@
                 ],
                 notScanned: [
                     'Individual file/item-level permissions',
-                    'Sensitivity labels on sites',
                 ],
             },
             {
@@ -609,8 +641,21 @@
                     'Group memberships and ownership',
                 ],
                 notScanned: [
-                    'Conditional Access policies',
                     'Administrative units',
+                ],
+            },
+            {
+                val: 'Teams',
+                icon: '👥',
+                label: 'Microsoft Teams',
+                checked: false,
+                scans: [
+                    'Team owners, members and guests',
+                    'Private & shared channel memberships',
+                ],
+                notScanned: [
+                    'Channel messages / files',
+                    'Meeting and app permissions',
                 ],
             },
             {
@@ -640,7 +685,6 @@
                 ],
                 notScanned: [
                     'Individual file/folder-level sharing',
-                    'Sync client configurations',
                     'Inactive or deleted user sites'
                 ],
             },
@@ -654,7 +698,6 @@
                     'Workspace ownership',
                 ],
                 notScanned: [
-                    'Report-level row-level security (RLS)',
                     'Dataflow connections',
                 ],
             },
@@ -671,7 +714,6 @@
                 ],
                 notScanned: [
                     'Connection reference credentials',
-                    'Dataverse table-level security',
                 ],
             },
             {
@@ -682,12 +724,13 @@
                 scans: [
                     'Subscription-level role assignments',
                     'Resource group-level role assignments',
+                    'Management group role assignments',
+                    'Azure PIM-eligible assignments',
                     'Classic administrator roles',
                 ],
                 notScanned: [
                     'Resource-level role assignments',
                     'Azure Policy assignments',
-                    'Management group roles',
                 ],
             },
             {
@@ -717,12 +760,7 @@
                     'Role group members (Get-RoleGroupMember)',
                     'Built-in and custom compliance role groups',
                 ],
-                notScanned: [
-                    'Sensitivity label policies and assignments',
-                    'Data Loss Prevention (DLP) policies',
-                    'Retention policies and labels',
-                    'eDiscovery case-level permissions',
-                ],
+                notScanned: [],
             },
         ];
 
@@ -752,10 +790,11 @@
                                         <ul style="margin:0 0 8px 16px;padding:0;color:var(--text-secondary)">
                                             ${t.scans.map(s => `<li>${s}</li>`).join('')}
                                         </ul>
-                                        <div style="color:var(--text-muted);margin-bottom:4px;font-weight:600">🚫 Not included:</div>
+                                        ${t.notScanned.length ? `
+                                        <div style="color:var(--text-muted);margin-bottom:4px;font-weight:600">🔒 Only in hosted edition:</div>
                                         <ul style="margin:0 0 0 16px;padding:0;color:var(--text-muted);font-style:italic">
                                             ${t.notScanned.map(s => `<li>${s}</li>`).join('')}
-                                        </ul>
+                                        </ul>` : ''}
                                     </div>
                                 </label>
                             `).join('')}
@@ -771,12 +810,24 @@
                         <strong>💡 Need deeper scanning?</strong><br>
                         <a href="https://m365permissions.com" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">M365Permissions.com</a>
                         offers additional scanning depth including item-level SharePoint, Teams &amp; OneDrive permissions,
-                        Exchange folder-level permissions, security roles at any level, and automated scheduled scans, historical tracking and actionable built in reports.
+                        Exchange folder-level permissions, security roles at any level, continuous scans, historical tracking and actionable built in reports.
                     </div>
                     <div id="precheckResults" style="display:none;margin-bottom:12px"></div>
                     <div class="btn-group">
                         <button class="btn btn-secondary" id="btnPrecheck" onclick="window.m365.precheckScan()">🔍 Pre-check Permissions</button>
                         <button class="btn btn-primary" id="btnStartScan" onclick="window.m365.startScan()">▶ Start Scan</button>
+                    </div>
+                    <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+                        <div style="font-size:0.8em;color:var(--text-muted);margin-bottom:6px">Available in the hosted version — <a href="https://m365permissions.com" target="_blank" rel="noopener" style="color:var(--accent)">m365permissions.com</a>:</div>
+                        <div class="btn-group" style="opacity:0.55;flex-wrap:wrap">
+                            <button class="btn btn-secondary" disabled title="Continuous, unattended scanning — hosted version">🔁 Continuous scans</button>
+                            <button class="btn btn-secondary" disabled title="Email/SIEM alerts on new critical findings — hosted version">🔔 Email/SIEM alerts</button>
+                            <button class="btn btn-secondary" disabled title="Continuous item-level SharePoint/OneDrive scanning — hosted version">🔬 Item-level scan</button>
+                            <button class="btn btn-secondary" disabled title="Track and action risky findings to remediation — hosted version">📋 Risk remediation queue</button>
+                            <button class="btn btn-secondary" disabled title="Ready-made oversharing reports — hosted version">📊 Oversharing reports</button>
+                            <button class="btn btn-secondary" disabled title="Push findings to third-party tools — hosted version">🔌 Third party integrations</button>
+                        </div>
+                        <div style="font-size:0.75em;color:var(--text-muted);margin-top:6px">Local = interactive, top-level snapshots. Hosted = continuous, item-level monitoring with managed identity auth.</div>
                     </div>
                 `}
             </div>
@@ -789,6 +840,22 @@
                 <p id="progressText" style="font-size:0.9em;color:var(--text-muted);margin:8px 0">Preparing...</p>
                 <div id="categoryProgress" style="margin:12px 0"></div>
                 <div id="throttleStatus" style="display:none;margin:8px 0;padding:8px 12px;background:var(--bg-input);border-radius:6px;font-size:0.8em;color:var(--text-muted)"></div>
+                <div style="display:flex;align-items:center;gap:8px;margin:8px 0 4px">
+                    <label style="font-size:0.8em;color:var(--text-muted)">Filter log by service:</label>
+                    <select id="logCategoryFilter" onchange="window.renderScanLog && window.renderScanLog()" style="padding:4px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8em">
+                        <option value="">All services</option>
+                        <option value="SharePoint">SharePoint</option>
+                        <option value="Entra">Entra</option>
+                        <option value="Teams">Teams</option>
+                        <option value="Exchange">Exchange</option>
+                        <option value="OneDrive">OneDrive</option>
+                        <option value="PowerBI">PowerBI</option>
+                        <option value="PowerAutomate">PowerAutomate</option>
+                        <option value="Azure">Azure</option>
+                        <option value="AzureDevOps">AzureDevOps</option>
+                        <option value="Purview">Purview</option>
+                    </select>
+                </div>
                 <div class="log-container" id="scanLog"></div>
             </div>
         `;
@@ -804,6 +871,20 @@
 
         if (progressCard) progressCard.style.display = '';
         if (setupCard) setupCard.style.display = 'none';
+
+        // Render the live scan log applying the per-service filter, with "sticky bottom" so the
+        // panel only auto-scrolls when the user is already at the bottom. Reused by the poll loop
+        // and by the filter dropdown's onchange (so filtering works after the scan finishes too).
+        window.renderScanLog = function renderScanLog() {
+            const log = document.getElementById('scanLog');
+            if (!log || !window.__scanLogs) return;
+            const filter = document.getElementById('logCategoryFilter')?.value || '';
+            const lines = filter ? window.__scanLogs.filter(l => l.includes(`[${filter}]`)) : window.__scanLogs;
+            const nearBottom = (log.scrollHeight - log.scrollTop - log.clientHeight) < 40;
+            log.innerHTML = lines.map(l => `<div class="log-entry">${escapeHtml(l)}</div>`).join('');
+            if (nearBottom) log.scrollTop = log.scrollHeight;
+        };
+        const renderScanLog = window.renderScanLog;
 
         if (pollInterval) clearInterval(pollInterval);
         pollInterval = setInterval(async () => {
@@ -821,20 +902,30 @@
                 if (fill) fill.style.width = `${pct}%`;
 
                 const statusText = p.overallStatus === 'Completed' ? '100% — Scan complete!'
+                    : p.overallStatus === 'CompletedWithErrors' ? '100% — Completed with errors (some services failed/skipped)'
                     : p.overallStatus === 'Failed' ? 'Scan failed'
                     : p.overallStatus === 'Cancelled' ? 'Scan cancelled'
+                    : p.estimatedTimeRemaining ? `${pct}% — ${p.estimatedTimeRemaining}`
                     : `${pct}%`;
                 if (text) text.textContent = statusText;
 
                 if (catProg && p.categories && p.categories.length > 0) {
-                    catProg.innerHTML = p.categories.map(c => {
+                    catProg.innerHTML = p.categories.slice().sort((a, b) => a.category.localeCompare(b.category)).map(c => {
                         const catPct = Math.min(100, c.percentComplete || 0);
-                        const icon = c.status === 'Completed' ? '✓' : c.status === 'Running' ? '⏳' : c.status === 'Pending' ? '⏸' : '✗';
+                        const st = c.status;
+                        const icon = st === 'Completed' ? '✓' : st === 'Running' ? '⏳' : st === 'Pending' ? '⏸'
+                            : st === 'Skipped' ? '⊘' : '✗';
+                        const barColor = st === 'Completed' ? 'var(--success)'
+                            : st === 'Failed' ? 'var(--danger, #e5484d)'
+                            : st === 'Skipped' ? 'var(--warning, #f5a623)'
+                            : 'var(--accent)';
+                        const failNote = (st === 'Failed' || st === 'Skipped')
+                            ? ` <span style="color:${barColor};font-size:0.9em">(${st})</span>` : '';
                         return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:0.85em">
                             <span>${icon}</span>
-                            <span style="min-width:100px;font-weight:600">${escapeHtml(c.category)}</span>
+                            <span style="min-width:100px;font-weight:600">${escapeHtml(c.category)}${failNote}</span>
                             <div style="flex:1;height:6px;background:var(--bg-input);border-radius:3px;overflow:hidden">
-                                <div style="height:100%;width:${catPct}%;background:${c.status === 'Completed' ? 'var(--success)' : 'var(--accent)'};border-radius:3px;transition:width 0.5s"></div>
+                                <div style="height:100%;width:${catPct}%;background:${barColor};border-radius:3px;transition:width 0.5s"></div>
                             </div>
                             <span style="min-width:40px;text-align:right;color:var(--text-muted)">${Math.round(catPct)}%</span>
                             <span style="min-width:80px;color:var(--text-muted);font-size:0.9em">${c.permissionsFound || 0} found</span>
@@ -843,10 +934,8 @@
                 }
 
                 if (log && p.recentLogs && p.recentLogs.length > 0) {
-                    log.innerHTML = p.recentLogs
-                        .map(l => `<div class="log-entry">${escapeHtml(l)}</div>`)
-                        .join('');
-                    log.scrollTop = log.scrollHeight;
+                    window.__scanLogs = p.recentLogs;
+                    renderScanLog();
                 }
 
                 // Poll throttle metrics
@@ -1002,7 +1091,10 @@
         currentPage = page || 1;
         const scanId = document.getElementById('scanSelect')?.value;
         const category = document.getElementById('categoryFilter')?.value || '';
-        const search = document.getElementById('searchInput')?.value || '';
+        // Require 3+ chars before searching: a 1-2 char LIKE '%x%' is a full table scan on large
+        // scans and returns near-everything anyway (P4). 0 chars = no filter.
+        const rawSearch = document.getElementById('searchInput')?.value || '';
+        const search = rawSearch.length > 0 && rawSearch.length < 3 ? '' : rawSearch;
 
         if (!scanId) return;
         // Show loading state
@@ -1164,7 +1256,7 @@
         const option = sel.selectedOptions[0];
         if (!option) return;
         const text = option.textContent;
-        const allTypes = ['SharePoint', 'Entra', 'Exchange', 'OneDrive', 'PowerBI', 'PowerAutomate', 'Azure', 'AzureDevOps', 'Purview'];
+        const allTypes = ['SharePoint', 'Entra', 'Teams', 'Exchange', 'OneDrive', 'PowerBI', 'PowerAutomate', 'Azure', 'AzureDevOps', 'Purview'];
         const missing = allTypes.filter(t => !text.includes(t));
         if (missing.length > 0) {
             notice.innerHTML = `<div class="notice notice-info">This scan did not include: <strong>${missing.join(', ')}</strong>. Results for those services will not appear.</div>`;
@@ -1680,6 +1772,13 @@
 
     // ── Actions ─────────────────────────────────────────────────
     window.m365 = {
+        dismissPain() {
+            const card = document.getElementById('painCard');
+            if (card) {
+                if (card.dataset.scanId) localStorage.setItem('m365_painDismissed_' + card.dataset.scanId, '1');
+                card.style.display = 'none';
+            }
+        },
         async connect() {
             try {
                 showToast('Opening browser for sign-in...', 'info');

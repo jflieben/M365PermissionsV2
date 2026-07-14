@@ -8,6 +8,7 @@ public enum ScanStatus
     Pending,
     Running,
     Completed,
+    CompletedWithErrors,   // finished, but one or more categories failed/partial (R1)
     Failed,
     Cancelled
 }

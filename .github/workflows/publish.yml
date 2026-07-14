@@ -5,7 +5,7 @@ on:
     branches: [ main ]
 
 jobs:
-  publish:
+  build-test-publish:
     runs-on: windows-latest
 
     steps:
@@ -27,16 +27,84 @@ jobs:
           Write-Host "Release type: $releaseType"
           "type=$releaseType" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      # ── Quality gates (must pass before we build/publish anything) ──
+
+      - name: .NET unit tests
+        shell: pwsh
+        run: dotnet test M365PermissionsV2.sln -c Release --nologo
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          $results = Invoke-ScriptAnalyzer -Path "M365Permissions" -Recurse -Severity Error
+          if ($results) {
+            $results | Format-Table -AutoSize | Out-String | Write-Host
+            throw "PSScriptAnalyzer found $($results.Count) error-severity issue(s)."
+          }
+          Write-Host "PSScriptAnalyzer: no error-severity issues."
+
+      # ── Build the module (compiles the engine + assembles lib/) ──
+
       - name: Build module
         shell: pwsh
         run: ./build/Build-Module.ps1 -NoImport
+
+      - name: Pester tests
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck -MinimumVersion 5.0.0
+          Import-Module Pester -MinimumVersion 5.0.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = "tests"
+          $config.Run.Throw = $true
+          $config.Output.Verbosity = "Detailed"
+          Invoke-Pester -Configuration $config
+
+      # ── Version gate: don't attempt a publish that PSGallery will reject ──
+
+      - name: Version gate
+        id: versiongate
+        shell: pwsh
+        run: |
+          $manifest = Import-PowerShellDataFile "M365Permissions/M365Permissions.psd1"
+          $version = [version]$manifest.ModuleVersion
+          Write-Host "Local ModuleVersion: $version (release type: ${{ steps.config.outputs.type }})"
+
+          $stable = @()
+          try {
+            $stable = Find-Module -Name M365Permissions -Repository PSGallery -AllVersions -ErrorAction Stop |
+              ForEach-Object { [version]$_.Version }
+            Write-Host "Published stable versions: $($stable -join ', ')"
+          } catch {
+            Write-Host "No published versions found (first publish?): $($_.Exception.Message)"
+          }
+
+          $latestStable = $stable | Sort-Object -Descending | Select-Object -First 1
+
+          if ("${{ steps.config.outputs.type }}" -eq 'production') {
+            if ($stable -contains $version) {
+              throw "Version $version is already published as a stable release. Bump ModuleVersion in M365Permissions.psd1."
+            }
+          }
+          else {
+            # A prerelease of version X sorts BELOW stable X, so PSGallery rejects it.
+            # The preview base version must be strictly greater than the latest stable.
+            if ($latestStable -and $version -le $latestStable) {
+              throw "Preview base version $version is not greater than the latest published stable ($latestStable). Bump ModuleVersion before publishing previews."
+            }
+          }
+          Write-Host "Version gate passed."
 
       - name: Apply preview prerelease tag
         if: steps.config.outputs.type == 'preview'
         shell: pwsh
         run: |
-          $sha = "${{ github.sha }}".Substring(0, 7)
-          $prerelease = "prev$sha"
+          # Prerelease tags must be monotonically increasing or PSGallery rejects the
+          # upload as "not a higher version". SemVer compares prerelease identifiers
+          # lexically, so a git-SHA-based tag (prev<sha>) sorts randomly and frequently
+          # regresses. A fixed-width UTC timestamp always sorts correctly and increases.
+          $prerelease = "preview" + [DateTime]::UtcNow.ToString("yyyyMMddHHmmss")
           Write-Host "Marking as prerelease: $prerelease"
           Update-ModuleManifest -Path "M365Permissions/M365Permissions.psd1" -Prerelease $prerelease
 

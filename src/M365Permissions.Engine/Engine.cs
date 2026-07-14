@@ -26,6 +26,7 @@ public sealed class Engine : IDisposable
     private readonly PermissionRepository _permRepo;
     private readonly AuditRepository _auditRepo;
     private readonly PolicyRepository _policyRepo;
+    private readonly LogRepository _logRepo;
     private readonly TokenCache _tokenCache;
     private readonly DelegatedAuth _auth;
     private readonly ExcelExporter _excelExporter;
@@ -51,6 +52,11 @@ public sealed class Engine : IDisposable
         _permRepo = new PermissionRepository(_db);
         _auditRepo = new AuditRepository(_db);
         _policyRepo = new PolicyRepository(_db);
+        _logRepo = new LogRepository(_db);
+
+        // B13: any scan still marked Running/Pending belongs to a previous process that died
+        // mid-scan (progress lives in the engine); mark them Failed so they don't show forever.
+        _scanRepo.RecoverInterruptedScans();
 
         // Persist refresh tokens alongside the database
         var persistDir = Path.GetDirectoryName(databasePath) ?? ".";
@@ -104,14 +110,6 @@ public sealed class Engine : IDisposable
     {
         await _auth.AuthenticateAsync(ct);
         InitializeClients();
-
-        // Check tenant size and return warning for large tenants
-        try
-        {
-            var countResult = await _graphClient!.GetAsync("users/$count", eventualConsistency: true, ct: ct);
-            // Note: Direct $count on users returns a plain integer, not JSON
-        }
-        catch { /* best effort — don't block connection */ }
     }
 
     /// <summary>
@@ -184,13 +182,14 @@ public sealed class Engine : IDisposable
 
     private void InitializeClients()
     {
-        _graphClient = new GraphClient(_auth, _config.MaxThreads);
+        _graphClient = new GraphClient(_auth, _config.MaxThreads, _config.MaxJobRetries);
         _spClient = new SharePointRestClient(_auth, _graphClient);
         _exoClient = new ExchangeRestClient(_auth);
 
-        _orchestrator = new ScanOrchestrator(_db, _scanRepo, _permRepo, _policyRepo);
+        _orchestrator = new ScanOrchestrator(_db, _scanRepo, _permRepo, _policyRepo, _logRepo);
         _orchestrator.RegisterProvider(new SharePointScanner(_spClient, _graphClient, _auth));
         _orchestrator.RegisterProvider(new EntraScanner(_graphClient));
+        _orchestrator.RegisterProvider(new TeamsScanner(_graphClient));
         _orchestrator.RegisterProvider(new ExchangeScanner(_exoClient, _graphClient));
         _orchestrator.RegisterProvider(new OneDriveScanner(_graphClient, _spClient, _auth));
         _orchestrator.RegisterProvider(new PowerBIScanner(_auth));
@@ -303,6 +302,13 @@ public sealed class Engine : IDisposable
 
     public AggregatedProgress? GetScanProgress() => _orchestrator?.GetProgress();
 
+    /// <summary>Persisted per-category progress for a scan — survives engine restarts (B15).</summary>
+    public List<ScanProgress> GetPersistedProgress(long scanId) => _scanRepo.GetProgress(scanId);
+
+    /// <summary>Persisted logs for a scan (B15/O1). Filter by max level and/or category.</summary>
+    public List<LogEntry> GetScanLogs(long scanId, int? maxLevel = null, string? category = null, int limit = 1000)
+        => _logRepo.GetByScan(scanId, maxLevel, category, limit);
+
     public ThrottleMetrics? GetThrottleMetrics() => _graphClient?.ThrottleManager.GetMetrics();
 
     /// <summary>Pre-check permissions for the requested scan types before starting.</summary>
@@ -364,22 +370,34 @@ public sealed class Engine : IDisposable
 
     // ── Export ───────────────────────────────────────────────────
 
-    public (byte[] bytes, string fileName, string contentType) ExportScan(long scanId, string format, string? category)
+    public (byte[] bytes, string fileName, string contentType) ExportScan(long scanId, string format, string? category = null)
     {
         var scan = _scanRepo.GetById(scanId)
             ?? throw new KeyNotFoundException($"Scan {scanId} not found");
 
-        var entries = _permRepo.GetAll(scanId, category);
         var catSuffix = category ?? "All";
 
         if (format.Equals("csv", StringComparison.OrdinalIgnoreCase))
         {
-            var bytes = _csvExporter.Export(entries);
+            // Stream the CSV a page at a time so a million-row scan doesn't materialise the whole
+            // result set (entry objects + string) in a default PS session (P3).
+            const int pageSize = 5000;
+            var bytes = _csvExporter.ExportPaged(afterId => _permRepo.GetPage(scanId, category, afterId, pageSize));
             _auditRepo.Log("Export", _auth.UserPrincipalName ?? "", $"CSV export: scan {scanId}, category={catSuffix}");
             return (bytes, $"M365Permissions_{catSuffix}_{scanId}.csv", "text/csv");
         }
         else
         {
+            // ClosedXML holds the whole workbook in memory. Above a threshold this OOMs, so steer
+            // very large exports to CSV rather than failing opaquely (P3). Uses the whole-scan
+            // count as a cheap upper bound.
+            const long xlsxRowLimit = 250_000;
+            var count = _permRepo.Count(scanId);
+            if (count > xlsxRowLimit)
+                throw new InvalidOperationException(
+                    $"This scan has {count:N0} rows, which is too large for an XLSX export. Please export as CSV instead (or export a single category).");
+
+            var entries = _permRepo.GetAll(scanId, category);
             var bytes = _excelExporter.Export(entries, catSuffix);
             _auditRepo.Log("Export", _auth.UserPrincipalName ?? "", $"XLSX export: scan {scanId}, category={catSuffix}");
             return (bytes, $"M365Permissions_{catSuffix}_{scanId}.xlsx",
@@ -391,6 +409,67 @@ public sealed class Engine : IDisposable
 
     public ComparisonResult CompareScans(long oldScanId, long newScanId, string? category = null)
         => _comparisonEngine.Compare(oldScanId, newScanId, category);
+
+    /// <summary>
+    /// Risk delta vs the previous completed scan of the same tenant (O3). Returns null with
+    /// HasPrevious=false when there is no earlier scan to compare against.
+    /// </summary>
+    public RiskDelta GetRiskDelta(long scanId)
+    {
+        var scan = _scanRepo.GetById(scanId)
+            ?? throw new KeyNotFoundException($"Scan {scanId} not found");
+
+        var previous = _scanRepo.GetAll(50, scan.TenantId)
+            .FirstOrDefault(s => s.Id < scanId &&
+                (s.Status is ScanStatus.Completed or ScanStatus.CompletedWithErrors));
+
+        var delta = new RiskDelta { ScanId = scanId, PreviousScanId = previous?.Id };
+        if (previous == null) return delta;
+
+        var cmp = _comparisonEngine.Compare(previous.Id, scanId);
+        delta.NewCritical = cmp.Added.Count(e => e.RiskLevel == "Critical");
+        delta.NewHigh = cmp.Added.Count(e => e.RiskLevel == "High");
+        delta.TotalAdded = cmp.Added.Count;
+        delta.TotalRemoved = cmp.Removed.Count;
+        return delta;
+    }
+
+    // Cache the PSGallery lookup for 24h; the check is best-effort and must never block/throw ($4).
+    private VersionInfo? _cachedVersion;
+    private DateTimeOffset _versionCheckedAt = DateTimeOffset.MinValue;
+
+    public async Task<VersionInfo> CheckForUpdateAsync(CancellationToken ct = default)
+    {
+        if (_cachedVersion != null && (DateTimeOffset.UtcNow - _versionCheckedAt).TotalHours < 24)
+            return _cachedVersion;
+
+        var info = new VersionInfo { Current = ModuleVersion };
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var xml = await http.GetStringAsync(
+                "https://www.powershellgallery.com/api/v2/FindPackagesById()?id='M365Permissions'&$filter=IsLatestVersion", ct);
+            // Extract the newest <d:Version>…</d:Version> from the OData feed.
+            Version? latest = null;
+            foreach (System.Text.RegularExpressions.Match m in
+                System.Text.RegularExpressions.Regex.Matches(xml, @"<d:Version>([^<]+)</d:Version>"))
+            {
+                if (Version.TryParse(m.Groups[1].Value.Split('-')[0], out var parsed) &&
+                    (latest == null || parsed > latest))
+                    latest = parsed;
+            }
+            if (latest != null)
+            {
+                info.Latest = latest.ToString();
+                info.UpdateAvailable = Version.TryParse(ModuleVersion, out var cur) && latest > cur;
+            }
+        }
+        catch { /* fail silent — never block the GUI on a gallery lookup */ }
+
+        _cachedVersion = info;
+        _versionCheckedAt = DateTimeOffset.UtcNow;
+        return info;
+    }
 
     // ── Comparison Export ───────────────────────────────────────
 

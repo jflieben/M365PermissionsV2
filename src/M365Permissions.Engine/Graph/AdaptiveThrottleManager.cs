@@ -7,9 +7,14 @@ namespace M365Permissions.Engine.Graph;
 /// </summary>
 public sealed class AdaptiveThrottleManager
 {
-    private SemaphoreSlim _throttle;
+    // Effective concurrency is enforced by comparing an in-flight counter against the current
+    // limit rather than by juggling semaphore permits. The old design lowered the limit on 429
+    // but always returned a permit in the caller's finally, so the effective concurrency never
+    // actually dropped and only ratcheted up (B5). Here shrinking the limit genuinely reduces
+    // how many callers can hold a slot at once.
+    private readonly SemaphoreSlim _slotAvailable = new(0, int.MaxValue);
+    private int _inFlight;
     private int _currentMaxConcurrency;
-    private readonly int _initialMax;
     private readonly int _absoluteMin = 1;
     private readonly int _absoluteMax;
     private readonly object _lock = new();
@@ -22,24 +27,44 @@ public sealed class AdaptiveThrottleManager
     private int _requestsSinceLastThrottle;
     private const int RequestsBeforeIncrease = 20;
 
-    public int CurrentConcurrency => _currentMaxConcurrency;
+    public int CurrentConcurrency => Volatile.Read(ref _currentMaxConcurrency);
     public int ThrottleCount => _throttleCount;
     public long TotalRequests => Interlocked.Read(ref _totalRequests);
     public DateTimeOffset? LastThrottleTime => _throttleCount > 0 ? _lastThrottleTime : null;
 
     public AdaptiveThrottleManager(int initialConcurrency, int maxConcurrency)
     {
-        _initialMax = initialConcurrency;
         _absoluteMax = maxConcurrency;
         _currentMaxConcurrency = initialConcurrency;
-        _throttle = new SemaphoreSlim(initialConcurrency, maxConcurrency);
     }
 
-    public async Task WaitAsync(CancellationToken ct) => await _throttle.WaitAsync(ct);
+    /// <summary>Acquire a concurrency slot, waiting while in-flight requests are at the limit.</summary>
+    public async Task WaitAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            lock (_lock)
+            {
+                if (_inFlight < _currentMaxConcurrency)
+                {
+                    _inFlight++;
+                    return;
+                }
+            }
+            // No slot within the current limit — wait to be signalled by a Release or an increase.
+            await _slotAvailable.WaitAsync(ct).ConfigureAwait(false);
+        }
+    }
 
+    /// <summary>Release a previously acquired slot and wake one waiter.</summary>
     public void Release()
     {
-        try { _throttle.Release(); } catch (SemaphoreFullException) { /* ignore */ }
+        lock (_lock)
+        {
+            if (_inFlight > 0) _inFlight--;
+        }
+        _slotAvailable.Release();
     }
 
     /// <summary>Record that a request was made. Call before executing each API call.</summary>
@@ -63,10 +88,10 @@ public sealed class AdaptiveThrottleManager
                 && (DateTimeOffset.UtcNow - _lastIncreaseTime).TotalSeconds >= 30)
             {
                 _currentMaxConcurrency = Math.Min(_currentMaxConcurrency + 1, _absoluteMax);
-                // Release an extra slot to increase effective concurrency
-                try { _throttle.Release(); } catch (SemaphoreFullException) { /* at max */ }
                 _lastIncreaseTime = DateTimeOffset.UtcNow;
                 _requestsSinceLastThrottle = 0;
+                // Wake a waiter so the newly opened slot can be used immediately.
+                _slotAvailable.Release();
             }
         }
     }
@@ -80,14 +105,9 @@ public sealed class AdaptiveThrottleManager
             _lastThrottleTime = DateTimeOffset.UtcNow;
             _requestsSinceLastThrottle = 0;
 
-            // Halve concurrency (minimum 1)
-            var newMax = Math.Max(_absoluteMin, _currentMaxConcurrency / 2);
-            if (newMax < _currentMaxConcurrency)
-            {
-                _currentMaxConcurrency = newMax;
-                // We can't remove slots from SemaphoreSlim, but we limit by not releasing
-                // The effective limit happens naturally as existing WaitAsync calls won't release extra slots
-            }
+            // Halve concurrency (minimum 1). The in-flight gate enforces this immediately: no
+            // new slot is granted until in-flight requests drain below the reduced limit.
+            _currentMaxConcurrency = Math.Max(_absoluteMin, _currentMaxConcurrency / 2);
         }
     }
 

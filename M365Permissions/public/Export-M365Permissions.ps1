@@ -31,7 +31,10 @@ function Export-M365Permissions {
         $ScanId = $scans[0].Id
     }
 
-    $bytes = $engine.ExportScan($ScanId, $Format.ToLower())
+    # ExportScan returns a (bytes, fileName, contentType) tuple; PowerShell surfaces
+    # ValueTuple fields as Item1/Item2/Item3 (named elements are not reliably honored).
+    $result = $engine.ExportScan($ScanId, $Format.ToLower(), $null)
+    $bytes = $result.Item1
     $ext = if ($Format -eq 'XLSX') { '.xlsx' } else { '.csv' }
 
     if (-not $OutputPath) {

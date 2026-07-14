@@ -27,7 +27,7 @@ public sealed class EntraScanner : IScanProvider
         context.ReportProgress("Scanning Entra directory roles...", 3);
 
         var roles = new List<JsonElement>();
-        await foreach (var role in _graphClient.GetPaginatedAsync("directoryRoles?$expand=members", ct: ct))
+        await foreach (var role in _graphClient.GetPaginatedAsync("directoryRoles", ct: ct))
         {
             roles.Add(role);
         }
@@ -44,9 +44,13 @@ public sealed class EntraScanner : IScanProvider
             var roleName = role.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
             var roleId = role.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
 
-            if (role.TryGetProperty("members", out var members) && members.ValueKind == JsonValueKind.Array)
+            if (!string.IsNullOrEmpty(roleId))
             {
-                foreach (var member in members.EnumerateArray())
+                // Enumerate members with pagination per role. directoryRoles?$expand=members caps
+                // at ~20 members with no nextLink for the expanded collection, silently dropping
+                // members in large roles — the worst failure mode for an audit tool (B4).
+                await foreach (var member in _graphClient.GetPaginatedAsync(
+                    $"directoryRoles/{roleId}/members?$select=id,displayName,userPrincipalName,userType", ct: ct))
                 {
                     yield return MapDirectoryRoleMember(member, roleName, roleId);
                 }
@@ -55,7 +59,14 @@ public sealed class EntraScanner : IScanProvider
             context.CompleteTarget();
         }
 
-        // --- App Registrations with permissions ---
+        // Build caches that resolve permission GUIDs → human-readable names (Mail.Read, etc.).
+        // Needed both to make requested-permission entries readable and to resolve granted
+        // app-role assignments below (A1). Without this, principal_role held raw GUIDs, so the
+        // high-risk-application-permission policy could never match a permission name.
+        context.ReportProgress("Resolving application permission definitions...", 3);
+        var (appPermsByAppId, appPermsByObjectId) = await BuildAppPermissionCachesAsync(ct);
+
+        // --- App Registrations: REQUESTED permissions (requiredResourceAccess) ---
         context.ReportProgress("Scanning app registrations...", 3);
 
         int appCount = 0;
@@ -81,6 +92,10 @@ public sealed class EntraScanner : IScanProvider
                             var permId = access.TryGetProperty("id", out var pid) ? pid.GetString() ?? "" : "";
                             var permType = access.TryGetProperty("type", out var pt) ? pt.GetString() ?? "" : "";
 
+                            // Resolve the permission GUID to its name via the resource app's definitions.
+                            var permName = appPermsByAppId.TryGetValue(resourceAppId, out var rmap)
+                                && rmap.TryGetValue(permId, out var pn) ? pn : permId;
+
                             yield return new PermissionEntry
                             {
                                 TargetPath = $"AppRegistration/{appName}",
@@ -89,10 +104,13 @@ public sealed class EntraScanner : IScanProvider
                                 PrincipalEntraId = appClientId,
                                 PrincipalSysName = appName,
                                 PrincipalType = "Application",
-                                PrincipalRole = permId,
-                                Through = permType == "Role" ? "ApplicationPermission" : "DelegatedPermission",
+                                PrincipalRole = permName,
+                                // "Requested" ≠ "Granted": these come from the app manifest and may
+                                // never have been consented. Mark distinctly so risk policies (which
+                                // key on the granted "ApplicationPermission") don't fire on them (A1).
+                                Through = permType == "Role" ? "RequestedApplicationPermission" : "RequestedDelegatedPermission",
                                 AccessType = "Allow",
-                                Tenure = "Permanent"
+                                Tenure = "Requested"
                             };
                         }
                     }
@@ -101,6 +119,53 @@ public sealed class EntraScanner : IScanProvider
         }
 
         context.ReportProgress($"Scanned {appCount} app registrations.", 3);
+
+        // --- Service principals: GRANTED application permissions (appRoleAssignments) ---
+        // These are the permissions actually consented to an app — the real risk surface.
+        context.ReportProgress("Scanning granted application permissions...", 3);
+        int grantedPermCount = 0;
+        await foreach (var sp in _graphClient.GetPaginatedAsync(
+            "servicePrincipals?$select=id,appId,displayName&$expand=appRoleAssignments", ct: ct))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var spName = sp.TryGetProperty("displayName", out var spdn) ? spdn.GetString() ?? "" : "";
+            var spAppId = sp.TryGetProperty("appId", out var spaid) ? spaid.GetString() ?? "" : "";
+            var spId = sp.TryGetProperty("id", out var spid) ? spid.GetString() ?? "" : "";
+
+            if (!sp.TryGetProperty("appRoleAssignments", out var aras) || aras.ValueKind != JsonValueKind.Array)
+                continue;
+
+            foreach (var ara in aras.EnumerateArray())
+            {
+                var appRoleId = ara.TryGetProperty("appRoleId", out var arid) ? arid.GetString() ?? "" : "";
+                var resourceId = ara.TryGetProperty("resourceId", out var resId) ? resId.GetString() ?? "" : "";
+                var resourceName = ara.TryGetProperty("resourceDisplayName", out var rdn) ? rdn.GetString() ?? "" : "";
+
+                // The all-zero GUID is the "default access" role (no specific app role) — skip it.
+                if (string.IsNullOrEmpty(appRoleId) || appRoleId == "00000000-0000-0000-0000-000000000000")
+                    continue;
+
+                var permName = appPermsByObjectId.TryGetValue(resourceId, out var rmap2)
+                    && rmap2.TryGetValue(appRoleId, out var pn2) ? pn2 : appRoleId;
+
+                grantedPermCount++;
+                yield return new PermissionEntry
+                {
+                    TargetPath = string.IsNullOrEmpty(resourceName) ? $"EnterpriseApp/{spName}" : $"EnterpriseApp/{spName} → {resourceName}",
+                    TargetType = "ServicePrincipal",
+                    TargetId = spId,
+                    PrincipalEntraId = spAppId,
+                    PrincipalSysName = spName,
+                    PrincipalType = "Application",
+                    PrincipalRole = permName,
+                    Through = "ApplicationPermission",
+                    AccessType = "Allow",
+                    Tenure = "Granted"
+                };
+            }
+        }
+        context.ReportProgress($"Found {grantedPermCount} granted application permissions.", 3);
         context.CompleteTarget();
 
         // --- PIM: Eligible directory role assignments ---
@@ -241,12 +306,12 @@ public sealed class EntraScanner : IScanProvider
         }
         context.ReportProgress($"Cached {spCache.Count} service principals.", 3);
 
-        int grantCount = 0;
+        int oauth2GrantCount = 0;
         await foreach (var grant in _graphClient.GetPaginatedAsync(
             "oauth2PermissionGrants?$select=id,clientId,consentType,principalId,resourceId,scope", ct: ct))
         {
             ct.ThrowIfCancellationRequested();
-            grantCount++;
+            oauth2GrantCount++;
 
             var clientId = grant.TryGetProperty("clientId", out var ci) ? ci.GetString() ?? "" : "";
             var resourceId = grant.TryGetProperty("resourceId", out var ri) ? ri.GetString() ?? "" : "";
@@ -278,7 +343,7 @@ public sealed class EntraScanner : IScanProvider
             }
         }
 
-        context.ReportProgress($"Found {grantCount} OAuth2 grants.", 3);
+        context.ReportProgress($"Found {oauth2GrantCount} OAuth2 grants.", 3);
         context.CompleteTarget();
 
         // --- Graph Subscriptions (webhook change notifications) ---
@@ -384,18 +449,21 @@ public sealed class EntraScanner : IScanProvider
                 continue;
             }
 
-            // Get group members
+            // Get group members and owners. Owners can add members (a privilege-escalation path),
+            // so they must be captured distinctly (A2). Nested groups appear here as Group-typed
+            // members, which flags the transitive path for review.
             var memberEntries = new List<PermissionEntry>();
             bool memberFetchFailed = false;
             try
             {
                 await foreach (var member in _graphClient.GetPaginatedAsync(
-                    $"groups/{groupId}/members?$select=id,displayName,userPrincipalName", ct: ct))
+                    $"groups/{groupId}/members?$select=id,displayName,userPrincipalName,userType", ct: ct))
                 {
                     var memberUpn = member.TryGetProperty("userPrincipalName", out var upn) ? upn.GetString() ?? "" : "";
                     var memberName = member.TryGetProperty("displayName", out var mdn) ? mdn.GetString() ?? "" : "";
                     var memberId = member.TryGetProperty("id", out var mid) ? mid.GetString() ?? "" : "";
                     var memberType = member.TryGetProperty("@odata.type", out var ot) ? ot.GetString() ?? "" : "";
+                    var memberUserType = member.TryGetProperty("userType", out var mut) ? mut.GetString() ?? "" : "";
 
                     memberEntries.Add(new PermissionEntry
                     {
@@ -405,8 +473,33 @@ public sealed class EntraScanner : IScanProvider
                         PrincipalEntraId = memberId,
                         PrincipalEntraUpn = memberUpn,
                         PrincipalSysName = memberName,
-                        PrincipalType = MapMemberType(memberType),
+                        PrincipalType = MapMemberType(memberType, memberUserType),
                         PrincipalRole = "Member",
+                        Through = "Direct",
+                        AccessType = "Allow",
+                        Tenure = "Permanent"
+                    });
+                }
+
+                await foreach (var owner in _graphClient.GetPaginatedAsync(
+                    $"groups/{groupId}/owners?$select=id,displayName,userPrincipalName,userType", ct: ct))
+                {
+                    var ownerUpn = owner.TryGetProperty("userPrincipalName", out var oupn) ? oupn.GetString() ?? "" : "";
+                    var ownerName = owner.TryGetProperty("displayName", out var odn) ? odn.GetString() ?? "" : "";
+                    var ownerId = owner.TryGetProperty("id", out var oid) ? oid.GetString() ?? "" : "";
+                    var ownerType = owner.TryGetProperty("@odata.type", out var oot) ? oot.GetString() ?? "" : "";
+                    var ownerUserType = owner.TryGetProperty("userType", out var out2) ? out2.GetString() ?? "" : "";
+
+                    memberEntries.Add(new PermissionEntry
+                    {
+                        TargetPath = $"Group/{groupName}",
+                        TargetType = secEnabled ? "SecurityGroup" : "M365Group",
+                        TargetId = groupId,
+                        PrincipalEntraId = ownerId,
+                        PrincipalEntraUpn = ownerUpn,
+                        PrincipalSysName = ownerName,
+                        PrincipalType = MapMemberType(ownerType, ownerUserType),
+                        PrincipalRole = "Owner",
                         Through = "Direct",
                         AccessType = "Allow",
                         Tenure = "Permanent"
@@ -441,12 +534,55 @@ public sealed class EntraScanner : IScanProvider
         context.ReportProgress($"Completed scanning {groupsDone} groups.", 3);
     }
 
+    /// <summary>
+    /// Enumerate service principals once and build permission-GUID → name lookups, keyed both by
+    /// the resource's appId (for resolving requiredResourceAccess) and its objectId (for resolving
+    /// appRoleAssignments). Covers both app roles and delegated (oauth2) permission scopes.
+    /// </summary>
+    private async Task<(Dictionary<string, Dictionary<string, string>> byAppId,
+                        Dictionary<string, Dictionary<string, string>> byObjectId)>
+        BuildAppPermissionCachesAsync(CancellationToken ct)
+    {
+        var byAppId = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        var byObjectId = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+        await foreach (var sp in _graphClient.GetPaginatedAsync(
+            "servicePrincipals?$select=id,appId,appRoles,oauth2PermissionScopes", ct: ct))
+        {
+            var spId = sp.TryGetProperty("id", out var i) ? i.GetString() ?? "" : "";
+            var appId = sp.TryGetProperty("appId", out var a) ? a.GetString() ?? "" : "";
+
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (sp.TryGetProperty("appRoles", out var ar) && ar.ValueKind == JsonValueKind.Array)
+                foreach (var r in ar.EnumerateArray())
+                {
+                    var rid = r.TryGetProperty("id", out var ri) ? ri.GetString() ?? "" : "";
+                    var val = r.TryGetProperty("value", out var rv) ? rv.GetString() ?? "" : "";
+                    if (!string.IsNullOrEmpty(rid) && !string.IsNullOrEmpty(val)) map[rid] = val;
+                }
+            if (sp.TryGetProperty("oauth2PermissionScopes", out var sc) && sc.ValueKind == JsonValueKind.Array)
+                foreach (var s in sc.EnumerateArray())
+                {
+                    var sid = s.TryGetProperty("id", out var si) ? si.GetString() ?? "" : "";
+                    var val = s.TryGetProperty("value", out var sv) ? sv.GetString() ?? "" : "";
+                    if (!string.IsNullOrEmpty(sid) && !string.IsNullOrEmpty(val)) map[sid] = val;
+                }
+
+            if (map.Count == 0) continue;
+            if (!string.IsNullOrEmpty(appId)) byAppId[appId] = map;
+            if (!string.IsNullOrEmpty(spId)) byObjectId[spId] = map;
+        }
+
+        return (byAppId, byObjectId);
+    }
+
     private static PermissionEntry MapDirectoryRoleMember(JsonElement member, string roleName, string roleId)
     {
         var upn = member.TryGetProperty("userPrincipalName", out var u) ? u.GetString() ?? "" : "";
         var displayName = member.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
         var memberId = member.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
         var odataType = member.TryGetProperty("@odata.type", out var ot) ? ot.GetString() ?? "" : "";
+        var userType = member.TryGetProperty("userType", out var ut) ? ut.GetString() ?? "" : "";
 
         return new PermissionEntry
         {
@@ -456,7 +592,7 @@ public sealed class EntraScanner : IScanProvider
             PrincipalEntraId = memberId,
             PrincipalEntraUpn = upn,
             PrincipalSysName = displayName,
-            PrincipalType = MapMemberType(odataType),
+            PrincipalType = MapMemberType(odataType, userType),
             PrincipalRole = roleName,
             Through = "DirectoryRoleAssignment",
             AccessType = "Allow",
@@ -464,12 +600,21 @@ public sealed class EntraScanner : IScanProvider
         };
     }
 
-    private static string MapMemberType(string odataType) => odataType switch
+    private static string MapMemberType(string odataType, string userType = "")
     {
-        "#microsoft.graph.user" => "User",
-        "#microsoft.graph.servicePrincipal" => "ServicePrincipal",
-        "#microsoft.graph.group" => "Group",
-        "#microsoft.graph.device" => "Device",
-        _ => "Unknown"
-    };
+        // Guests are ordinary users with userType=Guest. Surfacing them as "Guest" lets the
+        // "Guest/external user access" policy fire on Entra/role/group members, not just the
+        // SharePoint #ext# heuristic (A2).
+        if (odataType == "#microsoft.graph.user" && string.Equals(userType, "Guest", StringComparison.OrdinalIgnoreCase))
+            return "Guest";
+
+        return odataType switch
+        {
+            "#microsoft.graph.user" => "User",
+            "#microsoft.graph.servicePrincipal" => "ServicePrincipal",
+            "#microsoft.graph.group" => "Group",
+            "#microsoft.graph.device" => "Device",
+            _ => "Unknown"
+        };
+    }
 }

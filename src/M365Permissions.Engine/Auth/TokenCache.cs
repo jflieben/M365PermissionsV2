@@ -166,7 +166,12 @@ public sealed class TokenCache
             }
             else
             {
+                // No DPAPI off Windows. Base64 is not encryption, so at least restrict the file to
+                // the owner (chmod 600) — these are long-lived refresh tokens for what is usually a
+                // Global Admin account (S3). Keychain/libsecret integration is a further hardening step.
                 File.WriteAllText(path, Convert.ToBase64String(plainBytes));
+                try { File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite); }
+                catch { /* filesystem may not support unix modes */ }
             }
         }
         catch { /* best effort */ }

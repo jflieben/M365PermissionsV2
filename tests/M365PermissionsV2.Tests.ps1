@@ -3,7 +3,7 @@
 Describe 'M365Permissions Module' {
 
     BeforeAll {
-        $modulePath = Join-Path $PSScriptRoot '..' 'module'
+        $modulePath = Join-Path $PSScriptRoot '..' 'M365Permissions'
         $manifestPath = Join-Path $modulePath 'M365Permissions.psd1'
     }
 

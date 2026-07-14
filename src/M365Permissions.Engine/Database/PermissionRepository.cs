@@ -152,6 +152,32 @@ public sealed class PermissionRepository
         return items;
     }
 
+    /// <summary>
+    /// Fetch one page of a scan's permissions ordered by id (stable cursor). Used for streamed
+    /// export so a 1M-row scan is never fully materialised in memory at once (P3).
+    /// </summary>
+    public List<PermissionEntry> GetPage(long scanId, string? category, long afterId, int limit)
+    {
+        using var conn = _db.CreateConnection();
+        using var cmd = conn.CreateCommand();
+        var where = "WHERE scan_id = @scan_id AND id > @afterId";
+        cmd.Parameters.AddWithValue("@scan_id", scanId);
+        cmd.Parameters.AddWithValue("@afterId", afterId);
+        if (!string.IsNullOrEmpty(category))
+        {
+            where += " AND category = @category";
+            cmd.Parameters.AddWithValue("@category", category);
+        }
+        cmd.CommandText = $"SELECT * FROM permissions {where} ORDER BY id LIMIT @limit";
+        cmd.Parameters.AddWithValue("@limit", limit);
+
+        var items = new List<PermissionEntry>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            items.Add(MapPermission(reader));
+        return items;
+    }
+
     /// <summary>Get distinct categories for a scan.</summary>
     public List<string> GetCategories(long scanId)
     {
@@ -270,16 +296,23 @@ public sealed class PermissionRepository
     {
         using var conn = _db.CreateConnection();
 
+        // A user's permissions are: (1) rows where the user is the principal (direct memberships,
+        // ownerships, grants), plus (2) effective access via the groups they belong to — i.e. rows
+        // where the PRINCIPAL is one of those groups. The transitive clause must match on the group
+        // as principal (via its object id), NOT on target_path: a group-membership row's target_path
+        // is "Group/<name>", so matching target_path returned every OTHER member of the group (the
+        // roster leak this replaces).
         var baseWhere = @"scan_id = @scan_id AND (
             principal_entra_upn LIKE @search
             OR principal_sys_name LIKE @search
             OR principal_entra_id LIKE @search
-            OR target_path IN (
-                SELECT target_path FROM permissions
+            OR (principal_entra_id != '' AND principal_entra_id IN (
+                SELECT target_id FROM permissions
                 WHERE scan_id = @scan_id AND category = 'Entra'
                 AND target_type IN ('SecurityGroup','M365Group')
+                AND target_id != ''
                 AND (principal_entra_upn LIKE @search OR principal_sys_name LIKE @search OR principal_entra_id LIKE @search)
-            )
+            ))
         )";
 
         // Build additional column filter clauses
