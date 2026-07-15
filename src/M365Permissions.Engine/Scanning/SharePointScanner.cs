@@ -71,15 +71,45 @@ public sealed class SharePointScanner : IScanProvider
         // Scan sites in parallel (P1). Per-site work (elevation + REST round-trips) dominates
         // wall-clock, so bounded concurrency turns days into hours on large tenants. Graph/SP
         // calls remain governed by the shared throttle manager.
+        var stats = new SiteAccessStats();
         var dop = context.Config?.MaxThreads ?? 5;
         await foreach (var entry in ParallelScan.RunAsync(sites, dop,
-            (site, writer, tok) => ScanSiteAsync(site, context, writer, tok), ct))
+            (site, writer, tok) => ScanSiteAsync(site, context, stats, writer, tok), ct))
         {
             yield return entry;
         }
+
+        // One actionable summary instead of a wall of per-site 403s. When most/all sites deny
+        // access, the near-certain cause is that the connected account lacks the SharePoint
+        // Administrator (or Global Administrator) role needed to self-elevate as site admin.
+        var attempted = Interlocked.Read(ref stats.Attempted);
+        var denied = Interlocked.Read(ref stats.AccessDenied);
+        var elevationFailed = Interlocked.Read(ref stats.ElevationFailed);
+        if (attempted > 0 && denied > 0)
+        {
+            if (denied >= attempted)
+                context.ReportProgress(
+                    $"Permission summary: 0 of {attempted} sites returned permission data. The connected " +
+                    "account could not read any site — this almost always means it is not a SharePoint " +
+                    "Administrator (or Global Administrator), so it cannot temporarily elevate to site " +
+                    "collection admin. Grant that role and re-run for complete results.", 1);
+            else
+                context.ReportProgress(
+                    $"Permission summary: {denied} of {attempted} sites returned no permission data " +
+                    $"(elevation failed on {elevationFailed}). Those sites need the connected account to be " +
+                    "SharePoint Administrator (or site collection admin) for a complete scan.", 2);
+        }
     }
 
-    private async Task ScanSiteAsync(JsonElement site, ScanContext context,
+    /// <summary>Thread-safe tallies across the parallel per-site scan, used for the end-of-scan summary.</summary>
+    private sealed class SiteAccessStats
+    {
+        public long Attempted;       // sites we actually tried to read (post system-site filter)
+        public long AccessDenied;    // sites where neither admins nor role assignments were readable
+        public long ElevationFailed; // sites where temporary site-admin elevation could not be applied
+    }
+
+    private async Task ScanSiteAsync(JsonElement site, ScanContext context, SiteAccessStats stats,
         ChannelWriter<PermissionEntry> writer, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -95,6 +125,7 @@ public sealed class SharePointScanner : IScanProvider
         }
 
         context.ReportProgress($"Scanning: {displayName}", 4);
+        Interlocked.Increment(ref stats.Attempted);
 
         // Site collection admin elevation should target the site collection root, not a subsite URL.
         var elevationUrl = GetSiteCollectionRootUrl(webUrl);
@@ -127,11 +158,13 @@ public sealed class SharePointScanner : IScanProvider
                     }
                     catch (Exception tenantEx)
                     {
+                        Interlocked.Increment(ref stats.ElevationFailed);
                         context.ReportProgress($"Could not ensure site admin for {displayName}: {tenantEx.Message}", 3);
                     }
                 }
                 else
                 {
+                    Interlocked.Increment(ref stats.ElevationFailed);
                     context.ReportProgress($"Could not ensure site admin for {displayName}: {ex.Message}", 3);
                 }
             }
@@ -179,6 +212,7 @@ public sealed class SharePointScanner : IScanProvider
             // skip this site gracefully and continue with the scan.
             if (adminQueryUnauthorized && roleQueryUnauthorized)
             {
+                Interlocked.Increment(ref stats.AccessDenied);
                 context.ReportProgress($"Skipping {displayName}: no SharePoint REST access after elevation attempt.", 2);
                 context.CompleteTarget();
                 return;

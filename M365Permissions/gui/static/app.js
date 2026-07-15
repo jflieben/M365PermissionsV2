@@ -1906,8 +1906,15 @@
             const types = Array.from(checkboxes).map(c => c.value);
             if (types.length === 0) { showToast('Select at least one scan type', 'error'); return; }
 
+            // Give the button a busy state. Starting a scan can block for a while when a selected
+            // category needs first-time consent (an interactive browser tab opens and the request
+            // waits for it), so without feedback the button looks unresponsive / "not working".
+            const btn = document.getElementById('btnStartScan');
+            const originalLabel = btn ? btn.innerHTML : null;
+            if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Starting…'; }
+
             try {
-                showToast('Starting scan — a browser tab may open if a new category needs consent', 'info');
+                showToast('Starting scan — a browser tab may open if a new category needs consent. This can take a moment.', 'info');
                 const res = await api.post('/scan/start', { scanTypes: types });
                 if (res.success) {
                     state.scanRunning = true;
@@ -1916,10 +1923,14 @@
                     startProgressPolling();
                     showToast('Scan started', 'success');
                 } else {
+                    // Surface the server's explanation (missing consent, timeout, etc.) rather than a
+                    // generic message, and restore the button so the user can retry.
                     showToast(res.error || 'Failed to start scan', 'error');
+                    if (btn) { btn.disabled = false; btn.innerHTML = originalLabel; }
                 }
             } catch (e) {
-                showToast('Error: ' + e.message, 'error');
+                showToast('Could not start scan: ' + e.message, 'error');
+                if (btn) { btn.disabled = false; btn.innerHTML = originalLabel; }
             }
         },
 

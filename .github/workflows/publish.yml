@@ -4,6 +4,9 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: write
+
 jobs:
   build-test-publish:
     runs-on: windows-latest
@@ -26,6 +29,38 @@ jobs:
           }
           Write-Host "Release type: $releaseType"
           "type=$releaseType" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # ── Version bump: the pipeline OWNS the version, not the manifest ──
+      # Preview:    bump the patch digit   (2.0.5 -> 2.0.6)
+      # Production: bump the minor digit, reset patch to 0 (2.0.5 -> 2.1.0)
+      # The numeric bump is written into the manifest BEFORE the build so the
+      # engine .csproj (synced from the psd1) picks it up too. The commit that
+      # persists this bump is made after publish with [skip ci] (see last step).
+
+      - name: Bump module version
+        id: version
+        shell: pwsh
+        run: |
+          $type     = "${{ steps.config.outputs.type }}"
+          $psd1Path = "M365Permissions/M365Permissions.psd1"
+          $manifest = Import-PowerShellDataFile $psd1Path
+          $current  = [version]$manifest.ModuleVersion
+
+          if ($type -eq 'preview') {
+            $new = '{0}.{1}.{2}' -f $current.Major, $current.Minor, ($current.Build + 1)
+          } else {
+            $new = '{0}.{1}.0'   -f $current.Major, ($current.Minor + 1)
+          }
+          Write-Host "Bumping ModuleVersion: $current -> $new ($type)"
+
+          # Targeted replace preserves the manifest's exact formatting (matters
+          # because we commit this file back to the repo).
+          $content = Get-Content $psd1Path -Raw
+          $content = $content -replace "(?m)^(\s*ModuleVersion\s*=\s*')[^']*(')", ('${1}' + $new + '${2}')
+          Set-Content $psd1Path -Value $content -NoNewline
+
+          "new=$new"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "previous=$current" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # ── Quality gates (must pass before we build/publish anything) ──
 
@@ -67,9 +102,8 @@ jobs:
         id: versiongate
         shell: pwsh
         run: |
-          $manifest = Import-PowerShellDataFile "M365Permissions/M365Permissions.psd1"
-          $version = [version]$manifest.ModuleVersion
-          Write-Host "Local ModuleVersion: $version (release type: ${{ steps.config.outputs.type }})"
+          $version = [version]"${{ steps.version.outputs.new }}"
+          Write-Host "Publishing ModuleVersion: $version (release type: ${{ steps.config.outputs.type }})"
 
           $stable = @()
           try {
@@ -84,14 +118,14 @@ jobs:
 
           if ("${{ steps.config.outputs.type }}" -eq 'production') {
             if ($stable -contains $version) {
-              throw "Version $version is already published as a stable release. Bump ModuleVersion in M365Permissions.psd1."
+              throw "Version $version is already published as a stable release."
             }
           }
           else {
             # A prerelease of version X sorts BELOW stable X, so PSGallery rejects it.
             # The preview base version must be strictly greater than the latest stable.
             if ($latestStable -and $version -le $latestStable) {
-              throw "Preview base version $version is not greater than the latest published stable ($latestStable). Bump ModuleVersion before publishing previews."
+              throw "Preview base version $version is not greater than the latest published stable ($latestStable)."
             }
           }
           Write-Host "Version gate passed."
@@ -104,6 +138,8 @@ jobs:
           # upload as "not a higher version". SemVer compares prerelease identifiers
           # lexically, so a git-SHA-based tag (prev<sha>) sorts randomly and frequently
           # regresses. A fixed-width UTC timestamp always sorts correctly and increases.
+          # NOTE: this prerelease tag is applied to the RUNNER's copy of the manifest only;
+          # the commit made to the repo afterwards uses the numeric version (no -preview).
           $prerelease = "preview" + [DateTime]::UtcNow.ToString("yyyyMMddHHmmss")
           Write-Host "Marking as prerelease: $prerelease"
           Update-ModuleManifest -Path "M365Permissions/M365Permissions.psd1" -Prerelease $prerelease
@@ -114,3 +150,48 @@ jobs:
           PSGALL: ${{ secrets.PSGALL }}
         run: |
           Publish-Module -Path "M365Permissions" -NuGetApiKey $env:PSGALL -Verbose
+
+      # ── Persist the version bump + changelog back to the repo ──
+      # Runs only after a successful publish. The commit message carries [skip ci]
+      # so this push does NOT re-trigger the pipeline.
+
+      - name: Commit version bump and changelog
+        if: success()
+        shell: pwsh
+        env:
+          NEW_VERSION:  ${{ steps.version.outputs.new }}
+          RELEASE_TYPE: ${{ steps.config.outputs.type }}
+        run: |
+          $new      = $env:NEW_VERSION
+          $type     = $env:RELEASE_TYPE
+          $psd1Path = "M365Permissions/M365Permissions.psd1"
+
+          # Restore the manifest to its committed state (drops the -preview tag we
+          # applied for publishing), then re-apply ONLY the numeric version bump so
+          # the committed psd1 never contains a -preview suffix.
+          git checkout -- $psd1Path
+          $content = Get-Content $psd1Path -Raw
+          $content = $content -replace "(?m)^(\s*ModuleVersion\s*=\s*')[^']*(')", ('${1}' + $new + '${2}')
+          Set-Content $psd1Path -Value $content -NoNewline
+
+          # Build a brief changelog from commit subjects since the previous release.
+          $lastRelease = git log --grep="^chore(release):" --format=%H -n 1 | Select-Object -First 1
+          $range = if ($lastRelease) { "$lastRelease..HEAD" } else { "HEAD" }
+          $subjects = git log $range --no-merges --format="%s" |
+            Where-Object { $_ -and $_ -notmatch '^chore\(release\):' } |
+            ForEach-Object { $_.Trim() } |
+            Select-Object -Unique |
+            Select-Object -First 15
+          if (-not $subjects) { $subjects = @("Maintenance and internal improvements") }
+
+          $label = if ($type -eq 'preview') { "$new-preview" } else { $new }
+          $entry = "# $label`n" + (($subjects | ForEach-Object { "- $_" }) -join "`n") + "`n`n"
+          $existing = if (Test-Path "CHANGELOG.md") { Get-Content "CHANGELOG.md" -Raw } else { "" }
+          Set-Content "CHANGELOG.md" -Value ($entry + $existing) -NoNewline
+          Write-Host "Prepended CHANGELOG entry for $label"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add $psd1Path CHANGELOG.md
+          git commit -m "chore(release): $new [skip ci]"
+          git push

@@ -116,6 +116,28 @@ public static class ApiRoutes
             {
                 await WebServer.WriteJson(ctx.Response, 409, ApiResponse.Fail(ex.Message));
             }
+            catch (Auth.OAuthCallbackException ex)
+            {
+                // Consent/sign-in returned an error (e.g. the user declined, or an admin-consent
+                // requirement the signed-in account can't satisfy). Without this, the scan-start
+                // POST surfaced only a generic 500 and the "Start Scan" button looked dead.
+                await WebServer.WriteJson(ctx.Response, 403, ApiResponse.Fail(
+                    $"Consent required to start this scan but it did not complete: {ex.Message}. " +
+                    "Ask a Global Administrator to grant consent, or deselect the scan types that need it."));
+            }
+            catch (TimeoutException ex)
+            {
+                // The interactive consent/sign-in that runs before the scan waits up to 5 minutes
+                // for the browser redirect. If it never comes back (tab closed, consent blocked),
+                // report that plainly instead of hanging behind a generic 500.
+                await WebServer.WriteJson(ctx.Response, 504, ApiResponse.Fail(
+                    $"Timed out waiting for sign-in/consent to start the scan: {ex.Message}"));
+            }
+            catch (Exception ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 500, ApiResponse.Fail(
+                    $"Failed to start scan: {ex.Message}"));
+            }
         });
 
         server.Route("GET", "/api/scan/progress", async (ctx, _) =>
