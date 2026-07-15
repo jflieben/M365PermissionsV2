@@ -1,3 +1,6 @@
+# 2.0.7-preview
+- fix button and improve publish pipeline logic
+
 # 2.0.6
 - Minor improvements to logging
 - Better handling of missing SPN's (post-auth)
