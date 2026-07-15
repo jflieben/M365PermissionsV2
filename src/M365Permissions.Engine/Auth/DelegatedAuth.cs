@@ -79,6 +79,13 @@ public sealed class DelegatedAuth
     public string? UserPrincipalName => _userPrincipalName;
     public DateTimeOffset? RefreshTokenExpiry => _tokenCache.RefreshTokenExpiry;
 
+    /// <summary>SharePoint tenant prefix (e.g. "contoso"), discovered from the sites/root webUrl. Null until connected.</summary>
+    public string? SharePointTenantName => _sharePointTenant;
+    /// <summary>Tenant SharePoint root URL (e.g. https://contoso.sharepoint.com), or null if not yet discovered.</summary>
+    public string? SharePointRootUrl => string.IsNullOrEmpty(_sharePointTenant) ? null : $"https://{_sharePointTenant}.sharepoint.com";
+    /// <summary>Tenant SharePoint admin URL (e.g. https://contoso-admin.sharepoint.com), or null if not yet discovered.</summary>
+    public string? SharePointAdminUrl => string.IsNullOrEmpty(_sharePointTenant) ? null : $"https://{_sharePointTenant}-admin.sharepoint.com";
+
     public DelegatedAuth(TokenCache tokenCache)
     {
         _tokenCache = tokenCache;
@@ -230,7 +237,18 @@ public sealed class DelegatedAuth
     {
         var resources = GetOrderedResourceKeysForCategories(categories);
         foreach (var resource in resources)
-            await EnsureResourceTokenAsync(resource, ct);
+        {
+            try
+            {
+                await EnsureResourceTokenAsync(resource, ct);
+            }
+            catch (ResourcePrincipalNotFoundException)
+            {
+                // This resource isn't provisioned/subscribed in the tenant (e.g. no Azure DevOps
+                // SPN). Don't let it abort consent for the other selected resources — the scanner
+                // that needs it will be marked Skipped by the orchestrator with a clear reason.
+            }
+        }
     }
 
     /// <summary>
@@ -248,6 +266,13 @@ public sealed class DelegatedAuth
             try
             {
                 await ReconsentResourceAsync(resource, ct);
+            }
+            catch (ResourcePrincipalNotFoundException)
+            {
+                // Resource isn't provisioned/subscribed in this tenant (e.g. no Azure DevOps SPN —
+                // AADSTS650052). That's expected for some tenants and is not a failure: skip it and
+                // keep re-consenting the rest. The browser shows a friendly "service not available"
+                // page instead of a raw AAD error.
             }
             catch (Exception ex)
             {
@@ -535,6 +560,37 @@ public sealed class DelegatedAuth
     }
 
     /// <summary>
+    /// AAD error codes that mean "this resource is not usable in this tenant for this user and no
+    /// amount of retrying will fix it programmatically":
+    ///  - AADSTS500011: The resource principal named X was not found in the tenant
+    ///  - AADSTS650052: The app needs access to a service the org has not subscribed to
+    ///  - AADSTS650057: Invalid resource
+    ///  - AADSTS65001:  No consent for the requested permissions
+    ///  - AADSTS70011:  Invalid scope (often: scope not consented for this app/tenant)
+    ///  - AADSTS700016: App not found in tenant (shouldn't happen for resource tokens, but safe)
+    /// </summary>
+    private static readonly string[] SkippableAadResourceCodes =
+    {
+        "AADSTS500011", "AADSTS650052", "AADSTS650057",
+        "AADSTS65001",  "AADSTS70011",  "AADSTS700016"
+    };
+
+    /// <summary>
+    /// Return the first skippable AAD code found in an error description (from a token-endpoint
+    /// error body or an authorize-redirect error_description), or null if none is present. A match
+    /// means the requested resource can't be acquired in this tenant and should be skipped rather
+    /// than treated as a hard failure.
+    /// </summary>
+    private static string? MatchSkippableAadCode(string? description)
+    {
+        if (string.IsNullOrEmpty(description)) return null;
+        foreach (var c in SkippableAadResourceCodes)
+            if (description.Contains(c, StringComparison.Ordinal))
+                return c;
+        return null;
+    }
+
+    /// <summary>
     /// If the AAD error response indicates the resource cannot be acquired in the user's tenant
     /// (e.g. PowerBI / Azure DevOps / ASM SPN missing, resource never consented, user can't grant
     /// consent), throw a typed <see cref="ResourcePrincipalNotFoundException"/> so callers can skip
@@ -542,24 +598,7 @@ public sealed class DelegatedAuth
     /// </summary>
     private static void ThrowIfResourcePrincipalMissing(string resource, string errorJson)
     {
-        // AAD error codes that mean "this resource is not usable in this tenant for this user
-        // and no amount of retrying will fix it programmatically":
-        //  - AADSTS500011: The resource principal named X was not found in the tenant
-        //  - AADSTS650052: The app needs access to a service the org has not subscribed to
-        //  - AADSTS650057: Invalid resource
-        //  - AADSTS65001:  No consent for the requested permissions
-        //  - AADSTS70011:  Invalid scope (often: scope not consented for this app/tenant)
-        //  - AADSTS700016: App not found in tenant (shouldn't happen for resource tokens, but safe)
-        // OAuth2 error names that wrap any of the above on the token endpoint:
-        //  - "invalid_client", "invalid_scope", "invalid_request", "unauthorized_client"
-        var skippableAadCodes = new[]
-        {
-            "AADSTS500011", "AADSTS650052", "AADSTS650057",
-            "AADSTS65001",  "AADSTS70011",  "AADSTS700016"
-        };
-
         string? oauthError = null;
-        string? aadCode = null;
         string description = string.Empty;
 
         try
@@ -576,15 +615,7 @@ public sealed class DelegatedAuth
             return;
         }
 
-        foreach (var c in skippableAadCodes)
-        {
-            if (description.Contains(c, StringComparison.Ordinal))
-            {
-                aadCode = c;
-                break;
-            }
-        }
-
+        var aadCode = MatchSkippableAadCode(description);
         if (aadCode != null)
         {
             throw new ResourcePrincipalNotFoundException(resource, aadCode,
@@ -671,6 +702,15 @@ public sealed class DelegatedAuth
                 else
                     _tokenCache.SetRefreshToken(rt.GetString()!, rtExpiry);
             }
+        }
+        catch (OAuthCallbackException ex) when (ex.SkippableResourceCode != null)
+        {
+            // The authorize redirect came back with an error meaning this resource simply isn't
+            // available in the tenant (e.g. no Azure DevOps SPN — AADSTS650052). Surface it as a
+            // skippable resource error so callers skip just this resource and keep the rest working.
+            throw new ResourcePrincipalNotFoundException(cacheKey, ex.SkippableResourceCode,
+                $"Cannot consent to '{cacheKey}' in this tenant ({ex.SkippableResourceCode}). " +
+                "This service isn't provisioned or subscribed here. Skipping it.");
         }
         finally
         {
@@ -812,9 +852,24 @@ public sealed class DelegatedAuth
 
             if (!string.IsNullOrEmpty(error))
             {
-                await WriteBrowserResponseAsync(context,
-                    $"<html><body style='font-family:sans-serif'><h2>{failureTitle}</h2><p><b>{WebUtility.HtmlEncode(error)}</b></p><pre style='white-space:pre-wrap'>{WebUtility.HtmlEncode(errorDescription)}</pre></body></html>", ct);
-                throw new InvalidOperationException($"{failureTitle}: {error} — {errorDescription}");
+                // If the error means the requested resource isn't provisioned/subscribed in the
+                // tenant (e.g. AADSTS650052 for Azure DevOps), show a friendly "skipped" page and
+                // flag it so callers acquiring a per-resource token can skip gracefully instead of
+                // treating it as a hard failure.
+                var skippableCode = MatchSkippableAadCode(errorDescription);
+                if (skippableCode != null)
+                {
+                    await WriteBrowserResponseAsync(context,
+                        "<html><body style='font-family:sans-serif'><h2>Service not available</h2>" +
+                        "<p>This Microsoft service isn't provisioned in your organization, so it was skipped. " +
+                        "Your other permissions were not affected — you can close this tab.</p></body></html>", ct);
+                }
+                else
+                {
+                    await WriteBrowserResponseAsync(context,
+                        $"<html><body style='font-family:sans-serif'><h2>{failureTitle}</h2><p><b>{WebUtility.HtmlEncode(error)}</b></p><pre style='white-space:pre-wrap'>{WebUtility.HtmlEncode(errorDescription)}</pre></body></html>", ct);
+                }
+                throw new OAuthCallbackException($"{failureTitle}: {error} — {errorDescription}", error, errorDescription, skippableCode);
             }
 
             if (!string.IsNullOrEmpty(code))

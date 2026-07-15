@@ -1,6 +1,6 @@
 @{
     RootModule           = 'M365Permissions.psm1'
-    ModuleVersion        = '2.0.5'
+    ModuleVersion        = '2.0.6'
     CompatiblePSEditions = @('Core')
     GUID                 = '748c97a1-b861-4bc5-8455-53494b565526'
     Author               = 'Jos Lieben (jos@lieben.nu)'
@@ -10,7 +10,7 @@
     Description          = @'
 M365Permissions - Microsoft 365 & Azure Permission Scanner
 
-For the enterprise Azure-native version, see https://www.m365permissions.com
+For enterprise Azure-native, see https://www.m365permissions.com
 
 This module reports on permissions across SharePoint, Entra ID, Exchange Online, OneDrive, Power BI, Power Platform, Azure RBAC, and Azure DevOps.
 It can compare over time, scan multiple tenants and show an overview of all permissions for e.g. a specific user.

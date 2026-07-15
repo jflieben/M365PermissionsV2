@@ -1,3 +1,7 @@
+# 2.0.6
+- Minor improvements to logging
+- Better handling of missing SPN's (post-auth)
+
 # 2.0.5
 - Fix issue with export to excel
 - Automatic gallery publish

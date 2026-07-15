@@ -50,6 +50,12 @@ public sealed class SharePointScanner : IScanProvider
         ScanContext context,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
+        // Surface the tenant root that was detected from Graph sites/root (webUrl → {tenant}), so
+        // the log makes it obvious which tenant/host this scan (and any admin elevation) targets.
+        var rootUrl = _auth.SharePointRootUrl;
+        if (!string.IsNullOrEmpty(rootUrl))
+            context.ReportProgress($"Detected tenant SharePoint root URL: {rootUrl} (admin: {_auth.SharePointAdminUrl})", 3);
+
         context.ReportProgress("Enumerating SharePoint sites...", 3);
 
         // Collect all sites first so we know the total

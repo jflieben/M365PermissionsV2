@@ -28,6 +28,13 @@ public sealed class OneDriveScanner : IScanProvider
         ScanContext context,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
+        // Surface the tenant root detected from Graph sites/root (webUrl → {tenant}). OneDrive
+        // personal sites live on the "-my" host derived from the same tenant prefix.
+        var tenantName = _auth.SharePointTenantName;
+        if (!string.IsNullOrEmpty(tenantName))
+            context.ReportProgress(
+                $"Detected tenant SharePoint root URL: {_auth.SharePointRootUrl} (OneDrive host: https://{tenantName}-my.sharepoint.com, admin: {_auth.SharePointAdminUrl})", 3);
+
         context.ReportProgress("Enumerating OneDrive personal sites via user enumeration...", 3);
 
         var scannerUpn = _auth.UserPrincipalName ?? "";
