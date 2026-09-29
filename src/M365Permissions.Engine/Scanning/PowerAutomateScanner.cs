@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text.Json;
 using M365Permissions.Engine.Auth;
+using M365Permissions.Engine.Graph;
 using M365Permissions.Engine.Models;
 
 namespace M365Permissions.Engine.Scanning;
@@ -14,12 +15,46 @@ public sealed class PowerAutomateScanner : IScanProvider
     public string Category => "PowerAutomate";
 
     private readonly DelegatedAuth _auth;
-    private readonly HttpClient _http;
+    private readonly ResilientHttpClient _http;
 
     public PowerAutomateScanner(DelegatedAuth auth)
     {
         _auth = auth;
-        _http = new HttpClient();
+        _http = new ResilientHttpClient(auth);
+    }
+
+    /// <summary>
+    /// GET a Power Platform list with the powerapps token, following nextLink. Returns null plus the status
+    /// code when the first page fails (callers fall back); throws when a later page fails.
+    /// </summary>
+    private async Task<(List<JsonElement>? Items, int Status)> GetAllAsync(string url, CancellationToken ct)
+    {
+        var items = new List<JsonElement>();
+        string? next = url;
+        while (!string.IsNullOrEmpty(next))
+        {
+            var pageUrl = next;
+            var token = await _auth.GetAccessTokenAsync("powerapps", ct);
+            using var resp = await _http.SendAsync(() =>
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get, pageUrl);
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                return req;
+            }, ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                if (items.Count == 0 && pageUrl == url) return (null, (int)resp.StatusCode);
+                throw new HttpRequestException($"HTTP {(int)resp.StatusCode} while paging {url}; results would be incomplete.", null, resp.StatusCode);
+            }
+
+            using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
+                foreach (var v in val.EnumerateArray())
+                    items.Add(v.Clone());
+            next = doc.RootElement.TryGetProperty("nextLink", out var nl) ? nl.GetString() : null;
+        }
+        return (items, 200);
     }
 
     public async IAsyncEnumerable<PermissionEntry> ScanAsync(
@@ -32,63 +67,50 @@ public sealed class PowerAutomateScanner : IScanProvider
         var environments = new List<(string Id, string Name)>();
         try
         {
-            var token = await _auth.GetAccessTokenAsync("powerapps", ct);
-
             // Try admin endpoint first for all tenant environments
-            using var adminReq = new HttpRequestMessage(HttpMethod.Get,
-                "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments?api-version=2016-11-01");
-            adminReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-            var resp = await _http.SendAsync(adminReq, ct);
-            if (!resp.IsSuccessStatusCode)
+            var (envList, status) = await GetAllAsync(
+                "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments?api-version=2016-11-01", ct);
+            if (envList == null)
             {
-                context.ReportProgress($"BAP admin environments API returned HTTP {(int)resp.StatusCode}, falling back to user environments...", 4);
-                // Fallback: user's own environments
-                using var userReq = new HttpRequestMessage(HttpMethod.Get,
-                    "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/environments?api-version=2016-11-01");
-                userReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                resp = await _http.SendAsync(userReq, ct);
+                context.ReportProgress($"BAP admin environments API returned HTTP {status}, falling back to user environments...", 4);
+                (envList, status) = await GetAllAsync(
+                    "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/environments?api-version=2016-11-01", ct);
             }
 
-            if (resp.IsSuccessStatusCode)
+            if (envList != null)
             {
-                var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-                if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
+                foreach (var env in envList)
                 {
-                    foreach (var env in val.EnumerateArray())
+                    var envId = env.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                    var envDisplayName = envId;
+                    if (env.TryGetProperty("properties", out var props))
                     {
-                        var envId = env.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
-                        var envDisplayName = envId;
-                        if (env.TryGetProperty("properties", out var props))
-                        {
-                            if (props.TryGetProperty("displayName", out var dn))
-                                envDisplayName = dn.GetString() ?? envId;
+                        if (props.TryGetProperty("displayName", out var dn))
+                            envDisplayName = dn.GetString() ?? envId;
 
-                            // Skip disabled environments (matching V1)
-                            if (props.TryGetProperty("states", out var states) &&
-                                states.TryGetProperty("runtime", out var runtime) &&
-                                runtime.TryGetProperty("id", out var runtimeId) &&
-                                string.Equals(runtimeId.GetString(), "Disabled", StringComparison.OrdinalIgnoreCase))
-                            {
-                                context.ReportProgress($"Skipping environment '{envDisplayName}' because it is disabled.", 4);
-                                continue;
-                            }
+                        // Skip disabled environments (matching V1)
+                        if (props.TryGetProperty("states", out var states) &&
+                            states.TryGetProperty("runtime", out var runtime) &&
+                            runtime.TryGetProperty("id", out var runtimeId) &&
+                            string.Equals(runtimeId.GetString(), "Disabled", StringComparison.OrdinalIgnoreCase))
+                        {
+                            context.ReportProgress($"Skipping environment '{envDisplayName}' because it is disabled.", 4);
+                            continue;
                         }
-                        if (!string.IsNullOrEmpty(envId))
-                            environments.Add((envId, envDisplayName));
                     }
+                    if (!string.IsNullOrEmpty(envId))
+                        environments.Add((envId, envDisplayName));
                 }
             }
             else
             {
-                context.ReportProgress($"Cannot access Power Platform environments API (HTTP {(int)resp.StatusCode}). Check required scopes.", 2);
-                yield break;
+                throw new InvalidOperationException($"Cannot access Power Platform environments API (HTTP {status}). Check required scopes.");
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException and not ResourcePrincipalNotFoundException and not InvalidOperationException)
         {
-            context.ReportProgress($"Failed to enumerate Power Platform environments: {ex.Message}", 2);
-            yield break;
+            // Without environments nothing else runs: fail the category instead of reporting it complete.
+            throw new InvalidOperationException($"Failed to enumerate Power Platform environments: {ex.Message}", ex);
         }
 
         context.ReportProgress($"Found {environments.Count} Power Platform environment(s).", 3);
@@ -126,48 +148,21 @@ public sealed class PowerAutomateScanner : IScanProvider
         var flows = new List<JsonElement>();
         try
         {
-            var token = await _auth.GetAccessTokenAsync("powerapps", ct);
-
             // Try admin API first for all flows in the environment
-            using var req = new HttpRequestMessage(HttpMethod.Get,
-                $"https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/scopes/admin/environments/{envId}/v2/flows?api-version=2016-11-01&$select=permissions");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-            var resp = await _http.SendAsync(req, ct);
-            if (resp.IsSuccessStatusCode)
+            var (list, status) = await GetAllAsync(
+                $"https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/scopes/admin/environments/{envId}/v2/flows?api-version=2016-11-01&$select=permissions", ct);
+            if (list == null)
             {
-                var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-                if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var flow in val.EnumerateArray())
-                        flows.Add(flow.Clone());
-                }
-            }
-            else
-            {
-                context.ReportProgress($"Flow admin API returned HTTP {(int)resp.StatusCode} for {envName}, trying user API fallback...", 4);
+                context.ReportProgress($"Flow admin API returned HTTP {status} for {envName}, trying user API fallback...", 4);
                 // Fallback: get user's own flows
-                using var req2 = new HttpRequestMessage(HttpMethod.Get,
-                    $"https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/{envId}/flows?api-version=2016-11-01&$top=250&$select=permissions");
-                req2.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-                var resp2 = await _http.SendAsync(req2, ct);
-                if (resp2.IsSuccessStatusCode)
-                {
-                    var doc2 = await JsonDocument.ParseAsync(await resp2.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-                    if (doc2.RootElement.TryGetProperty("value", out var val2) && val2.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var flow in val2.EnumerateArray())
-                            flows.Add(flow.Clone());
-                    }
-                }
-                else
-                {
-                    context.ReportProgress($"Flow user API also returned HTTP {(int)resp2.StatusCode} for {envName}. Check permissions.", 2);
-                }
+                (list, status) = await GetAllAsync(
+                    $"https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/{envId}/flows?api-version=2016-11-01&$top=250&$select=permissions", ct);
+                if (list == null)
+                    context.ReportProgress($"Flow user API also returned HTTP {status} for {envName}. Check permissions.", 2);
             }
+            if (list != null) flows.AddRange(list);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             context.ReportProgress($"Error enumerating flows in {envName}: {ex.Message}", 2);
             yield break;
@@ -227,31 +222,18 @@ public sealed class PowerAutomateScanner : IScanProvider
         string envId, string flowId, string flowDisplayName, string envName,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        List<JsonElement> permissions = new();
+        List<JsonElement>? permissions;
         try
         {
-            var token = await _auth.GetAccessTokenAsync("powerapps", ct);
-            using var req = new HttpRequestMessage(HttpMethod.Get,
-                $"https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/scopes/admin/environments/{envId}/flows/{flowId}/permissions?api-version=2016-11-01");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-            var resp = await _http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode)
-                yield break;
-
-            var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-            if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var perm in val.EnumerateArray())
-                    permissions.Add(perm.Clone());
-            }
+            (permissions, _) = await GetAllAsync(
+                $"https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/scopes/admin/environments/{envId}/flows/{flowId}/permissions?api-version=2016-11-01", ct);
         }
-        catch
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             yield break;
         }
 
-        foreach (var perm in permissions)
+        foreach (var perm in permissions ?? new())
         {
             var permType = perm.TryGetProperty("properties", out var pp)
                 ? (pp.TryGetProperty("roleName", out var rn) ? rn.GetString() ?? "" : "")
@@ -296,48 +278,21 @@ public sealed class PowerAutomateScanner : IScanProvider
         List<JsonElement> apps = new();
         try
         {
-            var token = await _auth.GetAccessTokenAsync("powerapps", ct);
-
             // Try admin API first (with permissions expanded, matching V1)
-            using var req = new HttpRequestMessage(HttpMethod.Get,
-                $"https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/{envId}/apps?api-version=2016-11-01&$expand=permissions");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-            var resp = await _http.SendAsync(req, ct);
-            if (resp.IsSuccessStatusCode)
+            var (list, status) = await GetAllAsync(
+                $"https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/{envId}/apps?api-version=2016-11-01&$expand=permissions", ct);
+            if (list == null)
             {
-                var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-                if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var app in val.EnumerateArray())
-                        apps.Add(app.Clone());
-                }
-            }
-            else
-            {
-                context.ReportProgress($"PowerApps admin API returned HTTP {(int)resp.StatusCode} for {envName}, trying user API fallback...", 4);
+                context.ReportProgress($"PowerApps admin API returned HTTP {status} for {envName}, trying user API fallback...", 4);
                 // Fallback: user's own apps
-                using var req2 = new HttpRequestMessage(HttpMethod.Get,
-                    $"https://api.powerapps.com/providers/Microsoft.PowerApps/apps?api-version=2016-11-01&$filter=environment eq '{envId}'");
-                req2.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-                var resp2 = await _http.SendAsync(req2, ct);
-                if (resp2.IsSuccessStatusCode)
-                {
-                    var doc2 = await JsonDocument.ParseAsync(await resp2.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-                    if (doc2.RootElement.TryGetProperty("value", out var val2) && val2.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var app in val2.EnumerateArray())
-                            apps.Add(app.Clone());
-                    }
-                }
-                else
-                {
-                    context.ReportProgress($"PowerApps user API also returned HTTP {(int)resp2.StatusCode} for {envName}. Check permissions.", 2);
-                }
+                (list, status) = await GetAllAsync(
+                    $"https://api.powerapps.com/providers/Microsoft.PowerApps/apps?api-version=2016-11-01&$filter=environment eq '{envId}'", ct);
+                if (list == null)
+                    context.ReportProgress($"PowerApps user API also returned HTTP {status} for {envName}. Check permissions.", 2);
             }
+            if (list != null) apps.AddRange(list);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             context.ReportProgress($"PowerApps scan skipped for {envName}: {ex.Message}", 3);
             yield break;
@@ -394,30 +349,18 @@ public sealed class PowerAutomateScanner : IScanProvider
         string envId, string appId, string appDisplayName, string envName,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        List<JsonElement> permissions = new();
+        List<JsonElement>? permissions;
         try
         {
-            var token = await _auth.GetAccessTokenAsync("powerapps", ct);
-            using var req = new HttpRequestMessage(HttpMethod.Get,
-                $"https://api.powerapps.com/providers/Microsoft.PowerApps/apps/{appId}/permissions?api-version=2016-11-01");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-            var resp = await _http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode) yield break;
-
-            var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-            if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var perm in val.EnumerateArray())
-                    permissions.Add(perm.Clone());
-            }
+            (permissions, _) = await GetAllAsync(
+                $"https://api.powerapps.com/providers/Microsoft.PowerApps/apps/{appId}/permissions?api-version=2016-11-01", ct);
         }
-        catch
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             yield break;
         }
 
-        foreach (var perm in permissions)
+        foreach (var perm in permissions ?? new())
         {
             var pp = perm.TryGetProperty("properties", out var props) ? props : default;
             if (pp.ValueKind == JsonValueKind.Undefined) continue;
@@ -460,30 +403,18 @@ public sealed class PowerAutomateScanner : IScanProvider
         string envId, string envName, ScanContext context,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        List<JsonElement> connectors = new();
+        List<JsonElement>? connectors;
         try
         {
-            var token = await _auth.GetAccessTokenAsync("powerapps", ct);
-            using var req = new HttpRequestMessage(HttpMethod.Get,
-                $"https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/{envId}/connectors?api-version=2016-11-01");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-            var resp = await _http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode) yield break;
-
-            var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-            if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var conn in val.EnumerateArray())
-                    connectors.Add(conn.Clone());
-            }
+            (connectors, _) = await GetAllAsync(
+                $"https://api.powerapps.com/providers/Microsoft.PowerApps/scopes/admin/environments/{envId}/connectors?api-version=2016-11-01", ct);
         }
-        catch
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             yield break;
         }
 
-        if (connectors.Count == 0) yield break;
+        if (connectors == null || connectors.Count == 0) yield break;
         context.ReportProgress($"Scanning {connectors.Count} custom connectors in '{envName}'...", 4);
 
         foreach (var conn in connectors)

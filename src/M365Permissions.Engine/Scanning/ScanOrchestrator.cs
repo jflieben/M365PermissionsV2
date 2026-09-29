@@ -54,7 +54,7 @@ public sealed class ScanOrchestrator
         "none" => -1,
         "minimal" => 2,   // Critical, Error, Warning
         "normal" => 3,    // + Info
-        "full" => 5,      // everything
+        "verbose" or "full" => 5,  // everything ("Verbose" is what the GUI and Set-M365Config offer)
         _ => 3
     };
 
@@ -64,7 +64,8 @@ public sealed class ScanOrchestrator
     }
 
     /// <summary>Start a scan across the specified categories. Throws if already scanning.</summary>
-    public long StartScan(ScanContext context, List<string> scanTypes)
+    /// <param name="startupNotes">Account-check findings, logged right after "Scan started".</param>
+    public long StartScan(ScanContext context, List<string> scanTypes, IReadOnlyList<AccountNote>? startupNotes = null)
     {
         if (IsScanning)
             throw new InvalidOperationException("A scan is already in progress.");
@@ -96,6 +97,11 @@ public sealed class ScanOrchestrator
             {
                 _scanRepo.UpdateStatus(context.ScanId, ScanStatus.Running);
                 AddLog("Scan started", 3);
+                foreach (var note in startupNotes ?? Array.Empty<AccountNote>())
+                {
+                    var category = scanTypes.FirstOrDefault(t => t.Equals(note.Category, StringComparison.OrdinalIgnoreCase)) ?? "";
+                    AddLog(string.IsNullOrEmpty(category) ? $"Account check: {note.Message}" : $"[{category}] Account check: {note.Message}", note.Level, category);
+                }
                 await ExecuteScanAsync(context, scanTypes, _cts.Token);
 
                 var totalPerms = _permRepo.Count(context.ScanId);
@@ -233,6 +239,7 @@ public sealed class ScanOrchestrator
         {
             ScanId = context.ScanId,
             TenantDomain = context.TenantDomain,
+            TenantId = context.TenantId,
             UserPrincipalName = context.UserPrincipalName,
             Config = context.Config,
             ReportProgress = (msg, level) => AddLog($"[{scanType}] {msg}", level, scanType),
@@ -303,6 +310,11 @@ public sealed class ScanOrchestrator
             // User cancellation should propagate so the whole scan is marked cancelled.
             finalStatus = "Cancelled";
             throw;
+        }
+        catch (ResourcePrincipalNotFoundException ex) when (ex.NotProvisioned)
+        {
+            // The service isn't used in this tenant (no service principal): nothing to scan, so the category is complete.
+            AddLog($"[{scanType}] {ex.Message}", 3, scanType);
         }
         catch (ResourcePrincipalNotFoundException ex)
         {

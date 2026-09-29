@@ -4,9 +4,9 @@
     CompatiblePSEditions = @('Core')
     GUID                 = '748c97a1-b861-4bc5-8455-53494b565526'
     Author               = 'Jos Lieben (jos@lieben.nu)'
-    CompanyName          = 'Lieben Consultancy'
-    Copyright            = 'https://www.lieben.nu/liebensraum/commercial-use/'
-    HelpInfoURI          = 'https://lieben.nu/liebensraum/m365permissions/'
+    CompanyName          = 'JSolve B.V.'
+    Copyright            = 'https://jsolve.nl/commercial-use.html'
+    HelpInfoURI          = 'https://m365permissions.com'
     Description          = @'
 M365Permissions - Microsoft 365 & Azure Permission Scanner
 
@@ -21,7 +21,7 @@ INSTALLATION:
 USAGE:
     Import-Module M365Permissions   # Opens GUI automatically in your browser
 
-Free for non-commercial use. See https://www.lieben.nu/liebensraum/commercial-use/
+Free for non-commercial use. See https://jsolve.nl/commercial-use.html
 '@
     PowerShellVersion    = '7.4'
 
@@ -59,8 +59,8 @@ Free for non-commercial use. See https://www.lieben.nu/liebensraum/commercial-us
     PrivateData          = @{
         PSData = @{
             Tags         = @('M365Permissions', 'Microsoft365', 'SharePoint', 'Entra', 'Exchange', 'Security', 'Audit', 'Azure', 'PowerBI', 'PowerPlatform', 'DevOps')
-            LicenseUri   = 'https://www.lieben.nu/liebensraum/commercial-use/'
-            ProjectUri   = 'https://lieben.nu/liebensraum/m365permissions'
+            LicenseUri   = 'https://jsolve.nl/commercial-use.html'
+            ProjectUri   = 'https://m365permissions.com'
             ReleaseNotes = 'See https://github.com/jflieben/M365PermissionsV2'
         }
     }

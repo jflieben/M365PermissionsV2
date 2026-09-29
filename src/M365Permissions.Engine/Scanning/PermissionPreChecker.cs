@@ -19,19 +19,17 @@ public sealed class PermissionPreChecker
         _auth = auth;
     }
 
-    // Well-known Entra directory role template IDs
     private static class RoleTemplateIds
     {
-        public const string GlobalAdministrator = "62e90394-69f5-4237-9190-012177145e10";
-        public const string GlobalReader = "f2ef992c-3afb-46b9-b7cf-a126ee74c451";
-        public const string SharePointAdministrator = "f28a1f50-f6e7-4571-818b-6a12f2af6b6c";
-        public const string ExchangeAdministrator = "29232cdf-9323-42fd-ade2-1d097af3e4de";
-        public const string FabricAdministrator = "a9ea8996-122f-4c74-9520-8edcd192826c"; // Power BI Admin
-        public const string PowerPlatformAdministrator = "11648597-926c-4cf3-9c36-bcebb0ba8dcc";
+        public const string GlobalAdministrator = DirectoryRoles.GlobalAdministrator;
+        public const string SharePointAdministrator = DirectoryRoles.SharePointAdministrator;
+        public const string ExchangeAdministrator = DirectoryRoles.ExchangeAdministrator;
+        public const string FabricAdministrator = DirectoryRoles.FabricAdministrator;
+        public const string PowerPlatformAdministrator = DirectoryRoles.PowerPlatformAdministrator;
     }
 
     /// <summary>
-    /// Check permissions for the requested scan types. 
+    /// Check permissions for the requested scan types.
     /// Returns a dictionary: scanType → list of issues (empty list = OK).
     /// Checks both OAuth2 API access and Entra directory roles.
     /// </summary>
@@ -42,9 +40,19 @@ public sealed class PermissionPreChecker
         // Fetch the user's active directory roles once, reuse for all scan type checks
         var userRoles = await GetUserDirectoryRolesAsync(ct);
 
+        // Scope gaps per category, read from the access tokens themselves.
+        var claims = new Dictionary<string, TokenClaims?>(StringComparer.OrdinalIgnoreCase) { ["graph"] = _auth.GetCachedTokenClaims("graph") };
+        foreach (var scanType in scanTypes)
+            foreach (var resource in DelegatedAuth.GetRequiredResourceKeysForCategory(scanType))
+                claims.TryAdd(resource, _auth.GetCachedTokenClaims(resource));
+        var scopeNotes = AccountCheck.Evaluate(scanTypes, claims).Where(n => n.Level == 2).ToList();
+
         foreach (var scanType in scanTypes)
         {
             var issues = new List<string>();
+            issues.AddRange(scopeNotes
+                .Where(n => n.Category.Equals(scanType, StringComparison.OrdinalIgnoreCase))
+                .Select(n => n.Message));
             try
             {
                 switch (scanType.ToLower())
@@ -84,6 +92,14 @@ public sealed class PermissionPreChecker
                         break;
                 }
             }
+            catch (ResourcePrincipalNotFoundException ex) when (ex.NotProvisioned)
+            {
+                // The service isn't used in this tenant: nothing to scan, nothing to fix.
+            }
+            catch (ResourcePrincipalNotFoundException ex)
+            {
+                issues.Add(ex.Message);
+            }
             catch (Exception ex)
             {
                 issues.Add($"Pre-check failed: {ex.Message}");
@@ -95,11 +111,20 @@ public sealed class PermissionPreChecker
     }
 
     /// <summary>
-    /// Fetches the currently signed-in user's active Entra directory role template IDs.
+    /// The signed-in user's active Entra directory role template IDs: the token's wids claim (what
+    /// SharePoint and Exchange evaluate) plus me/memberOf, which needs directory read consent.
     /// </summary>
     private async Task<HashSet<string>> GetUserDirectoryRolesAsync(CancellationToken ct)
     {
         var roleIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var wids = TokenClaims.TryParse(await _auth.GetAccessTokenAsync("graph", ct))?.RoleTemplateIds;
+            if (wids != null) roleIds.UnionWith(wids);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* fall back to memberOf */ }
+
         try
         {
             await foreach (var role in _graphClient.GetPaginatedAsync(
@@ -166,7 +191,7 @@ public sealed class PermissionPreChecker
         // Try to get a single mailbox to verify Exchange access
         try
         {
-            var organization = _auth.TenantDomain ?? "";
+            var organization = _auth.TenantId ?? _auth.TenantDomain ?? "";
             using var http = new HttpClient();
             var token = await _auth.GetAccessTokenAsync("exchange", ct);
 
@@ -205,9 +230,9 @@ public sealed class PermissionPreChecker
     public static string? GetExchangePermissionIssue(System.Net.HttpStatusCode statusCode) => statusCode switch
     {
         System.Net.HttpStatusCode.Unauthorized =>
-            "Unauthorized: Exchange mailbox access returned HTTP 401. Exchange Administrator role, admin consent for Exchange.ManageAsApp, or a valid Exchange service principal is required for mailbox scanning.",
+            "Unauthorized: Exchange mailbox access returned HTTP 401. The signed-in account needs an active Exchange Administrator (or Global Administrator) role, and the app needs consent for the delegated Exchange.Manage permission.",
         System.Net.HttpStatusCode.Forbidden =>
-            "Missing permission: Exchange.ManageAsApp or Exchange Administrator role (needed for Exchange mailbox scanning)",
+            "Missing permission: Exchange Administrator (or Global Administrator) role, or consent for the delegated Exchange.Manage permission (needed for Exchange mailbox scanning)",
         _ => null
     };
 
@@ -397,6 +422,8 @@ public sealed class PermissionPreChecker
 
     // --- Entra directory role checks per scan type ---
 
+    private const string PimHint = " If the role is PIM-eligible, activate it first; the next scan start picks it up.";
+
     private static void CheckSharePointRoles(List<string> issues, HashSet<string> userRoles)
     {
         if (HasRole(userRoles, RoleTemplateIds.GlobalAdministrator, RoleTemplateIds.SharePointAdministrator))
@@ -404,7 +431,7 @@ public sealed class PermissionPreChecker
 
         issues.Add("Missing role: SharePoint Administrator (or Global Administrator). " +
             "Without this role the scanner cannot temporarily add itself as site collection admin to scan sites you don't own. " +
-            "Only sites where you are already a member or admin will be fully scanned — other sites will have incomplete permission data.");
+            "Only sites where you are already a member or admin will be fully scanned; other sites will have incomplete permission data." + PimHint);
     }
 
     private static void CheckExchangeRoles(List<string> issues, HashSet<string> userRoles)
@@ -414,7 +441,7 @@ public sealed class PermissionPreChecker
 
         issues.Add("Missing role: Exchange Administrator (or Global Administrator). " +
             "Without this role, Get-RecipientPermission (SendAs) and Get-MailboxPermission may fail or return limited results. " +
-            "SendAs permission data and mailbox delegate access will likely be incomplete or missing entirely.");
+            "Mailbox permission data will likely be incomplete or missing entirely." + PimHint);
     }
 
     private static void CheckOneDriveRoles(List<string> issues, HashSet<string> userRoles)
@@ -424,7 +451,7 @@ public sealed class PermissionPreChecker
 
         issues.Add("Missing role: SharePoint Administrator (or Global Administrator). " +
             "OneDrive is managed through SharePoint. Without this role the scanner cannot elevate to site admin on OneDrive sites. " +
-            "Only your own OneDrive and sites where you already have access will be scanned.");
+            "Only your own OneDrive and sites where you already have access will be scanned." + PimHint);
     }
 
     private static void CheckPowerBIRoles(List<string> issues, HashSet<string> userRoles)

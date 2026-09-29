@@ -35,7 +35,9 @@ public static class StaticFiles
         var safePath = requestPath.Replace('/', Path.DirectorySeparatorChar).TrimStart(Path.DirectorySeparatorChar);
         var fullPath = Path.GetFullPath(Path.Combine(rootPath, safePath));
 
-        if (!fullPath.StartsWith(Path.GetFullPath(rootPath), StringComparison.OrdinalIgnoreCase))
+        // Trailing separator, so a sibling folder such as "static-old" doesn't pass the prefix check.
+        var rootFull = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootPath)) + Path.DirectorySeparatorChar;
+        if (!fullPath.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
         {
             context.Response.StatusCode = 403;
             context.Response.Close();

@@ -7,7 +7,7 @@ $script:GuiRoot = Join-Path $PSScriptRoot 'gui' 'static'
 
 function Get-M365Engine {
     if ($null -eq $script:Engine) {
-        $dbFolder = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'LiebenConsultancy' 'M365Permissions'
+        $dbFolder = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'JSolveBV' 'M365Permissions'
         if (-not (Test-Path $dbFolder)) { New-Item -ItemType Directory -Path $dbFolder -Force | Out-Null }
         $dbPath = Join-Path $dbFolder 'data.db'
         $script:Engine = [M365Permissions.Engine.Engine]::new($dbPath)

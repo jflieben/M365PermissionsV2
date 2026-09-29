@@ -9,7 +9,7 @@ function Set-M365Config {
     .PARAMETER OutputFormat
         Default export format: XLSX or CSV.
     .PARAMETER LogLevel
-        Logging verbosity: Minimal, Normal, Verbose.
+        Which scan log lines are saved to the database: None, Minimal (warnings and errors), Normal (+ info) or Verbose (everything).
     .EXAMPLE
         Set-M365Config -GuiPort 9090 -MaxThreads 10
     #>
@@ -19,7 +19,7 @@ function Set-M365Config {
         [int]$MaxThreads,
         [ValidateSet('XLSX', 'CSV')]
         [string]$OutputFormat,
-        [ValidateSet('Minimal', 'Normal', 'Verbose')]
+        [ValidateSet('None', 'Minimal', 'Normal', 'Verbose')]
         [string]$LogLevel
     )
 

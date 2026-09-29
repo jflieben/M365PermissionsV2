@@ -21,9 +21,10 @@ function Start-M365Scan {
     )
 
     $engine = Get-M365Engine
-    $task = $engine.StartScanAsync($ScanTypes)
-    $scanId = $task.GetAwaiter().GetResult()
+    $result = $engine.StartScanDetailedAsync([System.Collections.Generic.List[string]]$ScanTypes).GetAwaiter().GetResult()
+    $scanId = $result.ScanId
     Write-Host "Scan started (ID: $scanId)." -ForegroundColor Cyan
+    foreach ($warning in $result.Warnings) { Write-Warning $warning }
 
     if (-not $Wait) {
         Write-Host "Use Get-M365ScanStatus to monitor progress." -ForegroundColor Cyan

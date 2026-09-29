@@ -60,114 +60,75 @@ public sealed class SharePointRestClient
         }
     }
 
-    /// <summary>Get site details by URL.</summary>
-    public async Task<JsonElement?> GetSiteByUrlAsync(string siteUrl, CancellationToken ct = default)
-    {
-        var uri = new Uri(siteUrl);
-        var hostname = uri.Host;
-        var sitePath = uri.AbsolutePath.TrimEnd('/');
-
-        if (string.IsNullOrEmpty(sitePath) || sitePath == "/")
-            return await _graphClient.GetAsync($"sites/{hostname}", ct: ct);
-
-        return await _graphClient.GetAsync($"sites/{hostname}:{sitePath}", ct: ct);
-    }
-
     /// <summary>Get site permissions (app registrations, users, groups with direct access).</summary>
     public IAsyncEnumerable<JsonElement> GetSitePermissionsAsync(string siteId, CancellationToken ct = default)
     {
         return _graphClient.GetPaginatedAsync($"sites/{siteId}/permissions", ct: ct);
     }
 
-    /// <summary>Get all lists/document libraries for a site.</summary>
-    public IAsyncEnumerable<JsonElement> GetListsAsync(string siteId, CancellationToken ct = default)
-    {
-        return _graphClient.GetPaginatedAsync(
-            $"sites/{siteId}/lists?$select=id,displayName,list&$expand=list",
-            ct: ct);
-    }
-
-    /// <summary>Get sharing links for a drive item.</summary>
-    public IAsyncEnumerable<JsonElement> GetDriveItemPermissionsAsync(string siteId, string itemId, CancellationToken ct = default)
-    {
-        return _graphClient.GetPaginatedAsync(
-            $"sites/{siteId}/drive/items/{itemId}/permissions",
-            ct: ct);
-    }
-
     /// <summary>
     /// Call SharePoint REST API directly (for features not yet in Graph).
     /// Example: /_api/web/roleassignments, /_api/web/sitegroups
     /// </summary>
-    public async Task<JsonElement?> CallSpRestAsync(string siteUrl, string apiPath, CancellationToken ct = default)
-    {
-        var token = await _auth.GetAccessTokenAsync("sharepoint", ct);
-        var fullUrl = $"{siteUrl.TrimEnd('/')}/{apiPath.TrimStart('/')}";
-
-        using var request = new HttpRequestMessage(HttpMethod.Get, fullUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        request.Headers.Add("odata-version", "");
-
-        var response = await _http.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode)
-        {
-            var errorBody = await response.Content.ReadAsStringAsync(ct);
-            throw new HttpRequestException(
-                $"SPO REST {(int)response.StatusCode} {response.ReasonPhrase}: {Truncate(errorBody, 500)}",
-                null, response.StatusCode);
-        }
-
-        var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-        return doc.RootElement.Clone();
-    }
+    public Task<JsonElement?> CallSpRestAsync(string siteUrl, string apiPath, CancellationToken ct = default)
+        => SendAsync(HttpMethod.Get, "sharepoint", siteUrl, apiPath, null, "SPO REST", ct);
 
     /// <summary>POST to SharePoint REST API and return the response JSON.</summary>
-    private async Task<JsonElement?> PostSpRestAsync(string siteUrl, string apiPath, string jsonBody, CancellationToken ct = default)
-    {
-        var token = await _auth.GetAccessTokenAsync("sharepoint", ct);
-        var fullUrl = $"{siteUrl.TrimEnd('/')}/{apiPath.TrimStart('/')}";
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, fullUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        request.Headers.Add("odata-version", "");
-        request.Content = new StringContent(jsonBody, System.Text.Encoding.UTF8, "application/json");
-
-        var response = await _http.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode)
-        {
-            var errorBody = await response.Content.ReadAsStringAsync(ct);
-            throw new HttpRequestException(
-                $"SPO REST POST {(int)response.StatusCode} {response.ReasonPhrase}: {Truncate(errorBody, 500)}",
-                null, response.StatusCode);
-        }
-
-        var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-        return doc.RootElement.Clone();
-    }
+    private Task<JsonElement?> PostSpRestAsync(string siteUrl, string apiPath, string jsonBody, CancellationToken ct = default)
+        => SendAsync(HttpMethod.Post, "sharepoint", siteUrl, apiPath, jsonBody, "SPO REST POST", ct);
 
     /// <summary>PATCH/MERGE to SharePoint REST API (for updating user properties).</summary>
-    private async Task PatchSpRestAsync(string siteUrl, string apiPath, string jsonBody, CancellationToken ct = default)
+    private Task PatchSpRestAsync(string siteUrl, string apiPath, string jsonBody, CancellationToken ct = default)
+        => SendAsync(HttpMethod.Patch, "sharepoint", siteUrl, apiPath, jsonBody, "SPO REST PATCH", ct);
+
+    private const int MaxAttempts = 5;
+
+    /// <summary>
+    /// Send one SharePoint REST call, retrying throttled responses (429/503) with Retry-After.
+    /// Returns the parsed body, or null when there is none (PATCH/MERGE). Throws HttpRequestException
+    /// with the status code on any other failure.
+    /// </summary>
+    private async Task<JsonElement?> SendAsync(HttpMethod method, string resource, string baseUrl, string apiPath,
+        string? jsonBody, string label, CancellationToken ct)
     {
-        var token = await _auth.GetAccessTokenAsync("sharepoint", ct);
-        var fullUrl = $"{siteUrl.TrimEnd('/')}/{apiPath.TrimStart('/')}";
+        var fullUrl = $"{baseUrl.TrimEnd('/')}/{apiPath.TrimStart('/')}";
 
-        using var request = new HttpRequestMessage(new HttpMethod("PATCH"), fullUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        request.Headers.Add("odata-version", "");
-        request.Headers.Add("X-HTTP-Method", "MERGE");
-        request.Headers.Add("IF-MATCH", "*");
-        request.Content = new StringContent(jsonBody, System.Text.Encoding.UTF8, "application/json");
-
-        var response = await _http.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode)
+        for (int attempt = 1; ; attempt++)
         {
-            var errorBody = await response.Content.ReadAsStringAsync(ct);
-            throw new HttpRequestException(
-                $"SPO REST PATCH {(int)response.StatusCode} {response.ReasonPhrase}: {Truncate(errorBody, 500)}",
-                null, response.StatusCode);
+            var token = await _auth.GetAccessTokenAsync(resource, ct);
+            using var request = new HttpRequestMessage(method, fullUrl);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            request.Headers.Add("odata-version", "");
+            if (method == HttpMethod.Patch)
+            {
+                request.Headers.Add("X-HTTP-Method", "MERGE");
+                request.Headers.Add("IF-MATCH", "*");
+            }
+            if (jsonBody != null)
+                request.Content = new StringContent(jsonBody, System.Text.Encoding.UTF8, "application/json");
+
+            using var response = await _http.SendAsync(request, ct);
+
+            if ((int)response.StatusCode is 429 or 503 && attempt < MaxAttempts)
+            {
+                await Task.Delay(response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(Math.Pow(2, attempt)), ct);
+                continue;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync(ct);
+                throw new HttpRequestException(
+                    $"{label} {(int)response.StatusCode} {response.ReasonPhrase}: {Truncate(errorBody, 500)}",
+                    null, response.StatusCode);
+            }
+
+            if (method == HttpMethod.Patch || response.Content.Headers.ContentLength == 0)
+                return null;
+
+            using var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            return doc.RootElement.Clone();
         }
     }
 
@@ -256,8 +217,9 @@ public sealed class SharePointRestClient
     public async Task<List<JsonElement>> GetRoleAssignmentsAsync(string siteUrl, CancellationToken ct = default)
     {
         var result = new List<JsonElement>();
+        // $top: without it large collections can come back truncated (same as the hosted scanner).
         var json = await CallSpRestAsync(siteUrl,
-            "_api/web/roleassignments?$expand=Member,RoleDefinitionBindings", ct);
+            "_api/web/roleassignments?$expand=Member,RoleDefinitionBindings&$top=5000", ct);
         if (json?.TryGetProperty("value", out var assignments) == true)
         {
             foreach (var assignment in assignments.EnumerateArray())
@@ -293,54 +255,9 @@ public sealed class SharePointRestClient
         throw new InvalidOperationException($"Unexpected site ID format from Graph: {siteId}");
     }
 
-    /// <summary>GET from SharePoint admin REST API.</summary>
-    private async Task<JsonElement?> CallAdminRestAsync(string adminUrl, string apiPath, CancellationToken ct)
-    {
-        var token = await _auth.GetAccessTokenAsync("sharepointadmin", ct);
-        var fullUrl = $"{adminUrl.TrimEnd('/')}/{apiPath.TrimStart('/')}";
-
-        using var request = new HttpRequestMessage(HttpMethod.Get, fullUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        request.Headers.Add("odata-version", "");
-
-        var response = await _http.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode)
-        {
-            var errorBody = await response.Content.ReadAsStringAsync(ct);
-            throw new HttpRequestException(
-                $"Admin REST GET {(int)response.StatusCode}: {Truncate(errorBody, 500)}",
-                null, response.StatusCode);
-        }
-
-        var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-        return doc.RootElement.Clone();
-    }
-
     /// <summary>POST to SharePoint admin REST API.</summary>
-    private async Task<JsonElement?> PostAdminRestAsync(string adminUrl, string apiPath, string jsonBody, CancellationToken ct)
-    {
-        var token = await _auth.GetAccessTokenAsync("sharepointadmin", ct);
-        var fullUrl = $"{adminUrl.TrimEnd('/')}/{apiPath.TrimStart('/')}";
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, fullUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        request.Headers.Add("odata-version", "");
-        request.Content = new StringContent(jsonBody, System.Text.Encoding.UTF8, "application/json");
-
-        var response = await _http.SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode)
-        {
-            var errorBody = await response.Content.ReadAsStringAsync(ct);
-            throw new HttpRequestException(
-                $"Admin REST POST {(int)response.StatusCode}: {Truncate(errorBody, 500)}",
-                null, response.StatusCode);
-        }
-
-        var doc = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-        return doc.RootElement.Clone();
-    }
+    private Task<JsonElement?> PostAdminRestAsync(string adminUrl, string apiPath, string jsonBody, CancellationToken ct)
+        => SendAsync(HttpMethod.Post, "sharepointadmin", adminUrl, apiPath, jsonBody, "Admin REST POST", ct);
 
     /// <summary>
     /// Add a user as site collection admin via the SharePoint tenant admin API.

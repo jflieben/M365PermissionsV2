@@ -17,6 +17,7 @@ public sealed class ExchangeRestClient
     private readonly string _baseUrl = "https://outlook.office365.com";
 
     private const int MaxRetries = 3;
+    private const int MaxThrottleRetries = 6;
     private const int MaxPageSize = 1000;
 
     // Exchange Online transient error codes that should be retried even on HTTP 400
@@ -47,6 +48,7 @@ public sealed class ExchangeRestClient
         var results = new List<JsonElement>();
         string? nextLink = null;
         var url = $"{_baseUrl}/adminapi/beta/{organization}/InvokeCommand";
+        var throttleRetries = 0;
 
         for (int attempt = 0; attempt < MaxRetries; attempt++)
         {
@@ -76,7 +78,15 @@ public sealed class ExchangeRestClient
                     request.Content = new StringContent(
                         JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
 
-                    var response = await _http.SendAsync(request, ct);
+                    using var response = await _http.SendAsync(request, ct);
+
+                    // Throttled: wait as told and retry the same page.
+                    if ((int)response.StatusCode == 429 && throttleRetries < MaxThrottleRetries)
+                    {
+                        throttleRetries++;
+                        await Task.Delay(response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(5 * throttleRetries), ct);
+                        continue;
+                    }
 
                     if (!response.IsSuccessStatusCode)
                     {
@@ -85,9 +95,9 @@ public sealed class ExchangeRestClient
 
                         if (statusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
                         {
-                            var hint = statusCode == System.Net.HttpStatusCode.Unauthorized
-                                ? "Exchange mailbox access is unauthorized. Exchange Administrator role or admin consent for Exchange.ManageAsApp may be missing."
-                                : "Exchange mailbox access is forbidden. Exchange Administrator role or admin consent for Exchange.ManageAsApp may be missing.";
+                            var hint = (statusCode == System.Net.HttpStatusCode.Unauthorized ? "Exchange rejected the request." : "Exchange denied the request.") +
+                                " The signed-in account needs an active Exchange Administrator or Global Administrator role (activate it first if it is PIM-eligible)," +
+                                " and the app needs consent for the delegated Exchange.Manage permission.";
 
                             throw new HttpRequestException(
                                 $"EXO {(int)statusCode} {response.ReasonPhrase} [{cmdletName}]: {hint} {Truncate(errorBody, 500)}",

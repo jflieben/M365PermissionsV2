@@ -27,12 +27,15 @@ public static class ParallelScan
             FullMode = BoundedChannelFullMode.Wait
         });
 
+        // Cancelled when the consumer stops early, so producers don't stay blocked on a full channel.
+        using var producerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
         var producer = Task.Run(async () =>
         {
             try
             {
                 await Parallel.ForEachAsync(targets,
-                    new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = ct },
+                    new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = producerCts.Token },
                     async (target, tok) => await processTarget(target, channel.Writer, tok).ConfigureAwait(false))
                     .ConfigureAwait(false);
                 channel.Writer.Complete();
@@ -42,10 +45,17 @@ public static class ParallelScan
                 // Surface the failure to the consumer: ReadAllAsync will throw after draining.
                 channel.Writer.Complete(ex);
             }
-        }, ct);
+        }, producerCts.Token);
 
-        await foreach (var entry in channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
-            yield return entry;
+        try
+        {
+            await foreach (var entry in channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+                yield return entry;
+        }
+        finally
+        {
+            producerCts.Cancel();
+        }
 
         await producer.ConfigureAwait(false);
     }

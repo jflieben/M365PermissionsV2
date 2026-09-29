@@ -89,13 +89,13 @@ public sealed class SharePointScanner : IScanProvider
         {
             if (denied >= attempted)
                 context.ReportProgress(
-                    $"Permission summary: 0 of {attempted} sites returned permission data. The connected " +
-                    "account could not read any site — this almost always means it is not a SharePoint " +
-                    "Administrator (or Global Administrator), so it cannot temporarily elevate to site " +
-                    "collection admin. Grant that role and re-run for complete results.", 1);
+                    $"Permission summary: none of the {attempted} sites returned role assignments. This almost " +
+                    "always means the connected account is not an active SharePoint Administrator or Global " +
+                    "Administrator, so it cannot make itself site collection admin. Assign or activate (PIM) " +
+                    "that role and start the scan again.", 1);
             else
                 context.ReportProgress(
-                    $"Permission summary: {denied} of {attempted} sites returned no permission data " +
+                    $"Permission summary: {denied} of {attempted} sites returned no role assignments " +
                     $"(elevation failed on {elevationFailed}). Those sites need the connected account to be " +
                     "SharePoint Administrator (or site collection admin) for a complete scan.", 2);
         }
@@ -105,7 +105,7 @@ public sealed class SharePointScanner : IScanProvider
     private sealed class SiteAccessStats
     {
         public long Attempted;       // sites we actually tried to read (post system-site filter)
-        public long AccessDenied;    // sites where neither admins nor role assignments were readable
+        public long AccessDenied;    // sites whose role assignments were not readable
         public long ElevationFailed; // sites where temporary site-admin elevation could not be applied
     }
 
@@ -208,11 +208,13 @@ public sealed class SharePointScanner : IScanProvider
                 roleAssignments = new();
             }
 
-            // If we cannot query either admins or role assignments due authorization,
-            // skip this site gracefully and continue with the scan.
+            // Role assignments are the core data: a site without them counts as denied even when
+            // members could still read the admin list.
+            if (roleQueryUnauthorized)
+                Interlocked.Increment(ref stats.AccessDenied);
+
             if (adminQueryUnauthorized && roleQueryUnauthorized)
             {
-                Interlocked.Increment(ref stats.AccessDenied);
                 context.ReportProgress($"Skipping {displayName}: no SharePoint REST access after elevation attempt.", 2);
                 context.CompleteTarget();
                 return;
@@ -300,7 +302,7 @@ public sealed class SharePointScanner : IScanProvider
             PrincipalEntraUpn = email,
             PrincipalSysId = id,
             PrincipalSysName = title,
-            PrincipalType = DeterminePrincipalType(loginName),
+            PrincipalType = SharePointPrincipal.DetermineType(loginName, SharePointPrincipal.ReadTypeCode(admin)),
             PrincipalRole = "Site Collection Administrator",
             Through = "Direct",
             AccessType = "Allow",
@@ -341,7 +343,7 @@ public sealed class SharePointScanner : IScanProvider
                 TargetId = siteId,
                 PrincipalSysId = principalId,
                 PrincipalSysName = principalName,
-                PrincipalType = DeterminePrincipalType(principalLogin),
+                PrincipalType = SharePointPrincipal.DetermineType(principalLogin, SharePointPrincipal.ReadTypeCode(member)),
                 PrincipalRole = roleName,
                 Through = "Direct",
                 AccessType = "Allow",
@@ -394,26 +396,6 @@ public sealed class SharePointScanner : IScanProvider
             AccessType = "Allow",
             Tenure = "Permanent"
         };
-    }
-
-    private static string DeterminePrincipalType(string loginName)
-    {
-        if (string.IsNullOrEmpty(loginName)) return "Unknown";
-        // Order matters: more specific checks first
-        // Users: i:0#.f|membership|user@domain.com
-        if (loginName.StartsWith("i:0#.f|membership|", StringComparison.OrdinalIgnoreCase)) return "Internal User";
-        // External users always contain #ext#
-        if (loginName.Contains("#ext#", StringComparison.OrdinalIgnoreCase)) return "External User";
-        // Security groups: c:0t.c|tenant|<guid> or c:0o.c|federateddirectoryclaimprovider|<guid>
-        if (loginName.StartsWith("c:0t.c|tenant|", StringComparison.OrdinalIgnoreCase)) return "SecurityGroup";
-        if (loginName.Contains("|federateddirectoryclaimprovider|", StringComparison.OrdinalIgnoreCase)) return "SecurityGroup";
-        // SharePoint groups: c:0-.f|rolemanager|spo-grid-all-users/...
-        if (loginName.Contains("c:0-.f|rolemanager|", StringComparison.OrdinalIgnoreCase)) return "SharePoint Group";
-        // Everyone / Everyone except external: c:0(.s|true (all authenticated)
-        if (loginName.StartsWith("c:0(.s|true", StringComparison.OrdinalIgnoreCase)) return "Everyone";
-        // Remaining membership claims are typically groups
-        if (loginName.Contains("|membership|", StringComparison.OrdinalIgnoreCase)) return "SecurityGroup";
-        return "Unknown";
     }
 
     private static bool IsUnauthorized(Exception ex)

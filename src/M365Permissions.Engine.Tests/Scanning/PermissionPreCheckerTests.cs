@@ -31,6 +31,8 @@ public sealed class PermissionPreCheckerTests
 
         Assert.NotNull(issue);
         Assert.Contains("Exchange Administrator", issue, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("Exchange.ManageAsApp", issue, StringComparison.OrdinalIgnoreCase);
+        // Delegated scans use the delegated Exchange.Manage scope; Exchange.ManageAsApp is app-only.
+        Assert.Contains("Exchange.Manage ", issue + " ", StringComparison.Ordinal);
+        Assert.DoesNotContain("ManageAsApp", issue, StringComparison.OrdinalIgnoreCase);
     }
 }

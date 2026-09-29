@@ -62,7 +62,7 @@ public sealed class StatusResponse
     public string LicenseNote { get; set; } = "Free for non-commercial use.";
 
     [JsonPropertyName("licenseUrl")]
-    public string LicenseUrl { get; set; } = "https://www.lieben.nu/liebensraum/commercial-use/";
+    public string LicenseUrl { get; set; } = "https://jsolve.nl/commercial-use.html";
 }
 
 /// <summary>
@@ -165,6 +165,16 @@ public sealed class AuditEntry
 
     [JsonPropertyName("timestamp")]
     public string Timestamp { get; set; } = string.Empty;
+}
+
+public sealed class ScanStartResult
+{
+    [JsonPropertyName("scanId")]
+    public long ScanId { get; set; }
+
+    /// <summary>Account-check findings that will limit results (missing roles or scopes).</summary>
+    [JsonPropertyName("warnings")]
+    public List<string> Warnings { get; set; } = new();
 }
 
 public sealed class UserCountInfo

@@ -10,10 +10,10 @@
             const res = await fetch(`/api${url}`);
             return res.json();
         },
-        async post(url, body) {
+        async post(url, body, headers) {
             const res = await fetch(`/api${url}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', ...(headers || {}) },
                 body: body ? JSON.stringify(body) : undefined
             });
             return res.json();
@@ -32,13 +32,13 @@
     };
 
     // ── Toast Notifications ─────────────────────────────────────
-    function showToast(message, type = 'info') {
+    function showToast(message, type = 'info', durationMs = 4000) {
         const container = document.getElementById('toast-container');
         const toast = document.createElement('div');
         toast.className = `toast ${type}`;
         toast.textContent = message;
         container.appendChild(toast);
-        setTimeout(() => toast.remove(), 4000);
+        setTimeout(() => toast.remove(), durationMs);
     }
 
     // ── Theme Toggle ────────────────────────────────────────────
@@ -180,6 +180,97 @@
         if (overlay) overlay.style.display = 'none';
     }
 
+    // ── Sign-in popup ───────────────────────────────────────────
+    // Requests that may need a Microsoft sign-in send X-M365-Prompt: gui. The engine then hands the
+    // sign-in URL to this page (GET /api/auth/prompt) instead of opening a browser tab, and the page
+    // shows it in a popup it closes again when the request finishes. A tab the OS opened can't be
+    // closed by script, which is why sign-in used to leave a tab behind.
+    const SIGNIN_WINDOW = 'm365-signin';
+    const SIGNIN_FEATURES = 'popup,width=520,height=720';
+
+    function openSignInWindow(url) {
+        try { return window.open(url || 'about:blank', SIGNIN_WINDOW, SIGNIN_FEATURES); } catch { return null; }
+    }
+
+    function hideSignInPrompt() {
+        document.getElementById('signInOverlay')?.remove();
+    }
+
+    // Asks for a click when no popup is open yet: browsers only allow popups right after a user action.
+    function showSignInPrompt(url, onOpened) {
+        hideSignInPrompt();
+        const overlay = document.createElement('div');
+        overlay.id = 'signInOverlay';
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal-content" style="max-width:460px">
+                <div class="modal-header"><h3>Microsoft sign-in required</h3></div>
+                <div class="modal-body">
+                    <p style="margin-bottom:16px">Sign in or approve the requested permissions in a popup window. It closes by itself when you're done.</p>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" data-action="open">Open sign-in window</button>
+                        <button class="btn btn-secondary" data-action="cancel">Cancel</button>
+                    </div>
+                </div>
+            </div>`;
+        overlay.querySelector('[data-action="open"]').addEventListener('click', () => {
+            const win = openSignInWindow(url);
+            if (win) {
+                onOpened(win);
+                hideSignInPrompt();
+            } else {
+                showToast('The popup was blocked. Allow popups for this page and try again.', 'error', 8000);
+            }
+        });
+        overlay.querySelector('[data-action="cancel"]').addEventListener('click', () => {
+            hideSignInPrompt();
+            api.post('/auth/cancel').catch(() => { });
+        });
+        document.body.appendChild(overlay);
+    }
+
+    // Runs a request that may need sign-in. preopen opens the popup right away, inside the click that
+    // started the request, so no extra click is needed when sign-in is certain (connect, re-consent).
+    async function withSignIn(request, { preopen = false } = {}) {
+        let win = preopen ? openSignInWindow() : null;
+        if (win) {
+            try { win.document.body.innerHTML = '<p style="font-family:sans-serif;padding:16px">Opening Microsoft sign-in…</p>'; } catch { /* ignore */ }
+        }
+        let done = false, seq = 0, reprompted = false;
+
+        (async () => {
+            while (!done) {
+                await new Promise(r => setTimeout(r, 400));
+                if (done) break;
+                let res;
+                try { res = await api.get('/auth/prompt'); } catch { continue; }
+                const p = res && res.success ? res.data : null;
+                if (done || !p || !p.url) continue;
+
+                if (p.sequence !== seq) {
+                    seq = p.sequence;
+                    reprompted = false;
+                    if (win && !win.closed) {
+                        try { win.location.href = p.url; continue; } catch { /* fall back to asking for a click */ }
+                    }
+                    showSignInPrompt(p.url, w => { win = w; });
+                } else if (win && win.closed && !reprompted) {
+                    // Closed before finishing; the engine is still waiting. Offer to reopen or cancel.
+                    reprompted = true;
+                    showSignInPrompt(p.url, w => { win = w; reprompted = false; });
+                }
+            }
+        })();
+
+        try {
+            return await request({ 'X-M365-Prompt': 'gui' });
+        } finally {
+            done = true;
+            hideSignInPrompt();
+            if (win && !win.closed) { try { win.close(); } catch { /* ignore */ } }
+        }
+    }
+
     // ── Remediation Links ───────────────────────────────────────
     function getRemediationLink(entry) {
         const cat = (entry.category || '').toLowerCase();
@@ -239,7 +330,7 @@
                          entry.targetType === 'SecurityGroup' || entry.targetType === 'M365Group';
         const groupHint = isGroup ? `<div style="margin-top:12px">
             <button class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em"
-                onclick="window.m365.showGroupMembers(${entry.scanId || 'null'}, '${escapeAttr(entry.targetId)}', '${escapeAttr(entry.targetPath || entry.principalSysName)}')">
+                onclick="window.m365.showGroupMembers(${Number(entry.scanId) || 'null'}, ${jsArg(entry.targetId)}, ${jsArg(entry.targetPath || entry.principalSysName)})">
                 👥 View Group Members
             </button>
         </div>` : '';
@@ -333,7 +424,7 @@
             if (options.length === 0) return '';
             return `<div class="th-filter">
                 <select class="filter-select" data-filter-col="${col.db}" multiple size="1"
-                    title="${selected.length ? selected.join(', ') : 'All'}">
+                    title="${escapeAttr(selected.length ? selected.join(', ') : 'All')}">
                     ${options.map(o => `<option value="${escapeAttr(o)}" ${selectedSet.has(o) ? 'selected' : ''}>${escapeHtml(o)}</option>`).join('')}
                 </select>
             </div>`;
@@ -1139,7 +1230,7 @@
                         const principal = p.principalEntraUpn || p.principalSysName || p.principalEntraId || '';
                         const isGroupType = p.principalType === 'SecurityGroup' || p.principalType === 'M365Group';
                         const principalHtml = isGroupType
-                            ? `<span class="group-link" onclick="event.stopPropagation();window.m365.showGroupMembers(${scanId},'${escapeAttr(p.principalEntraId || p.principalSysId || '')}','${escapeAttr(principal)}')" title="Click to view group members">👥 ${escapeHtml(principal)}</span>`
+                            ? `<span class="group-link" onclick="event.stopPropagation();window.m365.showGroupMembers(${Number(scanId) || 'null'},${jsArg(p.principalEntraId || p.principalSysId || '')},${jsArg(principal)})" title="Click to view group members">👥 ${escapeHtml(principal)}</span>`
                             : escapeHtml(principal);
                         const cellMap = {
                             riskLevel: `<td><span class="risk-badge risk-${(p.riskLevel || 'low').toLowerCase()}">${escapeHtml(p.riskLevel || '')}</span></td>`,
@@ -1781,8 +1872,8 @@
         },
         async connect() {
             try {
-                showToast('Opening browser for sign-in...', 'info');
-                const res = await api.post('/connect');
+                showToast('Sign in with your Microsoft account in the popup window.', 'info');
+                const res = await withSignIn(h => api.post('/connect', undefined, h), { preopen: true });
                 if (res.success) {
                     await refreshStatus();
                     showToast(`Connected to ${state.tenantDomain}`, 'success');
@@ -1838,7 +1929,7 @@
             precheckDiv.innerHTML = '<div style="color:var(--text-muted);font-size:0.85em">Checking permissions...</div>';
 
             try {
-                const res = await api.post('/scan/precheck', { scanTypes: types });
+                const res = await withSignIn(h => api.post('/scan/precheck', { scanTypes: types }, h));
                 if (!res.success) { precheckDiv.innerHTML = `<div class="notice notice-warning">${escapeHtml(res.error || 'Pre-check failed')}</div>`; return; }
 
                 const issues = res.data;
@@ -1887,9 +1978,9 @@
                 : { includeGraph: true };
 
             const consentTarget = types.length > 0 ? `selected targets (${types.join(', ')})` : 'all configured targets';
-            showToast(`Opening browser consent for ${consentTarget}...`, 'info');
+            showToast(`Approve the permissions for ${consentTarget} in the popup window.`, 'info');
             try {
-                const res = await api.post('/reconsent', payload);
+                const res = await withSignIn(h => api.post('/reconsent', payload, h), { preopen: true });
                 if (res.success) {
                     showToast('Permissions re-consented successfully! Run the pre-check again to verify.', 'success');
                     await refreshStatus();
@@ -1906,22 +1997,25 @@
             const types = Array.from(checkboxes).map(c => c.value);
             if (types.length === 0) { showToast('Select at least one scan type', 'error'); return; }
 
-            // Give the button a busy state. Starting a scan can block for a while when a selected
-            // category needs first-time consent (an interactive browser tab opens and the request
-            // waits for it), so without feedback the button looks unresponsive / "not working".
+            // Busy state: starting can wait on a sign-in/consent popup for a first-time category.
             const btn = document.getElementById('btnStartScan');
             const originalLabel = btn ? btn.innerHTML : null;
             if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Starting…'; }
 
             try {
-                showToast('Starting scan — a browser tab may open if a new category needs consent. This can take a moment.', 'info');
-                const res = await api.post('/scan/start', { scanTypes: types });
+                showToast('Starting scan. If a category needs new permissions you will be asked to sign in.', 'info');
+                const res = await withSignIn(h => api.post('/scan/start', { scanTypes: types }, h));
                 if (res.success) {
                     state.scanRunning = true;
                     state.currentScanId = res.data?.scanId;
                     updateNavStatus();
                     startProgressPolling();
-                    showToast('Scan started', 'success');
+                    const warnings = res.data?.warnings || [];
+                    if (warnings.length > 0) {
+                        showToast(`Scan started, but results will be incomplete (details in the scan log): ${warnings.join(' ')}`, 'error', 20000);
+                    } else {
+                        showToast('Scan started', 'success');
+                    }
                 } else {
                     // Surface the server's explanation (missing consent, timeout, etc.) rather than a
                     // generic message, and restore the button so the user can retry.
@@ -2448,6 +2542,13 @@
 
     function escapeAttr(str) {
         return (str || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // A JS string literal for use inside an inline handler attribute: onclick="fn(${jsArg(x)})".
+    // escapeAttr alone is not enough there: the browser decodes &#39; back to ' before running the JS,
+    // so a tenant-controlled name like x');alert(1);// would break out of the string.
+    function jsArg(str) {
+        return escapeAttr(JSON.stringify(String(str ?? '')));
     }
 
     function truncate(str, max) {

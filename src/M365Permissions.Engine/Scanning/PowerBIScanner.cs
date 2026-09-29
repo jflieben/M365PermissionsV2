@@ -31,33 +31,52 @@ public sealed class PowerBIScanner : IScanProvider
 
         // Try the Power BI admin API first for full workspace enumeration
         var pbiWorkspaces = new List<JsonElement>();
-        try
+        const int pageSize = 5000; // admin/groups requires $top and caps it at 5000; page with $skip
+        for (int skip = 0; ; skip += pageSize)
         {
-            var token = await _auth.GetAccessTokenAsync("powerbi", ct);
-            using var resp = await _http.SendAsync(() =>
+            HttpResponseMessage resp;
+            try
             {
-                var req = new HttpRequestMessage(HttpMethod.Get,
-                    "https://api.powerbi.com/v1.0/myorg/admin/groups?$top=5000&$expand=users");
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                return req;
-            }, ct);
-            if (resp.IsSuccessStatusCode)
+                var token = await _auth.GetAccessTokenAsync("powerbi", ct);
+                resp = await _http.SendAsync(() =>
+                {
+                    var req = new HttpRequestMessage(HttpMethod.Get,
+                        $"https://api.powerbi.com/v1.0/myorg/admin/groups?$top={pageSize}&$skip={skip}&$expand=users");
+                    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                    return req;
+                }, ct);
+            }
+            catch (Exception ex) when (skip == 0 && ex is not OperationCanceledException and not ResourcePrincipalNotFoundException)
             {
-                var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+                context.ReportProgress($"Power BI Admin API failed: {ex.Message}. Falling back to user-scoped.", 3);
+                break;
+            }
+
+            using (resp)
+            {
+                if (!resp.IsSuccessStatusCode)
+                {
+                    if (skip == 0)
+                    {
+                        context.ReportProgress("Power BI Admin API not available (may need Power BI admin role). Falling back to user-scoped enumeration.", 3);
+                        break;
+                    }
+                    // A later page failing would silently truncate the workspace list.
+                    throw new InvalidOperationException($"Power BI Admin API returned HTTP {(int)resp.StatusCode} after {skip} workspaces; results would be incomplete.");
+                }
+
+                using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+                var count = 0;
                 if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var ws in val.EnumerateArray())
+                    {
                         pbiWorkspaces.Add(ws.Clone());
+                        count++;
+                    }
                 }
+                if (count < pageSize) break;
             }
-            else
-            {
-                context.ReportProgress("Power BI Admin API not available (may need Power BI admin role). Falling back to user-scoped enumeration.", 3);
-            }
-        }
-        catch (Exception ex)
-        {
-            context.ReportProgress($"Power BI Admin API failed: {ex.Message}. Falling back to user-scoped.", 3);
         }
 
         if (pbiWorkspaces.Count > 0)

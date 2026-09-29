@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Threading.Channels;
 using M365Permissions.Engine.Graph;
 using M365Permissions.Engine.Models;
 
@@ -27,8 +28,8 @@ public sealed class ExchangeScanner : IScanProvider
     {
         context.ReportProgress("Enumerating Exchange mailboxes...", 3);
 
-        // Get organization domain for EXO REST calls
-        var organization = context.TenantDomain;
+        // Tenant ID, as the EXO module uses. The default domain is not always an accepted domain in Exchange.
+        var organization = string.IsNullOrEmpty(context.TenantId) ? context.TenantDomain : context.TenantId;
 
         // Get all mailboxes
         var mailboxes = await _exoClient.GetMailboxesAsync(organization, ct);
@@ -36,91 +37,82 @@ public sealed class ExchangeScanner : IScanProvider
         context.SetTotalTargets(mailboxes.Count);
         context.ReportProgress($"Found {mailboxes.Count} mailboxes to scan.", 3);
 
-        foreach (var mailbox in mailboxes)
+        // Exchange throttles per user harder than Graph, so cap the per-mailbox parallelism.
+        var dop = Math.Min(context.Config?.MaxThreads ?? 5, 4);
+        await foreach (var entry in ParallelScan.RunAsync(mailboxes, dop,
+            (mailbox, writer, tok) => ScanMailboxAsync(mailbox, organization, context, writer, tok), ct))
         {
-            ct.ThrowIfCancellationRequested();
+            yield return entry;
+        }
+    }
 
-            var identity = mailbox.TryGetProperty("Identity", out var id) ? id.GetString() ?? "" : "";
-            var displayName = mailbox.TryGetProperty("DisplayName", out var dn) ? dn.GetString() ?? "" : "";
-            var primarySmtp = mailbox.TryGetProperty("PrimarySmtpAddress", out var smtp) ? smtp.GetString() ?? "" : "";
-            var externalId = mailbox.TryGetProperty("ExternalDirectoryObjectId", out var edi) ? edi.GetString() ?? "" : "";
+    private async Task ScanMailboxAsync(JsonElement mailbox, string organization, ScanContext context,
+        ChannelWriter<PermissionEntry> writer, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
 
-            if (string.IsNullOrEmpty(identity))
-            {
-                context.CompleteTarget();
-                continue;
-            }
+        var identity = mailbox.TryGetProperty("Identity", out var id) ? id.GetString() ?? "" : "";
+        var displayName = mailbox.TryGetProperty("DisplayName", out var dn) ? dn.GetString() ?? "" : "";
+        var primarySmtp = mailbox.TryGetProperty("PrimarySmtpAddress", out var smtp) ? smtp.GetString() ?? "" : "";
+        var externalId = mailbox.TryGetProperty("ExternalDirectoryObjectId", out var edi) ? edi.GetString() ?? "" : "";
 
-            // Skip system mailboxes (e.g. DiscoverySearchMailbox)
-            if (displayName.StartsWith("DiscoverySearchMailbox", StringComparison.OrdinalIgnoreCase))
-            {
-                context.CompleteTarget();
-                continue;
-            }
+        // Skip system mailboxes (e.g. DiscoverySearchMailbox)
+        if (string.IsNullOrEmpty(identity) || displayName.StartsWith("DiscoverySearchMailbox", StringComparison.OrdinalIgnoreCase))
+        {
+            context.CompleteTarget();
+            return;
+        }
 
-            context.ReportProgress($"Scanning mailbox: {displayName}", 5);
+        context.ReportProgress($"Scanning mailbox: {displayName}", 5);
 
-            // --- Mailbox permissions (FullAccess) ---
-            List<JsonElement> mbxPermissions;
-            try
-            {
-                mbxPermissions = await _exoClient.GetMailboxPermissionsAsync(organization, identity, ct);
-            }
-            catch (Exception ex)
-            {
-                context.ReportProgress($"Failed to get mailbox permissions for {displayName}: {ex.Message}", 2);
-                mbxPermissions = new();
-            }
+        // --- Mailbox permissions (FullAccess) ---
+        try
+        {
+            foreach (var perm in await _exoClient.GetMailboxPermissionsAsync(organization, identity, ct))
+                foreach (var entry in MapMailboxPermission(perm, primarySmtp, externalId, displayName))
+                    await writer.WriteAsync(entry, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            context.ReportProgress($"Failed to get mailbox permissions for {displayName}: {ex.Message}", 2);
+        }
 
-            foreach (var perm in mbxPermissions)
-            {
-                var entries = MapMailboxPermission(perm, primarySmtp, externalId, displayName);
-                foreach (var entry in entries)
-                    yield return entry;
-            }
-
-            // --- Recipient permissions (SendAs) ---
-            List<JsonElement> recipientPermissions;
-            try
-            {
-                recipientPermissions = await _exoClient.GetRecipientPermissionsAsync(organization, identity, ct);
-            }
-            catch (Exception ex)
-            {
-                context.ReportProgress($"Failed to get recipient permissions for {displayName}: {ex.Message}", 2);
-                recipientPermissions = new();
-            }
-
-            foreach (var perm in recipientPermissions)
+        // --- Recipient permissions (SendAs) ---
+        try
+        {
+            foreach (var perm in await _exoClient.GetRecipientPermissionsAsync(organization, identity, ct))
             {
                 var entry = MapRecipientPermission(perm, primarySmtp, externalId, displayName);
-                if (entry != null) yield return entry;
+                if (entry != null) await writer.WriteAsync(entry, ct);
             }
-
-            // --- SendOnBehalf (from mailbox properties) ---
-            if (mailbox.TryGetProperty("GrantSendOnBehalfTo", out var delegates) &&
-                delegates.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var del in delegates.EnumerateArray())
-                {
-                    var delName = del.GetString() ?? "";
-                    yield return new PermissionEntry
-                    {
-                        TargetPath = primarySmtp,
-                        TargetType = "Mailbox",
-                        TargetId = externalId,
-                        PrincipalSysName = delName,
-                        PrincipalType = "User",
-                        PrincipalRole = "SendOnBehalf",
-                        Through = "GrantSendOnBehalfTo",
-                        AccessType = "Allow",
-                        Tenure = "Permanent"
-                    };
-                }
-            }
-
-            context.CompleteTarget();
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            context.ReportProgress($"Failed to get recipient permissions for {displayName}: {ex.Message}", 2);
+        }
+
+        // --- SendOnBehalf (from mailbox properties) ---
+        if (mailbox.TryGetProperty("GrantSendOnBehalfTo", out var delegates) &&
+            delegates.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var del in delegates.EnumerateArray())
+            {
+                await writer.WriteAsync(new PermissionEntry
+                {
+                    TargetPath = primarySmtp,
+                    TargetType = "Mailbox",
+                    TargetId = externalId,
+                    PrincipalSysName = del.GetString() ?? "",
+                    PrincipalType = "User",
+                    PrincipalRole = "SendOnBehalf",
+                    Through = "GrantSendOnBehalfTo",
+                    AccessType = "Allow",
+                    Tenure = "Permanent"
+                }, ct);
+            }
+        }
+
+        context.CompleteTarget();
     }
 
     private static List<PermissionEntry> MapMailboxPermission(JsonElement perm, string targetEmail, string targetId, string targetName)

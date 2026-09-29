@@ -50,6 +50,9 @@ public sealed class TokenCache
     public bool HasValidToken(string resource)
         => Get(resource) != null;
 
+    /// <summary>Forget cached access tokens but keep refresh tokens, so the next call mints fresh tokens.</summary>
+    public void ClearAccessTokens() => _tokens.Clear();
+
     public void SetRefreshToken(string refreshToken, long? expiresInSeconds = null)
     {
         _refreshToken = refreshToken;

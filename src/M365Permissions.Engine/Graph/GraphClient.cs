@@ -235,7 +235,7 @@ public sealed class GraphClient
                 }
 
                 _throttle.RecordRequest();
-                var response = await _http.SendAsync(request, ct);
+                using var response = await _http.SendAsync(request, ct);
 
                 if (response.StatusCode == (HttpStatusCode)429)
                 {
@@ -259,7 +259,8 @@ public sealed class GraphClient
 
                 _throttle.ReportSuccess();
 
-                var doc = await JsonDocument.ParseAsync(
+                // Disposed after Clone() so the pooled parse buffers go back to the pool.
+                using var doc = await JsonDocument.ParseAsync(
                     await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
                 var root = doc.RootElement;
 

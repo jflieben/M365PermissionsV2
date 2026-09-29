@@ -53,6 +53,37 @@ public sealed class ParallelScanTests
     }
 
     [Fact]
+    public async Task RunAsync_ConsumerStoppingEarly_CancelsProducers()
+    {
+        // More entries than the channel holds, so producers block until the consumer's exit cancels them.
+        var targets = Enumerable.Range(0, 8).ToList();
+        var cancelled = 0;
+
+        await foreach (var _ in ParallelScan.RunAsync(targets, 4, async (t, writer, ct) =>
+        {
+            try
+            {
+                for (var i = 0; i < 1000; i++)
+                    await writer.WriteAsync(new PermissionEntry { TargetId = $"{t}-{i}" }, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                Interlocked.Increment(ref cancelled);
+                throw;
+            }
+        }))
+        {
+            break;
+        }
+
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (Volatile.Read(ref cancelled) == 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(20);
+
+        Assert.True(Volatile.Read(ref cancelled) > 0, "blocked producers were not cancelled after the consumer stopped");
+    }
+
+    [Fact]
     public async Task RunAsync_PropagatesProducerException()
     {
         var targets = Enumerable.Range(0, 20).ToList();

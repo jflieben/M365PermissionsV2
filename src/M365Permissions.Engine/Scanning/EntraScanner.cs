@@ -64,7 +64,7 @@ public sealed class EntraScanner : IScanProvider
         // app-role assignments below (A1). Without this, principal_role held raw GUIDs, so the
         // high-risk-application-permission policy could never match a permission name.
         context.ReportProgress("Resolving application permission definitions...", 3);
-        var (appPermsByAppId, appPermsByObjectId) = await BuildAppPermissionCachesAsync(ct);
+        var (appPermsByAppId, appPermsByObjectId, spCache) = await BuildAppPermissionCachesAsync(ct);
 
         // --- App Registrations: REQUESTED permissions (requiredResourceAccess) ---
         context.ReportProgress("Scanning app registrations...", 3);
@@ -136,7 +136,18 @@ public sealed class EntraScanner : IScanProvider
             if (!sp.TryGetProperty("appRoleAssignments", out var aras) || aras.ValueKind != JsonValueKind.Array)
                 continue;
 
-            foreach (var ara in aras.EnumerateArray())
+            // Graph caps an expanded directory relationship at 20 items without a nextLink, and the apps
+            // with many grants are the ones that matter most. Re-read those in full.
+            IEnumerable<JsonElement> assignments = aras.EnumerateArray().ToList();
+            if (aras.GetArrayLength() >= ExpandCap && !string.IsNullOrEmpty(spId))
+            {
+                var all = new List<JsonElement>();
+                await foreach (var a in _graphClient.GetPaginatedAsync($"servicePrincipals/{spId}/appRoleAssignments", ct: ct))
+                    all.Add(a);
+                assignments = all;
+            }
+
+            foreach (var ara in assignments)
             {
                 var appRoleId = ara.TryGetProperty("appRoleId", out var arid) ? arid.GetString() ?? "" : "";
                 var resourceId = ara.TryGetProperty("resourceId", out var resId) ? resId.GetString() ?? "" : "";
@@ -291,20 +302,6 @@ public sealed class EntraScanner : IScanProvider
 
         // --- Service Principal OAuth2 grants (delegated consent) ---
         context.ReportProgress("Scanning OAuth2 permission grants...", 3);
-
-        // Build service principal lookup cache (id → displayName) for resolving OAuth2 grant targets
-        context.ReportProgress("Building service principal cache for OAuth2 grants...", 3);
-        var spCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        await foreach (var sp in _graphClient.GetPaginatedAsync(
-            "servicePrincipals?$select=id,displayName", ct: ct))
-        {
-            ct.ThrowIfCancellationRequested();
-            var spId = sp.TryGetProperty("id", out var sid) ? sid.GetString() ?? "" : "";
-            var spName = sp.TryGetProperty("displayName", out var sdn) ? sdn.GetString() ?? "" : "";
-            if (!string.IsNullOrEmpty(spId))
-                spCache[spId] = spName;
-        }
-        context.ReportProgress($"Cached {spCache.Count} service principals.", 3);
 
         int oauth2GrantCount = 0;
         await foreach (var grant in _graphClient.GetPaginatedAsync(
@@ -534,23 +531,31 @@ public sealed class EntraScanner : IScanProvider
         context.ReportProgress($"Completed scanning {groupsDone} groups.", 3);
     }
 
+    private const int ExpandCap = 20;
+
     /// <summary>
     /// Enumerate service principals once and build permission-GUID → name lookups, keyed both by
     /// the resource's appId (for resolving requiredResourceAccess) and its objectId (for resolving
-    /// appRoleAssignments). Covers both app roles and delegated (oauth2) permission scopes.
+    /// appRoleAssignments), plus objectId/appId → displayName for OAuth2 grants and subscriptions.
     /// </summary>
     private async Task<(Dictionary<string, Dictionary<string, string>> byAppId,
-                        Dictionary<string, Dictionary<string, string>> byObjectId)>
+                        Dictionary<string, Dictionary<string, string>> byObjectId,
+                        Dictionary<string, string> namesById)>
         BuildAppPermissionCachesAsync(CancellationToken ct)
     {
         var byAppId = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
         var byObjectId = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        var namesById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         await foreach (var sp in _graphClient.GetPaginatedAsync(
-            "servicePrincipals?$select=id,appId,appRoles,oauth2PermissionScopes", ct: ct))
+            "servicePrincipals?$select=id,appId,displayName,appRoles,oauth2PermissionScopes", ct: ct))
         {
             var spId = sp.TryGetProperty("id", out var i) ? i.GetString() ?? "" : "";
             var appId = sp.TryGetProperty("appId", out var a) ? a.GetString() ?? "" : "";
+            // Keyed by object ID (OAuth2 grants) and by appId (subscriptions); GUIDs don't collide.
+            var spName = sp.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
+            if (!string.IsNullOrEmpty(spId)) namesById[spId] = spName;
+            if (!string.IsNullOrEmpty(appId)) namesById.TryAdd(appId, spName);
 
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (sp.TryGetProperty("appRoles", out var ar) && ar.ValueKind == JsonValueKind.Array)
@@ -573,7 +578,7 @@ public sealed class EntraScanner : IScanProvider
             if (!string.IsNullOrEmpty(spId)) byObjectId[spId] = map;
         }
 
-        return (byAppId, byObjectId);
+        return (byAppId, byObjectId, namesById);
     }
 
     private static PermissionEntry MapDirectoryRoleMember(JsonElement member, string roleName, string roleId)

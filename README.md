@@ -56,7 +56,7 @@ To switch tenants, use the disconnect button (⏏) in the navigation bar or dash
 
 ## Configuration
 
-Settings are managed through the GUI's Settings page and stored in `%APPDATA%/LiebenConsultancy/M365Permissions/`:
+Settings are managed through the GUI's Settings page and stored in `%APPDATA%/JSolveBV/M365Permissions/`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -65,6 +65,20 @@ Settings are managed through the GUI's Settings page and stored in `%APPDATA%/Li
 | `OutputFormat` | XLSX | Default export format |
 | `LogLevel` | Minimal | Logging verbosity |
 | `DefaultTimeoutMinutes` | 120 | Scan timeout |
+
+## Required Roles
+
+Scans run as the signed-in account. These categories need an active admin role for complete results:
+
+| Category | Role (any one) |
+|----------|----------------|
+| SharePoint, OneDrive | Global Administrator or SharePoint Administrator |
+| Exchange Online | Global Administrator or Exchange Administrator |
+| Power BI | Global Administrator or Fabric Administrator |
+| Power Platform | Global Administrator, Power Platform Administrator or Dynamics 365 Administrator |
+| Purview | Global Administrator, Compliance Administrator or Exchange Administrator |
+
+Each scan starts with an account check that reads the roles and permissions in the access tokens and logs anything that will limit the results. Tokens are renewed at every scan start, so a PIM role activated after connecting is used as soon as you start the scan again.
 
 ## Scan Coverage
 
@@ -104,8 +118,8 @@ Settings are managed through the GUI's Settings page and stored in `%APPDATA%/Li
 - Custom connector permissions
 
 ### Azure RBAC
-- Subscription-level role assignments
-- Resource group-level role assignments
+- Management group (incl. root), subscription, resource group and resource role assignments
+- PIM-eligible role assignments
 
 ### Azure DevOps
 - Organization membership enumeration (delegated auth only)
@@ -117,6 +131,6 @@ Settings are managed through the GUI's Settings page and stored in `%APPDATA%/Li
 
 Free for non-commercial use. 
 
-Commercial use: https://www.lieben.nu/liebensraum/commercial-use/
+Commercial use: https://jsolve.nl/commercial-use.html
 
 Audit / Enterprise version: https://www.m365permissions.com

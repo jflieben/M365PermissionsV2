@@ -41,10 +41,9 @@ public sealed class AzureDevOpsScanner : IScanProvider
             // mark the category Skipped with a clear reason rather than a cryptic JSON crash.
             throw;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            context.ReportProgress($"Cannot access Azure DevOps profile: {ex.Message}", 2);
-            yield break;
+            throw new InvalidOperationException($"Cannot access Azure DevOps profile: {ex.Message}", ex);
         }
 
         // Step 2: Enumerate organizations the user has access to
@@ -53,10 +52,9 @@ public sealed class AzureDevOpsScanner : IScanProvider
         {
             organizations = await GetOrganizationsAsync(memberId, ct);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            context.ReportProgress($"Failed to enumerate Azure DevOps organizations: {ex.Message}", 2);
-            yield break;
+            throw new InvalidOperationException($"Failed to enumerate Azure DevOps organizations: {ex.Message}", ex);
         }
 
         if (organizations.Count == 0)

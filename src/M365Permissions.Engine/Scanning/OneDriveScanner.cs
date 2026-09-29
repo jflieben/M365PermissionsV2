@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Threading.Channels;
 using M365Permissions.Engine.Auth;
 using M365Permissions.Engine.Graph;
 using M365Permissions.Engine.Models;
@@ -61,23 +62,42 @@ public sealed class OneDriveScanner : IScanProvider
                 }
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            context.ReportProgress($"Failed to enumerate users: {ex.Message}", 2);
-            yield break;
+            // Without users there is nothing to scan: fail the category instead of reporting it complete.
+            throw new InvalidOperationException($"Failed to enumerate users: {ex.Message}", ex);
         }
 
         context.SetTotalTargets(users.Count);
         context.ReportProgress($"Found {users.Count} licensed users. Checking OneDrive access...", 3);
 
-        int processed = 0;
-        int sitesFound = 0;
-        foreach (var (userId, userUpn, displayName) in users)
+        // Per-user work (elevation, SP REST, item permissions) dominates, so run users in parallel like SharePoint sites.
+        var stats = new DriveStats();
+        var dop = context.Config?.MaxThreads ?? 5;
+        await foreach (var entry in ParallelScan.RunAsync(users, dop,
+            (user, writer, tok) => ScanUserDriveAsync(user, scannerUpn, context, stats, users.Count, writer, tok), ct))
         {
-            ct.ThrowIfCancellationRequested();
+            yield return entry;
+        }
 
-            // Determine the OneDrive site URL via Graph drive API. Fetch the drive id here too so
-            // the item-level scan below doesn't re-fetch users/{id}/drive a second time (B16).
+        context.ReportProgress($"Completed scanning {stats.SitesFound} OneDrive sites (from {stats.Processed} users).", 3);
+    }
+
+    private sealed class DriveStats
+    {
+        public int Processed;
+        public int SitesFound;
+    }
+
+    private async Task ScanUserDriveAsync((string UserId, string Upn, string DisplayName) user, string scannerUpn,
+        ScanContext context, DriveStats stats, int totalUsers, ChannelWriter<PermissionEntry> writer, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var (userId, userUpn, displayName) = user;
+
+        try
+        {
+            // Resolve the OneDrive site URL and drive id in one call (the item scan below reuses the id).
             var oneDriveUrl = "";
             var driveId = "";
             var driveWebUrl = "";
@@ -86,32 +106,30 @@ public sealed class OneDriveScanner : IScanProvider
                 var driveResponse = await _graphClient.GetAsync($"users/{userId}/drive?$select=id,webUrl", ct: ct);
                 if (driveResponse != null && driveResponse.Value.TryGetProperty("webUrl", out var wUrl))
                 {
-                    driveId = driveResponse.Value.TryGetProperty("id", out var didEnum) ? didEnum.GetString() ?? "" : "";
+                    driveId = driveResponse.Value.TryGetProperty("id", out var did) ? did.GetString() ?? "" : "";
                     driveWebUrl = wUrl.GetString() ?? "";
-                    // webUrl is like https://tenant-my.sharepoint.com/personal/user_domain_com/Documents
-                    // We need the site URL (remove /Documents or similar trailing path)
-                    var webUrlStr = wUrl.GetString() ?? "";
-                    if (!string.IsNullOrEmpty(webUrlStr))
+                    // webUrl is like https://tenant-my.sharepoint.com/personal/user_domain_com/Documents;
+                    // the site is the first two path segments.
+                    if (Uri.TryCreate(driveWebUrl, UriKind.Absolute, out var uri))
                     {
-                        var uri = new Uri(webUrlStr);
                         var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-                        // personal/{encoded_upn} are the first 2 segments
                         if (segments.Length >= 2)
                             oneDriveUrl = $"{uri.Scheme}://{uri.Host}/{segments[0]}/{segments[1]}";
                     }
                 }
             }
-            catch
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // User may not have OneDrive provisioned — skip silently
+                // No OneDrive provisioned (or not readable): nothing to scan for this user.
             }
 
             if (string.IsNullOrEmpty(oneDriveUrl))
             {
                 context.CompleteTarget();
-                processed++;
-                continue;
+                return;
             }
+
+            Interlocked.Increment(ref stats.SitesFound);
 
             // Temporarily add scanning user as site admin via tenant admin API
             // (site-level APIs return 403 on other users' personal sites)
@@ -124,7 +142,7 @@ public sealed class OneDriveScanner : IScanProvider
                     if (wasAdded)
                         context.ReportProgress($"Temporarily added scanner as admin on OneDrive: {displayName}", 4);
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     context.ReportProgress($"Could not ensure admin on OneDrive of {displayName}: {ex.Message}", 3);
                 }
@@ -132,98 +150,78 @@ public sealed class OneDriveScanner : IScanProvider
 
             try
             {
-                sitesFound++;
-
-                // --- Site admins via SP REST ---
-                List<JsonElement> admins;
-                try
-                {
-                    admins = await _spClient.GetSiteAdminsAsync(oneDriveUrl, ct);
-                }
-                catch (Exception ex)
-                {
-                    context.ReportProgress($"Failed to get admins for OneDrive of {displayName}: {ex.Message}", 2);
-                    admins = new();
-                }
-
                 var scannerFilter = wasAdded ? scannerUpn : "";
 
-                foreach (var admin in admins)
+                // --- Site admins via SP REST ---
+                try
                 {
-                    var entry = MapSiteAdmin(admin, oneDriveUrl, userId, scannerFilter);
-                    if (entry != null) yield return entry;
+                    foreach (var admin in await _spClient.GetSiteAdminsAsync(oneDriveUrl, ct))
+                    {
+                        var entry = MapSiteAdmin(admin, oneDriveUrl, userId, scannerFilter);
+                        if (entry != null) await writer.WriteAsync(entry, ct);
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    context.ReportProgress($"Failed to get admins for OneDrive of {displayName}: {ex.Message}", 2);
                 }
 
                 // --- Role assignments via SP REST ---
-                List<JsonElement> roleAssignments;
                 try
                 {
-                    roleAssignments = await _spClient.GetRoleAssignmentsAsync(oneDriveUrl, ct);
+                    foreach (var ra in await _spClient.GetRoleAssignmentsAsync(oneDriveUrl, ct))
+                        foreach (var entry in MapRoleAssignment(ra, oneDriveUrl, userId, scannerFilter))
+                            await writer.WriteAsync(entry, ct);
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     context.ReportProgress($"Failed to get role assignments for OneDrive of {displayName}: {ex.Message}", 2);
-                    roleAssignments = new();
                 }
 
-                foreach (var ra in roleAssignments)
+                // --- Item-level sharing on top-level items via Graph drive API ---
+                if (!string.IsNullOrEmpty(driveId))
                 {
-                    var entries = MapRoleAssignment(ra, oneDriveUrl, userId, scannerFilter);
-                    foreach (var entry in entries)
-                        yield return entry;
-                }
-
-                // --- Item-level sharing via Graph drive API (reuses driveId from enumeration) ---
-                var itemEntries = new List<PermissionEntry>();
-                try
-                {
+                    try
                     {
-                        if (!string.IsNullOrEmpty(driveId))
+                        await foreach (var item in _graphClient.GetPaginatedAsync(
+                            $"drives/{driveId}/root/children?$select=id,name,webUrl,shared,folder", ct: ct))
                         {
-                            await foreach (var item in _graphClient.GetPaginatedAsync(
-                                $"drives/{driveId}/root/children?$select=id,name,webUrl,shared,folder", ct: ct))
+                            if (!item.TryGetProperty("shared", out _) && !item.TryGetProperty("folder", out _))
+                                continue;
+
+                            var itemId = item.TryGetProperty("id", out var iid) ? iid.GetString() ?? "" : "";
+                            var itemName = item.TryGetProperty("name", out var iname) ? iname.GetString() ?? "" : "";
+                            var itemUrl = item.TryGetProperty("webUrl", out var iwUrl) ? iwUrl.GetString() ?? "" : "";
+
+                            JsonElement? permsResponse;
+                            try
                             {
-                                var itemId = item.TryGetProperty("id", out var iid) ? iid.GetString() ?? "" : "";
-                                var itemName = item.TryGetProperty("name", out var iname) ? iname.GetString() ?? "" : "";
-                                var itemUrl = item.TryGetProperty("webUrl", out var iwUrl) ? iwUrl.GetString() ?? "" : "";
+                                permsResponse = await _graphClient.GetAsync(
+                                    $"drives/{driveId}/items/{itemId}/permissions?$select=id,roles,grantedToV2,grantedToIdentitiesV2,link,inheritedFrom",
+                                    ct: ct);
+                            }
+                            catch (Exception ex) when (ex is not OperationCanceledException)
+                            {
+                                context.ReportProgress($"Failed to read sharing of '{itemName}' in OneDrive of {displayName}: {ex.Message}", 4);
+                                continue;
+                            }
 
-                                if (!item.TryGetProperty("shared", out _) && !item.TryGetProperty("folder", out _))
-                                    continue;
+                            if (permsResponse == null || !permsResponse.Value.TryGetProperty("value", out var permArr)
+                                || permArr.ValueKind != JsonValueKind.Array)
+                                continue;
 
-                                List<JsonElement>? itemPerms = null;
-                                try
-                                {
-                                    var permsResponse = await _graphClient.GetAsync(
-                                        $"drives/{driveId}/items/{itemId}/permissions?$select=id,roles,grantedToV2,grantedToIdentitiesV2,link,inheritedFrom",
-                                        ct: ct);
-                                    if (permsResponse != null && permsResponse.Value.TryGetProperty("value", out var permArr)
-                                        && permArr.ValueKind == JsonValueKind.Array)
-                                    {
-                                        itemPerms = new List<JsonElement>();
-                                        foreach (var p in permArr.EnumerateArray())
-                                            itemPerms.Add(p.Clone());
-                                    }
-                                }
-                                catch { }
-
-                                if (itemPerms == null) continue;
-
-                                foreach (var perm in itemPerms)
-                                {
-                                    var entry = MapDriveItemPermission(perm, driveWebUrl, itemName, itemUrl, userUpn, userId, driveId, scannerFilter);
-                                    if (entry != null) itemEntries.Add(entry);
-                                }
+                            foreach (var perm in permArr.EnumerateArray())
+                            {
+                                var entry = MapDriveItemPermission(perm, driveWebUrl, itemName, itemUrl, userUpn, userId, driveId, scannerFilter);
+                                if (entry != null) await writer.WriteAsync(entry, ct);
                             }
                         }
                     }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        context.ReportProgress($"Failed to scan OneDrive items for {displayName}: {ex.Message}", 3);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    context.ReportProgress($"Failed to scan OneDrive items for {displayName}: {ex.Message}", 3);
-                }
-
-                foreach (var ie in itemEntries)
-                    yield return ie;
 
                 context.CompleteTarget();
             }
@@ -242,18 +240,17 @@ public sealed class OneDriveScanner : IScanProvider
                     }
                     catch (Exception ex)
                     {
-                        context.ReportProgress($"WARNING: Failed to remove temp admin from OneDrive of {displayName} — account may remain elevated on {oneDriveUrl}: {ex.Message}", 2);
+                        context.ReportProgress($"WARNING: Failed to remove temp admin from OneDrive of {displayName}; account may remain elevated on {oneDriveUrl}: {ex.Message}", 2);
                     }
                 }
             }
-
-            processed++;
-
-            if (processed % 50 == 0)
-                context.ReportProgress($"Scanned {processed}/{users.Count} users ({sitesFound} OneDrive sites found)...", 4);
         }
-
-        context.ReportProgress($"Completed scanning {sitesFound} OneDrive sites (from {processed} users).", 3);
+        finally
+        {
+            var processed = Interlocked.Increment(ref stats.Processed);
+            if (processed % 50 == 0)
+                context.ReportProgress($"Scanned {processed}/{totalUsers} users ({Volatile.Read(ref stats.SitesFound)} OneDrive sites found)...", 4);
+        }
     }
 
     private static PermissionEntry? MapSiteAdmin(JsonElement admin, string siteUrl, string ownerId, string scannerUpn)
@@ -278,7 +275,7 @@ public sealed class OneDriveScanner : IScanProvider
             PrincipalEntraUpn = email,
             PrincipalSysId = id,
             PrincipalSysName = title,
-            PrincipalType = DeterminePrincipalType(loginName),
+            PrincipalType = SharePointPrincipal.DetermineType(loginName, SharePointPrincipal.ReadTypeCode(admin)),
             PrincipalRole = "Site Collection Administrator",
             Through = "Direct",
             AccessType = "Allow",
@@ -319,7 +316,7 @@ public sealed class OneDriveScanner : IScanProvider
                 TargetId = ownerId,
                 PrincipalSysId = principalId,
                 PrincipalSysName = principalName,
-                PrincipalType = DeterminePrincipalType(principalLogin),
+                PrincipalType = SharePointPrincipal.DetermineType(principalLogin, SharePointPrincipal.ReadTypeCode(member)),
                 PrincipalRole = roleName,
                 Through = "Direct",
                 AccessType = "Allow",
@@ -422,18 +419,5 @@ public sealed class OneDriveScanner : IScanProvider
             AccessType = "Allow",
             Tenure = "Permanent"
         };
-    }
-
-    private static string DeterminePrincipalType(string loginName)
-    {
-        if (string.IsNullOrEmpty(loginName)) return "Unknown";
-        if (loginName.StartsWith("i:0#.f|membership|", StringComparison.OrdinalIgnoreCase)) return "Internal User";
-        if (loginName.Contains("#ext#", StringComparison.OrdinalIgnoreCase)) return "External User";
-        if (loginName.StartsWith("c:0t.c|tenant|", StringComparison.OrdinalIgnoreCase)) return "SecurityGroup";
-        if (loginName.Contains("|federateddirectoryclaimprovider|", StringComparison.OrdinalIgnoreCase)) return "SecurityGroup";
-        if (loginName.Contains("c:0-.f|rolemanager|", StringComparison.OrdinalIgnoreCase)) return "SharePoint Group";
-        if (loginName.StartsWith("c:0(.s|true", StringComparison.OrdinalIgnoreCase)) return "Everyone";
-        if (loginName.Contains("|membership|", StringComparison.OrdinalIgnoreCase)) return "SecurityGroup";
-        return "Unknown";
     }
 }

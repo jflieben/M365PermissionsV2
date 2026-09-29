@@ -27,6 +27,7 @@ public sealed class ScanContext
 {
     public required long ScanId { get; init; }
     public required string TenantDomain { get; init; }
+    public string TenantId { get; init; } = "";
     public required string UserPrincipalName { get; init; }
     public required AppConfig Config { get; init; }
     public required Action<string, int> ReportProgress { get; init; }  // (message, logLevel)

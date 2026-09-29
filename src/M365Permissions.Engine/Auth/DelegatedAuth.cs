@@ -1,4 +1,4 @@
-using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
@@ -31,7 +31,8 @@ public sealed class DelegatedAuth
     /// </summary>
     private static readonly Dictionary<string, string[]> GraphScopesByCategory = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["sharepoint"] = new[] { "Sites.Read.All" },
+        // Sites.FullControl.All: GET sites/{id}/permissions (app grants) rejects anything less.
+        ["sharepoint"] = new[] { "Sites.Read.All", "Sites.FullControl.All" },
         ["onedrive"]   = new[] { "User.Read.All", "Sites.Read.All", "Files.Read.All" },
         ["entra"]      = new[] { "Directory.Read.All", "Application.Read.All", "Group.Read.All", "GroupMember.Read.All", "RoleManagement.Read.Directory" },
         ["teams"]      = new[] { "Team.ReadBasic.All", "TeamMember.Read.All", "Channel.ReadBasic.All", "ChannelMember.Read.All" },
@@ -59,6 +60,54 @@ public sealed class DelegatedAuth
         ["purview"] = new[] { "compliance" }
     };
 
+    /// <summary>
+    /// Delegated scopes a resource token must carry (from the app registration). A token request never
+    /// fails for a scope that isn't granted, it just leaves it out, so every token is checked.
+    /// </summary>
+    private static readonly Dictionary<string, string[]> RequiredResourceScopes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["sharepoint"] = new[] { "AllSites.FullControl" },
+        ["sharepointadmin"] = new[] { "AllSites.FullControl" },
+        ["exchange"] = new[] { "Exchange.Manage" },
+        ["compliance"] = new[] { "Exchange.Manage" },
+        ["powerbi"] = new[] { "Tenant.Read.All" },
+        ["azure"] = new[] { "user_impersonation" },
+        ["azuredevops"] = new[] { "user_impersonation" }
+    };
+
+    /// <summary>App IDs of the APIs behind each resource key.</summary>
+    private static readonly Dictionary<string, string> ResourceAppIds = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["graph"] = "00000003-0000-0000-c000-000000000000",
+        ["sharepoint"] = "00000003-0000-0ff1-ce00-000000000000",
+        ["sharepointadmin"] = "00000003-0000-0ff1-ce00-000000000000",
+        ["exchange"] = "00000002-0000-0ff1-ce00-000000000000",
+        ["compliance"] = "00000002-0000-0ff1-ce00-000000000000",
+        ["powerbi"] = "00000009-0000-0000-c000-000000000000",
+        ["azure"] = "797f4846-ba00-4fd7-ba43-dac1f8f63013",
+        ["azuredevops"] = "499b84ac-1321-427f-aa17-267ca6975798"
+    };
+
+    private static readonly Dictionary<string, string> ServiceNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["graph"] = "Microsoft Graph",
+        ["sharepoint"] = "SharePoint",
+        ["sharepointadmin"] = "SharePoint admin",
+        ["exchange"] = "Exchange Online",
+        ["compliance"] = "Purview compliance",
+        ["powerbi"] = "Power BI",
+        ["powerapps"] = "Power Platform",
+        ["flow"] = "Power Automate",
+        ["azure"] = "Azure Resource Manager",
+        ["azuredevops"] = "Azure DevOps"
+    };
+
+    public static IReadOnlyList<string> GetRequiredResourceScopes(string resource)
+        => RequiredResourceScopes.TryGetValue(resource, out var s) ? s : Array.Empty<string>();
+
+    public static string ServiceName(string resource)
+        => ServiceNames.TryGetValue(resource, out var n) ? n : resource;
+
     /// <summary>Return the list of Graph delegated scopes a given scan category needs.</summary>
     public static IReadOnlyList<string> GetRequiredGraphScopesForCategory(string category)
         => GraphScopesByCategory.TryGetValue(category, out var s) ? s : Array.Empty<string>();
@@ -71,7 +120,20 @@ public sealed class DelegatedAuth
     private string? _tenantId;
     private string? _tenantDomain;
     private string? _sharePointTenant;
+    private string? _initialDomainPrefix;
     private string? _userPrincipalName;
+
+    // Resources found unusable since the last scan start (no service principal, consent refused), so a
+    // running scan doesn't retry them. Cleared by DropCachedAccessTokens.
+    private readonly ConcurrentDictionary<string, ResourcePrincipalNotFoundException> _unavailable = new(StringComparer.OrdinalIgnoreCase);
+
+    // Consent requests that failed since the last scan start, by scope. Purview is consented through
+    // Exchange, so without this a failed Exchange consent is prompted for a second time.
+    private readonly ConcurrentDictionary<string, ResourcePrincipalNotFoundException> _failedConsents = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, bool> _consentsShown = new(StringComparer.OrdinalIgnoreCase);
+
+    // True inside a running scan: nobody is at the GUI to answer a sign-in prompt.
+    private static readonly AsyncLocal<bool> InteractionSuppressed = new();
 
     public bool IsConnected => _tokenCache.HasValidToken("graph") || _tokenCache.GetRefreshToken() != null;
     public string? TenantId => _tenantId;
@@ -86,10 +148,21 @@ public sealed class DelegatedAuth
     /// <summary>Tenant SharePoint admin URL (e.g. https://contoso-admin.sharepoint.com), or null if not yet discovered.</summary>
     public string? SharePointAdminUrl => string.IsNullOrEmpty(_sharePointTenant) ? null : $"https://{_sharePointTenant}-admin.sharepoint.com";
 
-    public DelegatedAuth(TokenCache tokenCache)
+    /// <summary>Where sign-in URLs open: system browser, or the GUI while it drives a request.</summary>
+    public BrowserPrompt Prompt { get; }
+
+    private readonly HttpMessageHandler? _httpHandler;
+
+    /// <param name="httpHandler">Handler for calls to Entra and Graph; tests pass a fake.</param>
+    public DelegatedAuth(TokenCache tokenCache, BrowserPrompt? prompt = null, HttpMessageHandler? httpHandler = null)
     {
         _tokenCache = tokenCache;
+        Prompt = prompt ?? new BrowserPrompt();
+        _httpHandler = httpHandler;
     }
+
+    private HttpClient NewHttpClient()
+        => _httpHandler == null ? new HttpClient() : new HttpClient(_httpHandler, disposeHandler: false);
 
     /// <summary>
     /// Perform interactive delegated sign-in.
@@ -119,11 +192,7 @@ public sealed class DelegatedAuth
                 $"&code_challenge={codeChallenge}" +
                 $"&code_challenge_method=S256";
 
-            OpenBrowser(authUrl);
-
-            var code = await WaitForOAuthCallbackAsync(listener, state,
-                "<html><body><h2>Authentication successful!</h2><p>You can close this window.</p></body></html>",
-                "Authentication failed", ct);
+            var code = await PromptForCodeAsync(listener, authUrl, state, "Signed in", "Authentication failed", ct);
 
             // Exchange code for tokens
             await ExchangeCodeForTokens(code, redirectUri, codeVerifier, ct);
@@ -143,8 +212,41 @@ public sealed class DelegatedAuth
         _tokenCache.Clear();
         _tenantId = null;
         _tenantDomain = null;
+        _sharePointTenant = null;
+        _initialDomainPrefix = null;
         _userPrincipalName = null;
     }
+
+    /// <summary>
+    /// Drop cached access tokens (refresh tokens stay) and forget which resources were unusable. Tokens
+    /// minted afterwards carry the roles the account holds now, e.g. a PIM role activated after sign-in.
+    /// </summary>
+    public void DropCachedAccessTokens()
+    {
+        _tokenCache.ClearAccessTokens();
+        _unavailable.Clear();
+        _failedConsents.Clear();
+        _consentsShown.Clear();
+    }
+
+    /// <summary>
+    /// Until disposed, sign-in prompts in this async flow (and tasks it starts, such as the scan) fail
+    /// instead of opening a browser. The scan runs unattended; consent belongs to its start.
+    /// </summary>
+    public IDisposable SuppressInteraction()
+    {
+        var previous = InteractionSuppressed.Value;
+        InteractionSuppressed.Value = true;
+        return new Restore(() => InteractionSuppressed.Value = previous);
+    }
+
+    private sealed class Restore(Action restore) : IDisposable
+    {
+        public void Dispose() => restore();
+    }
+
+    /// <summary>Claims of the cached access token for a resource, or null if none is cached. Never triggers sign-in.</summary>
+    public TokenClaims? GetCachedTokenClaims(string resource) => TokenClaims.TryParse(_tokenCache.Get(resource));
 
     /// <summary>
     /// Trigger an interactive admin consent flow for the M365Permissions app registration.
@@ -173,11 +275,7 @@ public sealed class DelegatedAuth
                 $"&code_challenge={codeChallenge}" +
                 $"&code_challenge_method=S256";
 
-            OpenBrowser(authUrl);
-
-            var code = await WaitForOAuthCallbackAsync(listener, state,
-                "<html><body><h2>Consent granted!</h2><p>Permissions have been updated. You can close this window.</p></body></html>",
-                "Consent failed", ct);
+            var code = await PromptForCodeAsync(listener, authUrl, state, "Consent granted", "Consent failed", ct);
 
             // Exchange code for fresh tokens with the newly consented permissions
             await ExchangeCodeForTokens(code, redirectUri, codeVerifier, ct);
@@ -209,6 +307,17 @@ public sealed class DelegatedAuth
 
         var consented = _tokenCache.GetConsentedGraphScopes();
         var missing = needed.Where(s => !consented.Contains(s)).ToList();
+
+        // The local list can claim a scope the tenant no longer grants (consent revoked). Trust the token.
+        if (missing.Count == 0)
+        {
+            TokenClaims? claims = null;
+            try { claims = TokenClaims.TryParse(await GetAccessTokenAsync("graph", ct)); }
+            catch (OperationCanceledException) { throw; }
+            catch { /* no token to compare against; keep the local list */ }
+            if (claims != null && claims.Scopes.Count > 0)
+                missing = needed.Where(s => !claims.HasScope(s)).ToList();
+        }
         if (missing.Count == 0) return;
 
         // Build a scope string with the union: previously-consented + missing + always-needed.
@@ -233,22 +342,61 @@ public sealed class DelegatedAuth
     /// If a refresh-token grant fails due missing consent, trigger an interactive consent prompt
     /// for that specific resource so the user can grant it before scan/pre-check runs.
     /// </summary>
-    public async Task EnsureResourceConsentForCategoriesAsync(IEnumerable<string> categories, CancellationToken ct = default)
+    /// <returns>The resources that can't be used in this tenant; their categories report it during the scan.</returns>
+    public async Task<List<ResourcePrincipalNotFoundException>> EnsureResourceConsentForCategoriesAsync(IEnumerable<string> categories, CancellationToken ct = default)
     {
-        var resources = GetOrderedResourceKeysForCategories(categories);
-        foreach (var resource in resources)
+        var unavailable = new List<ResourcePrincipalNotFoundException>();
+        foreach (var resource in GetOrderedResourceKeysForCategories(categories))
         {
             try
             {
                 await EnsureResourceTokenAsync(resource, ct);
+                await EnsureRequiredScopesAsync(resource, ct);
             }
-            catch (ResourcePrincipalNotFoundException)
+            catch (ResourcePrincipalNotFoundException ex)
             {
-                // This resource isn't provisioned/subscribed in the tenant (e.g. no Azure DevOps
-                // SPN). Don't let it abort consent for the other selected resources — the scanner
-                // that needs it will be marked Skipped by the orchestrator with a clear reason.
+                // Not usable here (e.g. no Azure DevOps service principal); carry on with the others.
+                unavailable.Add(ex);
             }
         }
+        return unavailable;
+    }
+
+    /// <summary>
+    /// If the resource token lacks a scope the scan needs (a .default token only carries what was
+    /// granted before), ask for the missing scopes explicitly. The consent screen shows only those.
+    /// </summary>
+    private async Task EnsureRequiredScopesAsync(string resource, CancellationToken ct)
+    {
+        if (MissingRequiredScopes(resource) is not { Count: > 0 }) return;
+
+        // Entra doesn't fail a token request for a scope that isn't granted: it issues the token without
+        // it. Exchange Online even accepts Graph grants, so its .default token looks fine while
+        // Exchange.Manage was never consented. So never wait for a "consent required" error.
+
+        // Silent retry first: the grant may exist by now, e.g. from the other SharePoint host a moment ago.
+        var refreshToken = _tokenCache.GetRefreshToken();
+        if (!string.IsNullOrEmpty(refreshToken))
+        {
+            try { await AcquireTokenForResourceAsync(refreshToken, ClientId, resource, GetScopeForResource(resource), ct); }
+            catch (OperationCanceledException) { throw; }
+            catch { /* fall through to the consent screen */ }
+            if (MissingRequiredScopes(resource) is not { Count: > 0 }) return;
+        }
+
+        await ReconsentResourceAsync(resource, ct);
+
+        if (MissingRequiredScopes(resource) is { Count: > 0 } stillMissing)
+            throw new ResourcePrincipalNotFoundException(resource, "ScopeNotGranted",
+                $"Consent for {ServiceName(resource)} finished without granting {string.Join(", ", stillMissing)}. " +
+                "Grant it in Entra ID (Enterprise applications, M365Permissions PowerShell Module, Permissions) or tick 'Consent on behalf of your organization'.");
+    }
+
+    /// <summary>Required scopes the cached token for the resource lacks; null when no token is cached.</summary>
+    private List<string>? MissingRequiredScopes(string resource)
+    {
+        var claims = GetCachedTokenClaims(resource);
+        return claims == null ? null : GetRequiredResourceScopes(resource).Where(s => !claims.HasScope(s)).ToList();
     }
 
     /// <summary>
@@ -261,22 +409,26 @@ public sealed class DelegatedAuth
         var resources = GetOrderedResourceKeysForCategories(categories);
         var failures = new List<string>();
 
+        // An explicit retry: forget earlier failures for these resources.
+        _failedConsents.Clear();
+        _consentsShown.Clear();
+        foreach (var resource in resources)
+            _unavailable.TryRemove(resource, out _);
+
         foreach (var resource in resources)
         {
             try
             {
                 await ReconsentResourceAsync(resource, ct);
             }
-            catch (ResourcePrincipalNotFoundException)
+            catch (ResourcePrincipalNotFoundException ex) when (ex.NotProvisioned)
             {
-                // Resource isn't provisioned/subscribed in this tenant (e.g. no Azure DevOps SPN —
-                // AADSTS650052). That's expected for some tenants and is not a failure: skip it and
-                // keep re-consenting the rest. The browser shows a friendly "service not available"
-                // page instead of a raw AAD error.
+                // The service isn't used in this tenant (e.g. no Azure DevOps service principal):
+                // nothing to consent to, and not a failure.
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                failures.Add($"{resource}: {ex.Message}");
+                failures.Add($"{ServiceName(resource)}: {ex.Message}");
             }
         }
 
@@ -343,6 +495,22 @@ public sealed class DelegatedAuth
         if (_tokenCache.Get(resource) != null)
             return;
 
+        if (_unavailable.TryGetValue(resource, out var known))
+            throw new ResourcePrincipalNotFoundException(known.Resource, known.AadErrorCode, known.Message);
+
+        try
+        {
+            await AcquireResourceTokenAsync(resource, ct);
+        }
+        catch (ResourcePrincipalNotFoundException ex)
+        {
+            _unavailable[resource] = ex;
+            throw;
+        }
+    }
+
+    private async Task AcquireResourceTokenAsync(string resource, CancellationToken ct)
+    {
         // Power Platform resources use the well-known PP client ID (different from our app)
         if (IsPowerPlatformResource(resource))
         {
@@ -352,8 +520,9 @@ public sealed class DelegatedAuth
 
         var refreshToken = _tokenCache.GetRefreshToken();
         if (string.IsNullOrEmpty(refreshToken))
-            throw new InvalidOperationException("Not authenticated. Call ConnectAsync first.");
+            throw new InvalidOperationException("Not connected. Connect to a tenant first.");
 
+        await EnsureSharePointTenantAsync(resource, ct);
         var scope = GetScopeForResource(resource);
 
         try
@@ -361,26 +530,104 @@ public sealed class DelegatedAuth
             await AcquireTokenForResourceAsync(refreshToken, ClientId, resource, scope, ct);
             return;
         }
-        catch (ResourcePrincipalNotFoundException ex) when (ShouldTryInteractiveConsentByCode(ex.AadErrorCode))
+        catch (ResourcePrincipalNotFoundException ex) when (ShouldTryInteractiveConsentByCode(ex.AadErrorCode) || ex.NotProvisioned)
         {
-            // Consent-like tenant errors should trigger an interactive prompt, not a silent skip.
+            // Consent-like errors lead to the consent screen. So does "no service principal" from the token
+            // endpoint: its view can lag behind a service principal created moments ago, so only the
+            // sign-in may conclude that a service isn't set up here.
         }
         catch (InvalidOperationException ex) when (ShouldTryInteractiveConsentByMessage(ex.Message))
         {
             // Token endpoint returned consent-related errors in payload. Fall through to interactive.
         }
 
-        await AcquireTokenInteractiveAsync(ClientId, resource, scope, ct, isPP: false);
+        await ReconsentResourceAsync(resource, ct);
     }
 
+    /// <summary>
+    /// Show the consent screen for one resource (prompt=consent: without it Entra may return the existing
+    /// partial grant without asking), then fetch the normal token silently when the consent went through
+    /// another host (Purview through Exchange, the SharePoint admin host through SharePoint). Each consent
+    /// is shown at most once per round; a repeat only renews the token.
+    /// </summary>
     private async Task ReconsentResourceAsync(string resource, CancellationToken ct)
     {
-        var scope = GetScopeForResource(resource);
-        var isPowerPlatform = IsPowerPlatformResource(resource);
-        var clientId = isPowerPlatform ? PowerPlatformClientId : ClientId;
+        if (IsPowerPlatformResource(resource))
+        {
+            await AcquireTokenInteractiveAsync(PowerPlatformClientId, resource, GetScopeForResource(resource), ct, isPP: true, forceConsentPrompt: true);
+            return;
+        }
 
-        // Force a consent screen for this resource so users can explicitly grant/re-grant access.
-        await AcquireTokenInteractiveAsync(clientId, resource, scope, ct, isPP: isPowerPlatform, forceConsentPrompt: true);
+        await EnsureSharePointTenantAsync(resource, ct);
+        var consentScope = GetConsentScopeForResource(resource);
+        if (_failedConsents.TryGetValue(consentScope, out var failed))
+            throw new ResourcePrincipalNotFoundException(resource, failed.AadErrorCode, failed.Message);
+
+        if (_consentsShown.ContainsKey(consentScope))
+        {
+            if (_tokenCache.GetRefreshToken() is { Length: > 0 } rt)
+                await AcquireTokenForResourceAsync(rt, ClientId, resource, GetScopeForResource(resource), ct);
+            return;
+        }
+
+        try
+        {
+            await AcquireTokenInteractiveAsync(ClientId, resource, consentScope, ct, forceConsentPrompt: true);
+            _consentsShown[consentScope] = true;
+        }
+        catch (OAuthCallbackException ex)
+        {
+            var declined = new ResourcePrincipalNotFoundException(resource, ex.Error,
+                $"Consent for {ServiceName(resource)} did not complete ({ex.Error}: {ex.ErrorDescription}).");
+            _failedConsents[consentScope] = declined;
+            throw declined;
+        }
+        catch (ResourcePrincipalNotFoundException ex) when (ex.AadErrorCode != "InteractionRequired")
+        {
+            _failedConsents[consentScope] = ex;
+            throw;
+        }
+
+        var scope = GetScopeForResource(resource);
+        if (consentScope != scope && _tokenCache.GetRefreshToken() is { Length: > 0 } refreshToken)
+            await AcquireTokenForResourceAsync(refreshToken, ClientId, resource, scope, ct);
+    }
+
+    private const string OtherServiceMissing = "OtherServiceMissing";
+
+    /// <summary>
+    /// AADSTS650052 names the service that has no service principal. Only when that is this resource's
+    /// API is the resource "not set up here"; otherwise another API on the app registration is missing
+    /// (typically Azure DevOps) and this one still needs its own, explicit consent.
+    /// </summary>
+    internal static string ClassifySkipCode(string resource, string code, string? description)
+    {
+        if (code != "AADSTS650052" || !ResourceAppIds.TryGetValue(resource, out var appId))
+            return code;
+        var named = MissingServiceAppId(description);
+        return named == null || named.Equals(appId, StringComparison.OrdinalIgnoreCase) ? code : OtherServiceMissing;
+    }
+
+    /// <summary>The app ID quoted in an AADSTS650052 description, if any.</summary>
+    private static string? MissingServiceAppId(string? description)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(description ?? "", "'([0-9a-fA-F-]{36})'");
+        return match.Success ? match.Groups[1].Value : null;
+    }
+
+    /// <summary>
+    /// A .default consent covers every API on the app registration, so it fails when the tenant lacks
+    /// one of them. Exchange can only be consented that way (its explicit scopes are redirected to Graph).
+    /// </summary>
+    internal static string StaticConsentBlocked(string resource, string? description)
+    {
+        var missing = MissingServiceAppId(description);
+        var fix = missing == null
+            ? "create that service principal in this tenant"
+            : $"create it with New-MgServicePrincipal -AppId {missing}";
+        return $"{ServiceName(resource)} can only be consented together with every API configured on the app registration, " +
+               $"and this tenant has no service principal for one of them ({description}). An admin can {fix}, or the app's " +
+               "publisher can remove that API from the registration. Then start the scan again.";
     }
 
     private static bool ShouldTryInteractiveConsentByCode(string? aadErrorCodeOrOauth)
@@ -388,7 +635,8 @@ public sealed class DelegatedAuth
         if (string.IsNullOrWhiteSpace(aadErrorCodeOrOauth))
             return false;
 
-        return aadErrorCodeOrOauth.Equals("AADSTS65001", StringComparison.OrdinalIgnoreCase)
+        return aadErrorCodeOrOauth.Equals(OtherServiceMissing, StringComparison.Ordinal)
+            || aadErrorCodeOrOauth.Equals("AADSTS65001", StringComparison.OrdinalIgnoreCase)
             || aadErrorCodeOrOauth.Equals("AADSTS70011", StringComparison.OrdinalIgnoreCase)
             || aadErrorCodeOrOauth.Equals("invalid_scope", StringComparison.OrdinalIgnoreCase)
             || aadErrorCodeOrOauth.Equals("unauthorized_client", StringComparison.OrdinalIgnoreCase)
@@ -443,23 +691,42 @@ public sealed class DelegatedAuth
     }
 
     /// <summary>Map resource key to the OAuth2 scope string needed for that API.</summary>
+    /// <remarks>
+    /// Explicit scopes where possible: a .default consent covers every API on the app registration and
+    /// fails outright (AADSTS650052) in a tenant that lacks one of them, e.g. Azure DevOps. A token still
+    /// carries every scope granted for its API, not just the one named.
+    /// Exchange Online is the exception: Entra redirects explicitly requested Exchange scopes to Microsoft
+    /// Graph (AADSTS650053 "Exchange.Manage doesn't exist on the resource 00000003-..."), so Exchange can
+    /// only be requested and consented through the app registration's configured permissions (.default).
+    /// The Power Platform resources use Microsoft's own pre-authorized client, where .default is right.
+    /// </remarks>
     private string GetScopeForResource(string resource) => resource switch
     {
-        // Graph uses explicit consented v2 scopes (never .default) so missing tenant-consent on extra perms
-        // doesn't break login or token refresh in tenants that have never granted them.
         "graph" => BuildGraphScopeString(),
-        "sharepoint" => $"https://{GetSharePointHost()}/.default offline_access",
+        "sharepoint" => $"https://{GetSharePointHost()}/AllSites.FullControl offline_access",
+        "sharepointadmin" => $"https://{GetSharePointAdminHost()}/AllSites.FullControl offline_access",
         "exchange" => "https://outlook.office365.com/.default offline_access",
+        // Same service principal as Exchange Online (its SPNs include this host).
         "compliance" => "https://ps.compliance.protection.outlook.com/.default offline_access",
-        "powerbi" => "https://analysis.windows.net/powerbi/api/.default offline_access",
+        "powerbi" => "https://analysis.windows.net/powerbi/api/Tenant.Read.All offline_access",
         // BAP + PowerApps APIs use service.powerapps.com audience
         "powerapps" => "https://service.powerapps.com/.default offline_access",
         // Flow API uses service.flow.microsoft.com audience
         "flow" => "https://service.flow.microsoft.com/.default offline_access",
-        "azure" => "https://management.azure.com/.default offline_access",
+        "azure" => "https://management.azure.com/user_impersonation offline_access",
         "azuredevops" => "499b84ac-1321-427f-aa17-267ca6975798/user_impersonation offline_access",
-        "sharepointadmin" => $"https://{GetSharePointAdminHost()}/.default offline_access",
         _ => throw new ArgumentException($"Unknown resource: {resource}")
+    };
+
+    /// <summary>
+    /// Scope for the consent screen. Purview's compliance host is the Exchange Online service principal,
+    /// so it is consented through Exchange.
+    /// </summary>
+    private string GetConsentScopeForResource(string resource) => resource switch
+    {
+        "compliance" => GetScopeForResource("exchange"),
+        "sharepointadmin" => GetScopeForResource("sharepoint"),
+        _ => GetScopeForResource(resource)
     };
 
     /// <summary>
@@ -476,12 +743,15 @@ public sealed class DelegatedAuth
         return string.Join(' ', fully) + " offline_access openid profile";
     }
 
+    private const string SharePointUnknownMessage =
+        "The tenant's SharePoint URL could not be determined. Run a SharePoint or OneDrive scan (it grants Sites.Read.All), or reconnect.";
+
     /// <summary>Derive the tenant's SharePoint hostname (e.g. contoso.sharepoint.com).</summary>
     private string GetSharePointHost()
     {
         if (!string.IsNullOrEmpty(_sharePointTenant))
             return $"{_sharePointTenant}.sharepoint.com";
-        throw new InvalidOperationException("SharePoint tenant not available. Ensure you're connected first.");
+        throw new InvalidOperationException(SharePointUnknownMessage);
     }
 
     /// <summary>Derive the tenant's SharePoint admin hostname (e.g. contoso-admin.sharepoint.com).</summary>
@@ -489,7 +759,49 @@ public sealed class DelegatedAuth
     {
         if (!string.IsNullOrEmpty(_sharePointTenant))
             return $"{_sharePointTenant}-admin.sharepoint.com";
-        throw new InvalidOperationException("SharePoint tenant not available. Ensure you're connected first.");
+        throw new InvalidOperationException(SharePointUnknownMessage);
+    }
+
+    /// <summary>
+    /// Resolve the SharePoint tenant name before a SharePoint token is requested. Sign-in only has
+    /// User.Read, which can't read sites/root, so on a fresh tenant this runs after the scan's Graph
+    /// consent added Sites.Read.All. Falls back to the initial onmicrosoft.com domain.
+    /// </summary>
+    private async Task EnsureSharePointTenantAsync(string resource, CancellationToken ct)
+    {
+        if (resource is not ("sharepoint" or "sharepointadmin") || !string.IsNullOrEmpty(_sharePointTenant))
+            return;
+
+        try
+        {
+            using var http = NewHttpClient();
+            http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", await GetAccessTokenAsync("graph", ct));
+            _sharePointTenant = await TryGetSharePointTenantAsync(http, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* fall back below */ }
+
+        if (string.IsNullOrEmpty(_sharePointTenant))
+            _sharePointTenant = _initialDomainPrefix;
+        if (string.IsNullOrEmpty(_sharePointTenant))
+            throw new InvalidOperationException(SharePointUnknownMessage);
+    }
+
+    /// <summary>SharePoint tenant name from the root site's webUrl, or null when Graph won't return it (e.g. no Sites.Read.All yet).</summary>
+    private static async Task<string?> TryGetSharePointTenantAsync(HttpClient graph, CancellationToken ct)
+    {
+        using var response = await graph.GetAsync("https://graph.microsoft.com/v1.0/sites/root?$select=webUrl", ct);
+        if (!response.IsSuccessStatusCode) return null;
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+        return doc.RootElement.TryGetProperty("webUrl", out var webUrl) ? SharePointTenantFromUrl(webUrl.GetString()) : null;
+    }
+
+    /// <summary>"https://contoso.sharepoint.com/" gives "contoso".</summary>
+    public static string? SharePointTenantFromUrl(string? webUrl)
+    {
+        if (!Uri.TryCreate(webUrl, UriKind.Absolute, out var uri)) return null;
+        var label = uri.Host.Split('.')[0];
+        return string.IsNullOrEmpty(label) ? null : label;
     }
 
     /// <summary>Get the SharePoint admin site URL (e.g. https://contoso-admin.sharepoint.com).</summary>
@@ -498,7 +810,7 @@ public sealed class DelegatedAuth
     /// <summary>Acquire an access token for a specific resource using a refresh token.</summary>
     private async Task AcquireTokenForResourceAsync(string refreshToken, string clientId, string cacheKey, string scope, CancellationToken ct, bool isPP = false)
     {
-        using var http = new HttpClient();
+        using var http = NewHttpClient();
         var body = new FormUrlEncodedContent(new Dictionary<string, string>
         {
             ["client_id"] = clientId,
@@ -618,10 +930,12 @@ public sealed class DelegatedAuth
         var aadCode = MatchSkippableAadCode(description);
         if (aadCode != null)
         {
-            throw new ResourcePrincipalNotFoundException(resource, aadCode,
-                $"Cannot acquire a token for '{resource}' in this tenant ({aadCode}). " +
-                "This typically means the service is not licensed, has never been used, or admin consent " +
-                "has not been granted for it. Skipping this scan.");
+            aadCode = ClassifySkipCode(resource, aadCode, description);
+            throw new ResourcePrincipalNotFoundException(resource, aadCode, aadCode == OtherServiceMissing
+                ? $"Cannot acquire a token for {ServiceName(resource)}: {description}"
+                : aadCode is "AADSTS500011" or "AADSTS650052"
+                    ? $"{ServiceName(resource)} isn't set up in this tenant: the token request failed with {description} Nothing to scan there."
+                    : $"Cannot acquire a token for {ServiceName(resource)}: {description}");
         }
 
         // OAuth2 'invalid_client' or 'invalid_scope' on a refresh-token grant for a sub-resource is
@@ -641,6 +955,10 @@ public sealed class DelegatedAuth
     /// </summary>
     private async Task AcquireTokenInteractiveAsync(string clientId, string cacheKey, string scope, CancellationToken ct, bool isPP = false, bool forceConsentPrompt = false)
     {
+        if (InteractionSuppressed.Value)
+            throw new ResourcePrincipalNotFoundException(cacheKey, "InteractionRequired",
+                $"{ServiceName(cacheKey)} needs a new sign-in or consent, which can't be shown while a scan runs. Start the scan again to sign in.");
+
         var codeVerifier = GenerateCodeVerifier();
         var codeChallenge = GenerateCodeChallenge(codeVerifier);
         var state = GenerateState();
@@ -661,13 +979,9 @@ public sealed class DelegatedAuth
                 $"&code_challenge={codeChallenge}" +
                 $"&code_challenge_method=S256";
 
-            OpenBrowser(authUrl);
+            var code = await PromptForCodeAsync(listener, authUrl, state, "Signed in", $"Interactive auth failed for '{cacheKey}'", ct, cacheKey);
 
-            var code = await WaitForOAuthCallbackAsync(listener, state,
-                "<html><body><h2>Authentication successful!</h2><p>You can close this window.</p></body></html>",
-                $"Interactive auth failed for '{cacheKey}'", ct);
-
-            using var http = new HttpClient();
+            using var http = NewHttpClient();
             var body = new FormUrlEncodedContent(new Dictionary<string, string>
             {
                 ["client_id"] = clientId,
@@ -708,9 +1022,16 @@ public sealed class DelegatedAuth
             // The authorize redirect came back with an error meaning this resource simply isn't
             // available in the tenant (e.g. no Azure DevOps SPN — AADSTS650052). Surface it as a
             // skippable resource error so callers skip just this resource and keep the rest working.
-            throw new ResourcePrincipalNotFoundException(cacheKey, ex.SkippableResourceCode,
-                $"Cannot consent to '{cacheKey}' in this tenant ({ex.SkippableResourceCode}). " +
-                "This service isn't provisioned or subscribed here. Skipping it.");
+            var code = ClassifySkipCode(cacheKey, ex.SkippableResourceCode, ex.ErrorDescription);
+            throw new ResourcePrincipalNotFoundException(cacheKey, code, code switch
+            {
+                OtherServiceMissing when scope.Contains("/.default", StringComparison.Ordinal) =>
+                    StaticConsentBlocked(cacheKey, ex.ErrorDescription),
+                OtherServiceMissing => $"Consent for {ServiceName(cacheKey)} failed: {ex.ErrorDescription}",
+                "AADSTS500011" or "AADSTS650052" =>
+                    $"{ServiceName(cacheKey)} isn't set up in this tenant: sign-in returned {ex.ErrorDescription} Nothing to scan there.",
+                _ => $"Cannot consent to {ServiceName(cacheKey)}: {ex.ErrorDescription}"
+            });
         }
         finally
         {
@@ -721,7 +1042,7 @@ public sealed class DelegatedAuth
 
     private async Task ExchangeCodeForTokens(string code, string redirectUri, string codeVerifier, CancellationToken ct)
     {
-        using var http = new HttpClient();
+        using var http = NewHttpClient();
         var body = new FormUrlEncodedContent(new Dictionary<string, string>
         {
             ["client_id"] = ClientId,
@@ -766,7 +1087,7 @@ public sealed class DelegatedAuth
         var token = _tokenCache.Get("graph")
             ?? throw new InvalidOperationException("No access token available");
 
-        using var http = new HttpClient();
+        using var http = NewHttpClient();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
         // Get current user
@@ -778,31 +1099,27 @@ public sealed class DelegatedAuth
         var orgResponse = await http.GetStringAsync("https://graph.microsoft.com/v1.0/organization?$select=id,verifiedDomains", ct);
         var orgDoc = JsonDocument.Parse(orgResponse);
         var orgs = orgDoc.RootElement.GetProperty("value");
+        _initialDomainPrefix = null;
         if (orgs.GetArrayLength() > 0)
         {
             var org = orgs[0];
             _tenantId = org.GetProperty("id").GetString();
 
-            // Find the default verified domain
             foreach (var domain in org.GetProperty("verifiedDomains").EnumerateArray())
             {
+                var name = domain.TryGetProperty("name", out var n) ? n.GetString() : null;
                 if (domain.TryGetProperty("isDefault", out var isDefault) && isDefault.GetBoolean())
-                {
-                    _tenantDomain = domain.GetProperty("name").GetString();
-                    break;
-                }
+                    _tenantDomain = name;
+                if (domain.TryGetProperty("isInitial", out var isInitial) && isInitial.GetBoolean() && name != null)
+                    _initialDomainPrefix = name.Split('.')[0];
             }
         }
 
-        // Discover the actual SharePoint tenant prefix from the root site webUrl
-        // (the verified domain prefix may differ from the SharePoint tenant name)
-        var rootSiteResponse = await http.GetStringAsync("https://graph.microsoft.com/v1.0/sites/root", ct);
-        var rootSiteDoc = JsonDocument.Parse(rootSiteResponse);
-        if (rootSiteDoc.RootElement.TryGetProperty("webUrl", out var webUrlProp))
-        {
-            var webUrl = webUrlProp.GetString() ?? "";
-            _sharePointTenant = webUrl.Replace("https://", "", StringComparison.OrdinalIgnoreCase).Split('.')[0];
-        }
+        // The SharePoint tenant name comes from the root site (it can differ from any domain). Reading it
+        // needs Sites.Read.All, which a fresh sign-in doesn't have yet: then it is resolved on first use.
+        try { _sharePointTenant = await TryGetSharePointTenantAsync(http, ct); }
+        catch (OperationCanceledException) { throw; }
+        catch { _sharePointTenant = null; }
     }
 
     /// <summary>Random opaque value bound to one authorize request; verified on the callback.</summary>
@@ -817,7 +1134,7 @@ public sealed class DelegatedAuth
     /// noise on the fixed port 1985 (the Entra app registration only redirects there).
     /// </summary>
     private static async Task<string> WaitForOAuthCallbackAsync(
-        HttpListener listener, string expectedState, string successHtml, string failureTitle, CancellationToken ct)
+        HttpListener listener, string expectedState, string successHtml, Func<string, string?, string> skippedHtml, string failureTitle, CancellationToken ct)
     {
         var deadline = DateTime.UtcNow.AddMinutes(5);
         while (true)
@@ -859,10 +1176,7 @@ public sealed class DelegatedAuth
                 var skippableCode = MatchSkippableAadCode(errorDescription);
                 if (skippableCode != null)
                 {
-                    await WriteBrowserResponseAsync(context,
-                        "<html><body style='font-family:sans-serif'><h2>Service not available</h2>" +
-                        "<p>This Microsoft service isn't provisioned in your organization, so it was skipped. " +
-                        "Your other permissions were not affected — you can close this tab.</p></body></html>", ct);
+                    await WriteBrowserResponseAsync(context, skippedHtml(skippableCode, errorDescription), ct);
                 }
                 else
                 {
@@ -932,19 +1246,51 @@ public sealed class DelegatedAuth
             .Replace('/', '_');
     }
 
-    private static void OpenBrowser(string url)
+    /// <summary>Show the authorize URL (system browser or GUI popup) and wait for its redirect; returns the code.</summary>
+    private async Task<string> PromptForCodeAsync(HttpListener listener, string authUrl, string state,
+        string successTitle, string failureTitle, CancellationToken ct, string? resource = null)
     {
         try
         {
-            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            await Prompt.ShowAsync(authUrl, ct);
+            return await WaitForOAuthCallbackAsync(listener, state, SuccessPage(successTitle),
+                (code, description) => SkippedPage(resource, code, description,
+                    staticConsent: authUrl.Contains("%2F.default", StringComparison.OrdinalIgnoreCase)), failureTitle, ct);
         }
-        catch
+        finally
         {
-            // Fallback for Linux/macOS
-            if (OperatingSystem.IsLinux())
-                Process.Start("xdg-open", url);
-            else if (OperatingSystem.IsMacOS())
-                Process.Start("open", url);
+            Prompt.Complete();
         }
+    }
+
+    /// <summary>
+    /// Redirect landing page. The GUI closes its popup itself (and may reuse it for the next prompt).
+    /// A system-browser tab can only close itself when it has no history, e.g. when sign-in was silent.
+    /// </summary>
+    private string SuccessPage(string title)
+        => LandingPage(title, "<p>Returning to M365Permissions.</p>");
+
+    /// <summary>Landing page when the service can't be used here; the scan skips it.</summary>
+    private string SkippedPage(string? resource, string aadCode, string? description, bool staticConsent)
+    {
+        var service = resource == null ? "This service" : ServiceName(resource);
+        var code = resource == null ? aadCode : ClassifySkipCode(resource, aadCode, description);
+        return code switch
+        {
+            "AADSTS500011" or "AADSTS650052" => LandingPage($"{service} isn't used in your organization",
+                "<p>There is nothing to scan there, so it is skipped. Your other scans are not affected.</p>"),
+            OtherServiceMissing when staticConsent && resource != null => LandingPage($"{service} couldn't be consented",
+                $"<p>{WebUtility.HtmlEncode(StaticConsentBlocked(resource, description))}</p><p>Your other scans are not affected.</p>"),
+            _ => LandingPage($"{service} can't be accessed ({code})",
+                $"<p>{WebUtility.HtmlEncode(description ?? "")}</p><p>The scan log has the details. Your other scans are not affected.</p>")
+        };
+    }
+
+    private string LandingPage(string title, string bodyHtml)
+    {
+        var closing = Prompt.GuiDriven
+            ? "<p>This window closes automatically.</p>"
+            : "<p>You can close this tab.</p><script>setTimeout(function(){window.close();},300);</script>";
+        return $"<html><head><title>M365Permissions</title></head><body style='font-family:sans-serif'><h2>{WebUtility.HtmlEncode(title)}</h2>{bodyHtml}{closing}</body></html>";
     }
 }

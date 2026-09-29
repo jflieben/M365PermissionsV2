@@ -104,19 +104,19 @@ pwsh -NoProfile -c "Import-Module ./M365Permissions/M365Permissions.psd1 -Force;
 ## Database Schema
 7 tables: `config`, `scans`, `permissions`, `scan_progress`, `comparisons`, `logs`, `audit_log`
 - Permissions table has indexes on scan_id, category, principal, target, risk_level
-- Permissions have `risk_level` and `risk_reason` columns (populated by RiskClassifier)
+- Permissions have `risk_level` and `risk_reason` columns (populated by PolicyEngine from the enabled policies)
 - Scans have `notes` and `tags` columns for annotation
 - WAL mode enabled for concurrent read/write during scans
 - Schema auto-applied from embedded resource on first run
 
 ## Key Patterns
-- **Risk scoring**: `RiskClassifier` evaluates each permission entry post-batch and assigns Critical/High/Medium/Low/Info risk levels with reasons
+- **Risk scoring**: `PolicyEngine.ClassifyBatch` evaluates each batch against the enabled policies (defaults in `DefaultPolicies`) and sets risk level + reason
 - **Audit trail**: All actions (scan start, export, config change) logged to `audit_log` table via `AuditRepository`
 - **Database migrations**: `SqliteDb.ApplyMigrations()` adds missing columns/tables for backward compatibility with `AddColumnIfMissing()`
 - **Graph pagination**: `IAsyncEnumerable` with `@odata.nextLink` following
-- **Throttling**: 429 → Retry-After header, exponential backoff (5^attempt seconds)
+- **Throttling**: 429 → Retry-After header, exponential backoff; SharePoint REST also retries 503, Exchange and ARM retry 429
 - **Batch requests**: 20 requests per Graph $batch call
-- **Exchange REST**: InvokeCommand pattern via `/adminapi/beta/{org}/InvokeCommand`
+- **Exchange REST**: InvokeCommand pattern via `/adminapi/beta/{tenantId}/InvokeCommand`
 - **Scan orchestrator**: Categories run in parallel; per-category concurrency via AdaptiveThrottleManager
 - **Permission entry key**: `{category}|{targetPath}|{targetId}|{principalKey}|{role}|{through}` (+duplicate discriminator) for comparison
 

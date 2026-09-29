@@ -42,12 +42,8 @@ public sealed class PurviewScanner : IScanProvider
         context.ReportProgress("Scanning Purview compliance role groups...", 3);
 
         // Step 1: Discover regional compliance endpoint via redirect
-        var complianceUrl = await DiscoverComplianceEndpointAsync(context, ct);
-        if (complianceUrl == null)
-        {
-            context.ReportProgress("Cannot discover Purview compliance endpoint. Skipping Purview scan.", 2);
-            yield break;
-        }
+        var complianceUrl = await DiscoverComplianceEndpointAsync(context, ct)
+            ?? throw new InvalidOperationException("Cannot reach the Purview compliance endpoint; see the previous log line for the reason.");
 
         // Step 2: Get all role groups from the compliance center
         var roleGroups = new List<ComplianceRoleGroup>();
@@ -148,6 +144,10 @@ public sealed class PurviewScanner : IScanProvider
             context.ReportProgress($"Compliance endpoint returned HTTP {(int)resp.StatusCode}. Exchange Administrator role or compliance permissions may be required.", 2);
             return null;
         }
+        catch (Exception ex) when (ex is OperationCanceledException or ResourcePrincipalNotFoundException)
+        {
+            throw; // cancellation, or the service isn't provisioned (the orchestrator marks the category Skipped)
+        }
         catch (InvalidOperationException)
         {
             context.ReportProgress("Cannot acquire compliance token. Ensure the app registration has the compliance scope configured.", 2);
@@ -210,15 +210,9 @@ public sealed class PurviewScanner : IScanProvider
 
                     if (!resp.IsSuccessStatusCode)
                     {
+                        // Transient failures (429, 5xx, known Exchange codes) are retried from scratch by the
+                        // catch below. Breaking out here used to return the pages read so far as a success.
                         var errorBody = await resp.Content.ReadAsStringAsync(ct);
-
-                        // Check for transient errors
-                        if (IsTransientError(errorBody) && attempt < MaxRetries - 1)
-                        {
-                            await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt + 1)), ct);
-                            break;
-                        }
-
                         throw new HttpRequestException(
                             $"Compliance {(int)resp.StatusCode} [{cmdletName}]: {Truncate(errorBody, 500)}",
                             null, resp.StatusCode);
@@ -245,10 +239,10 @@ public sealed class PurviewScanner : IScanProvider
             }
             catch (HttpRequestException ex) when (
                 attempt < MaxRetries - 1 &&
-                (ex.StatusCode == null || (int)ex.StatusCode >= 500))
+                (ex.StatusCode == null || (int)ex.StatusCode >= 500 || (int)ex.StatusCode == 429 || IsTransientError(ex.Message)))
             {
                 results.Clear();
-                await Task.Delay(TimeSpan.FromSeconds((attempt + 1) * 2), ct);
+                await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt + 1)), ct);
                 currentUrl = url;
             }
         }
@@ -327,9 +321,10 @@ public sealed class PurviewScanner : IScanProvider
                 }
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            context.ReportProgress($"Failed to enumerate Compliance role groups: {ex.Message}", 2);
+            // An empty list would read as "no role groups"; fail the category instead.
+            throw new InvalidOperationException($"Failed to enumerate Compliance role groups: {ex.Message}", ex);
         }
     }
 

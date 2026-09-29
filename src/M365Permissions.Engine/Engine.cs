@@ -106,10 +106,28 @@ public sealed class Engine : IDisposable
 
     // ── Authentication ──────────────────────────────────────────
 
+    /// <summary>Where sign-in URLs open; the GUI claims them while it drives a request.</summary>
+    public BrowserPrompt Prompt => _auth.Prompt;
+
     public async Task ConnectAsync(CancellationToken ct = default)
     {
-        await _auth.AuthenticateAsync(ct);
-        InitializeClients();
+        try
+        {
+            await _auth.AuthenticateAsync(ct);
+        }
+        finally
+        {
+            // Also after a partial failure: tokens may be stored, and stale clients would keep the old tenant's state.
+            if (_auth.IsConnected) InitializeClients();
+        }
+    }
+
+    /// <summary>Create the clients if they're missing (after Disconnect, or a connect that never finished).</summary>
+    [System.Diagnostics.CodeAnalysis.MemberNotNull(nameof(_graphClient), nameof(_orchestrator))]
+    private void EnsureClients()
+    {
+        if (_graphClient == null || _orchestrator == null)
+            InitializeClients();
     }
 
     /// <summary>
@@ -118,7 +136,8 @@ public sealed class Engine : IDisposable
     /// </summary>
     public async Task<UserCountInfo?> GetUserCountAsync(CancellationToken ct = default)
     {
-        if (!_auth.IsConnected || _graphClient == null) return null;
+        if (!_auth.IsConnected) return null;
+        EnsureClients();
 
         try
         {
@@ -147,6 +166,8 @@ public sealed class Engine : IDisposable
 
     public void Disconnect()
     {
+        // A running scan can't continue without tokens.
+        _orchestrator?.CancelScan();
         _auth.SignOut();
         _graphClient = null;
         _spClient = null;
@@ -180,6 +201,7 @@ public sealed class Engine : IDisposable
         await ReconsentAsync(scanTypes: null, includeGraph: true, ct);
     }
 
+    [System.Diagnostics.CodeAnalysis.MemberNotNull(nameof(_graphClient), nameof(_spClient), nameof(_exoClient), nameof(_orchestrator))]
     private void InitializeClients()
     {
         _graphClient = new GraphClient(_auth, _config.MaxThreads, _config.MaxJobRetries);
@@ -252,12 +274,22 @@ public sealed class Engine : IDisposable
     // ── Scanning ────────────────────────────────────────────────
 
     public async Task<long> StartScanAsync(List<string> scanTypes, CancellationToken ct = default)
+        => (await StartScanDetailedAsync(scanTypes, ct)).ScanId;
+
+    /// <summary>Start a scan and return its ID plus account-check warnings (missing roles or scopes).</summary>
+    public async Task<ScanStartResult> StartScanDetailedAsync(List<string> scanTypes, CancellationToken ct = default)
     {
         if (!_auth.IsConnected)
-            throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
+            throw new InvalidOperationException("Not connected. Connect to a tenant first.");
 
-        if (_orchestrator == null)
-            InitializeClients();
+        EnsureClients();
+
+        // Checked here too so a second start doesn't run consent flows and leave an orphaned Pending scan row.
+        if (_orchestrator!.IsScanning)
+            throw new InvalidOperationException("A scan is already in progress.");
+
+        // Fresh tokens carry the roles held now (e.g. a PIM activation since sign-in).
+        _auth.DropCachedAccessTokens();
 
         // Make sure the user has consented to the Graph permissions each selected scan needs.
         // This may open a browser tab for incremental consent on first use of a category.
@@ -265,7 +297,9 @@ public sealed class Engine : IDisposable
 
         // Non-Graph APIs (Exchange, Azure, Power BI, DevOps, etc.) require separate resource consent.
         // Acquire these up front so scans don't fail later without ever prompting the user.
-        await _auth.EnsureResourceConsentForCategoriesAsync(scanTypes, ct);
+        var unavailable = await _auth.EnsureResourceConsentForCategoriesAsync(scanTypes, ct);
+
+        var accountNotes = await CheckAccountAsync(scanTypes, unavailable, ct);
 
         var scan = new ScanInfo
         {
@@ -285,6 +319,7 @@ public sealed class Engine : IDisposable
         {
             ScanId = scanId,
             TenantDomain = _auth.TenantDomain ?? "",
+            TenantId = _auth.TenantId ?? "",
             UserPrincipalName = _auth.UserPrincipalName ?? "",
             Config = _config,
             ReportProgress = (_, _) => { },
@@ -293,9 +328,37 @@ public sealed class Engine : IDisposable
             FailTarget = () => { }
         };
 
-        _orchestrator!.StartScan(context, scanTypes);
+        // Consent is settled; the scan task inherits this and never opens a sign-in window.
+        using (_auth.SuppressInteraction())
+            _orchestrator!.StartScan(context, scanTypes, accountNotes);
         _auditRepo.Log("ScanStarted", _auth.UserPrincipalName ?? "", $"Scan started: {string.Join(", ", scanTypes)}", scanId);
-        return scanId;
+        return new ScanStartResult
+        {
+            ScanId = scanId,
+            Warnings = accountNotes.Where(n => n.Level <= 2)
+                .Select(n => string.IsNullOrEmpty(n.Category) ? n.Message : $"{n.Category}: {n.Message}")
+                .ToList()
+        };
+    }
+
+    /// <summary>Evaluate the roles and scopes in the tokens the selected categories use. Never prompts.</summary>
+    private async Task<List<AccountNote>> CheckAccountAsync(List<string> scanTypes, List<ResourcePrincipalNotFoundException> unavailable, CancellationToken ct)
+    {
+        var claims = new Dictionary<string, TokenClaims?>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            // Consent was settled above, so this is a silent refresh-token redemption.
+            claims["graph"] = TokenClaims.TryParse(await _auth.GetAccessTokenAsync("graph", ct));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* the scan itself will report Graph failures */ }
+
+        foreach (var category in scanTypes)
+            foreach (var resource in DelegatedAuth.GetRequiredResourceKeysForCategory(category))
+                claims.TryAdd(resource, _auth.GetCachedTokenClaims(resource));
+
+        try { return AccountCheck.Evaluate(scanTypes, claims, unavailable); }
+        catch { return new List<AccountNote>(); }
     }
 
     public void CancelScan() => _orchestrator?.CancelScan();
@@ -314,8 +377,13 @@ public sealed class Engine : IDisposable
     /// <summary>Pre-check permissions for the requested scan types before starting.</summary>
     public async Task<Dictionary<string, List<string>>> CheckPermissionsAsync(List<string> scanTypes, CancellationToken ct = default)
     {
-        if (!_auth.IsConnected || _graphClient == null)
-            throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
+        if (!_auth.IsConnected)
+            throw new InvalidOperationException("Not connected. Connect to a tenant first.");
+
+        EnsureClients();
+
+        // Fresh tokens, so roles activated since sign-in are seen.
+        _auth.DropCachedAccessTokens();
 
         // Make sure each requested scan's Graph scopes are consented before running pre-check probes,
         // otherwise the probes themselves would fail with 403/AADSTS errors that aren't really

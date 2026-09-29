@@ -25,16 +25,33 @@ public static class ApiRoutes
         // ── Authentication ──────────────────────────────────────
         server.Route("POST", "/api/connect", async (ctx, _) =>
         {
+            using var prompt = BeginPrompt(ctx, engine);
             try
             {
-                await engine.ConnectAsync();
+                await engine.ConnectAsync(prompt?.Token ?? default);
                 var status = engine.GetStatus();
                 await WebServer.WriteJson(ctx.Response, 200, ApiResponse<StatusResponse>.Ok(status));
+            }
+            catch (OperationCanceledException)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(SignInCancelled));
             }
             catch (Exception ex)
             {
                 await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(ex.Message));
             }
+        });
+
+        // Sign-in URL the GUI should open in its popup (see BeginPrompt), or no data.
+        server.Route("GET", "/api/auth/prompt", async (ctx, _) =>
+        {
+            await WebServer.WriteJson(ctx.Response, 200, ApiResponse<Auth.PendingPrompt?>.Ok(engine.Prompt.Claim()));
+        });
+
+        server.Route("POST", "/api/auth/cancel", async (ctx, _) =>
+        {
+            engine.Prompt.CancelGuiOperations();
+            await WebServer.WriteJson(ctx.Response, 200, ApiResponse.Ok());
         });
 
         server.Route("POST", "/api/disconnect", async (ctx, _) =>
@@ -45,6 +62,7 @@ public static class ApiRoutes
 
         server.Route("POST", "/api/reconsent", async (ctx, _) =>
         {
+            using var prompt = BeginPrompt(ctx, engine);
             try
             {
                 var body = await WebServer.ReadJson<JsonElement>(ctx.Request);
@@ -66,9 +84,13 @@ public static class ApiRoutes
                     }
                 }
 
-                await engine.ReconsentAsync(scanTypes.Count > 0 ? scanTypes : null, includeGraph);
+                await engine.ReconsentAsync(scanTypes.Count > 0 ? scanTypes : null, includeGraph, prompt?.Token ?? default);
                 var status = engine.GetStatus();
                 await WebServer.WriteJson(ctx.Response, 200, ApiResponse<StatusResponse>.Ok(status));
+            }
+            catch (OperationCanceledException)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(SignInCancelled));
             }
             catch (Exception ex)
             {
@@ -106,11 +128,15 @@ public static class ApiRoutes
                 return;
             }
 
+            using var prompt = BeginPrompt(ctx, engine);
             try
             {
-                var scanId = await engine.StartScanAsync(request.ScanTypes);
-                await WebServer.WriteJson(ctx.Response, 200,
-                    ApiResponse<object>.Ok(new { scanId }));
+                var result = await engine.StartScanDetailedAsync(request.ScanTypes, prompt?.Token ?? default);
+                await WebServer.WriteJson(ctx.Response, 200, ApiResponse<ScanStartResult>.Ok(result));
+            }
+            catch (OperationCanceledException)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(SignInCancelled));
             }
             catch (InvalidOperationException ex)
             {
@@ -207,9 +233,26 @@ public static class ApiRoutes
                 return;
             }
 
-            var results = await engine.CheckPermissionsAsync(scanTypes);
-            await WebServer.WriteJson(ctx.Response, 200,
-                ApiResponse<Dictionary<string, List<string>>>.Ok(results));
+            using var prompt = BeginPrompt(ctx, engine);
+            try
+            {
+                var results = await engine.CheckPermissionsAsync(scanTypes, prompt?.Token ?? default);
+                await WebServer.WriteJson(ctx.Response, 200,
+                    ApiResponse<Dictionary<string, List<string>>>.Ok(results));
+            }
+            catch (OperationCanceledException)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(SignInCancelled));
+            }
+            catch (Auth.OAuthCallbackException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 403, ApiResponse.Fail(
+                    $"Consent required for the pre-check but it did not complete: {ex.Message}"));
+            }
+            catch (Exception ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail($"Pre-check failed: {ex.Message}"));
+            }
         });
 
         // ── Scan Results ────────────────────────────────────────
@@ -562,6 +605,17 @@ public static class ApiRoutes
             }
         });
     }
+
+    private const string SignInCancelled = "Sign-in was cancelled.";
+
+    /// <summary>
+    /// For requests sent with X-M365-Prompt: gui, hand sign-in URLs to the GUI (which opens and closes
+    /// its own popup) instead of the system browser, until the returned operation is disposed.
+    /// </summary>
+    private static Auth.BrowserPrompt.GuiOperation? BeginPrompt(System.Net.HttpListenerContext ctx, Engine engine)
+        => string.Equals(ctx.Request.Headers["X-M365-Prompt"], "gui", StringComparison.OrdinalIgnoreCase)
+            ? engine.Prompt.BeginGuiOperation()
+            : null;
 
     // ── Request DTOs ────────────────────────────────────────────
     private sealed class ScanStartRequest

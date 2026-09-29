@@ -12,6 +12,9 @@ public sealed class ResourcePrincipalNotFoundException : Exception
     public string Resource { get; }
     public string? AadErrorCode { get; }
 
+    /// <summary>The service has no service principal in the tenant, i.e. the tenant doesn't use it: nothing to scan.</summary>
+    public bool NotProvisioned => AadErrorCode is "AADSTS500011" or "AADSTS650052";
+
     public ResourcePrincipalNotFoundException(string resource, string? aadErrorCode, string message)
         : base(message)
     {
