@@ -1,3 +1,6 @@
+# 2.1.0
+- fix auth issues and some other long standing minor bugs
+
 # 2.0.7-preview
 - fix button and improve publish pipeline logic
 
