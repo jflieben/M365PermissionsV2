@@ -1,3 +1,6 @@
+# 2.2.0
+- v2.2.0
+
 # 2.1.0
 - fix auth issues and some other long standing minor bugs
 
