@@ -32,7 +32,7 @@ public sealed class ExchangeRestClient
     public ExchangeRestClient(DelegatedAuth auth)
     {
         _auth = auth;
-        _http = new HttpClient();
+        _http = new HttpClient { Timeout = RetryPolicy.HttpTimeout };
     }
 
     /// <summary>
@@ -48,13 +48,14 @@ public sealed class ExchangeRestClient
         var results = new List<JsonElement>();
         string? nextLink = null;
         var url = $"{_baseUrl}/adminapi/beta/{organization}/InvokeCommand";
-        var throttleRetries = 0;
 
         for (int attempt = 0; attempt < MaxRetries; attempt++)
         {
             try
             {
                 var currentUrl = nextLink ?? url;
+                // Throttle budget per page: a long listing may legitimately be throttled more than six times overall.
+                var throttleRetries = 0;
 
                 do
                 {
@@ -83,8 +84,8 @@ public sealed class ExchangeRestClient
                     // Throttled: wait as told and retry the same page.
                     if ((int)response.StatusCode == 429 && throttleRetries < MaxThrottleRetries)
                     {
+                        await Task.Delay(RetryPolicy.RetryAfter(response.Headers.RetryAfter) ?? RetryPolicy.ThrottleBackoff(throttleRetries), ct);
                         throttleRetries++;
-                        await Task.Delay(response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(5 * throttleRetries), ct);
                         continue;
                     }
 
@@ -114,7 +115,7 @@ public sealed class ExchangeRestClient
                             null, response.StatusCode);
                     }
 
-                    var doc = await JsonDocument.ParseAsync(
+                    using var doc = await JsonDocument.ParseAsync(
                         await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
 
                     var root = doc.RootElement;
@@ -133,16 +134,14 @@ public sealed class ExchangeRestClient
                         nextLink = nl2.GetString();
 
                     currentUrl = nextLink;
+                    throttleRetries = 0;
 
                 } while (currentUrl != null);
 
                 return results; // Success, exit retry loop
 
             }
-            catch (HttpRequestException ex) when (
-                attempt < MaxRetries - 1 &&
-                (ex.StatusCode == null || (int)ex.StatusCode >= 500 ||
-                 (ex.Message != null && TransientErrorCodes.Any(code => ex.Message.Contains(code, StringComparison.OrdinalIgnoreCase)))))
+            catch (Exception ex) when (attempt < MaxRetries - 1 && IsRetryable(ex, ct))
             {
                 // Reset ALL pagination state before retrying from scratch: both the accumulated
                 // results and the nextLink cursor. Otherwise the retry resumed mid-pagination
@@ -155,6 +154,17 @@ public sealed class ExchangeRestClient
 
         return results;
     }
+
+    /// <summary>
+    /// Network errors, 5xx, 429 (page throttle budget spent), Exchange's transient error codes and
+    /// HttpClient timeouts are retried; auth and other client errors are not.
+    /// </summary>
+    internal static bool IsRetryable(Exception ex, CancellationToken ct) => ex switch
+    {
+        HttpRequestException h => h.StatusCode == null || (int)h.StatusCode >= 500 || (int)h.StatusCode == 429 ||
+            (h.Message != null && TransientErrorCodes.Any(code => h.Message.Contains(code, StringComparison.OrdinalIgnoreCase))),
+        _ => RetryPolicy.IsTimeout(ex, ct)
+    };
 
     private static string Truncate(string s, int max)
         => s.Length <= max ? s : s[..max] + "...";
@@ -187,6 +197,17 @@ public sealed class ExchangeRestClient
             {
                 ["Identity"] = identity
             }, ct);
+    }
+
+    /// <summary>Resolve one recipient (mailbox, mail user, group, guest) by any identity form. Null when not found.</summary>
+    public async Task<JsonElement?> GetRecipientAsync(string organization, string identity, CancellationToken ct = default)
+    {
+        var results = await InvokeCommandAsync(organization, "Get-Recipient",
+            new Dictionary<string, object>
+            {
+                ["Identity"] = identity
+            }, ct);
+        return results.Count > 0 ? results[0] : null;
     }
 
     /// <summary>Get mailbox folder statistics to enumerate all folders.</summary>

@@ -6,14 +6,13 @@
     Author               = 'Jos Lieben (jos@lieben.nu)'
     CompanyName          = 'JSolve B.V.'
     Copyright            = 'https://jsolve.nl/commercial-use.html'
-    HelpInfoURI          = 'https://m365permissions.com'
     Description          = @'
 M365Permissions - Microsoft 365 & Azure Permission Scanner
 
-For enterprise Azure-native, see https://www.m365permissions.com
+For scheduled, unattended scans with change alerts, a risk queue and item-level depth, see the M365Permissions Cloud Edition, which runs in your own Azure subscription: https://m365permissions.com
 
-This module reports on permissions across SharePoint, Entra ID, Exchange Online, OneDrive, Power BI, Power Platform, Azure RBAC, and Azure DevOps.
-It can compare over time, scan multiple tenants and show an overview of all permissions for e.g. a specific user.
+This module reports on permissions across SharePoint, OneDrive, Entra ID, Teams, Exchange Online, Power BI, Power Platform, Azure RBAC, Azure DevOps and Purview, scores them with risk policies that include remediation advice, and compares scans over time.
+It can scan multiple tenants and show an overview of all permissions for e.g. a specific user.
 
 INSTALLATION:
     Install-PSResource -Name M365Permissions -Repository PSGallery
@@ -49,7 +48,11 @@ Free for non-commercial use. See https://jsolve.nl/commercial-use.html
         'Compare-M365Scans',
         'Get-M365Config',
         'Set-M365Config',
-        'Get-M365ScanStatus'
+        'Get-M365ScanStatus',
+        'Get-M365Scan',
+        'Get-M365RiskSummary',
+        'Remove-M365Scan',
+        'Invoke-M365PolicyEvaluation'
     )
 
     CmdletsToExport      = @()

@@ -27,6 +27,7 @@ public sealed class Engine : IDisposable
     private readonly AuditRepository _auditRepo;
     private readonly PolicyRepository _policyRepo;
     private readonly LogRepository _logRepo;
+    private readonly InsightRepository _insightRepo;
     private readonly TokenCache _tokenCache;
     private readonly DelegatedAuth _auth;
     private readonly ExcelExporter _excelExporter;
@@ -53,6 +54,7 @@ public sealed class Engine : IDisposable
         _auditRepo = new AuditRepository(_db);
         _policyRepo = new PolicyRepository(_db);
         _logRepo = new LogRepository(_db);
+        _insightRepo = new InsightRepository(_db);
 
         // B13: any scan still marked Running/Pending belongs to a previous process that died
         // mid-scan (progress lives in the engine); mark them Failed so they don't show forever.
@@ -65,19 +67,20 @@ public sealed class Engine : IDisposable
         _auth = new DelegatedAuth(_tokenCache);
         _excelExporter = new ExcelExporter();
         _csvExporter = new CsvExporter();
-        _comparisonEngine = new ComparisonEngine(_permRepo);
+        _comparisonEngine = new ComparisonEngine(_permRepo, _scanRepo);
 
         _config = LoadConfig();
 
-        // Seed default policy rules if none exist yet
-        SeedDefaultPolicies();
+        // Insert missing built-in policies and upgrade the ones the user never edited.
+        SyncDefaultPolicies();
+        PolicyEngine.ConfigurationWarning += OnPolicyConfigurationWarning;
 
         // Try to restore previous session from persisted refresh token
         _sessionRestoreTask = Task.Run(async () =>
         {
             try
             {
-                if (await _auth.TryRestoreSessionAsync())
+                if (await _auth.TryRestoreSessionAsync() && _orchestrator?.IsScanning != true)
                     InitializeClients();
             }
             catch { /* best effort — user can connect manually */ }
@@ -101,7 +104,8 @@ public sealed class Engine : IDisposable
         ModuleVersion = ModuleVersion,
         Scanning = _orchestrator?.IsScanning ?? false,
         ActiveScanId = _orchestrator?.IsScanning == true ? _orchestrator.ActiveScanId : null,
-        RefreshTokenExpiry = _auth.RefreshTokenExpiry?.ToString("O")
+        RefreshTokenExpiry = _auth.RefreshTokenExpiry?.ToString("O"),
+        SharePointAdminUrl = _auth.IsConnected ? _auth.SharePointAdminUrl : null
     };
 
     // ── Authentication ──────────────────────────────────────────
@@ -111,6 +115,7 @@ public sealed class Engine : IDisposable
 
     public async Task ConnectAsync(CancellationToken ct = default)
     {
+        ThrowIfScanning();
         try
         {
             await _auth.AuthenticateAsync(ct);
@@ -141,7 +146,9 @@ public sealed class Engine : IDisposable
 
         try
         {
-            var result = await _graphClient.GetAsync("users?$count=true&$top=1&$select=id", eventualConsistency: true, ct: ct);
+            // Enabled member accounts: guests and disabled accounts barely add scan work.
+            var result = await _graphClient.GetAsync(
+                "users?$count=true&$top=1&$select=id&$filter=accountEnabled eq true and userType eq 'Member'", eventualConsistency: true, ct: ct);
             if (result == null) return null;
 
             long count = 0;
@@ -150,11 +157,12 @@ public sealed class Engine : IDisposable
 
             string? recommendation = null;
             if (count > 1000)
-                recommendation = "Your tenant has over 1,000 users. For tenants this large, consider using M365Permissions.com for faster scans, managed infrastructure, and advanced reporting.";
-            else if (count > 500)
-                recommendation = "Your tenant has over 500 users. For larger tenants, M365Permissions.com offers managed scanning infrastructure and is recommended for best performance.";
+                recommendation = $"With {count:N0} accounts a full scan from this workstation can take hours, and it only runs while you are signed in. " +
+                    "The M365Permissions Cloud Edition runs scheduled delta scans unattended from your own Azure subscription, " +
+                    "with managed identity and extra scan nodes for large tenants.";
             else if (count > 250)
-                recommendation = "For growing tenants (250+ users), M365Permissions.com offers scheduled scans and historical tracking out of the box.";
+                recommendation = "The M365Permissions Cloud Edition schedules these scans (daily, weekly or continuous), compares every run with " +
+                    "the previous one and emails the changes or sends them to Microsoft Sentinel. It runs in your own Azure subscription.";
 
             return new UserCountInfo { UserCount = count, Recommendation = recommendation };
         }
@@ -180,6 +188,7 @@ public sealed class Engine : IDisposable
     /// </summary>
     public async Task ReconsentAsync(List<string>? scanTypes = null, bool includeGraph = true, CancellationToken ct = default)
     {
+        ThrowIfScanning();
         // Targeted re-consent (includeGraph=false) still needs an authenticated base session.
         // If not connected yet, bootstrap with Graph sign-in first.
         if (includeGraph || !_auth.IsConnected)
@@ -201,6 +210,16 @@ public sealed class Engine : IDisposable
         await ReconsentAsync(scanTypes: null, includeGraph: true, ct);
     }
 
+    /// <summary>
+    /// Re-connecting replaces the orchestrator and the shared auth state, which would orphan a running
+    /// scan (cancel and progress stop reaching it) or let it write another tenant's data into its scan row.
+    /// </summary>
+    private void ThrowIfScanning()
+    {
+        if (_orchestrator?.IsScanning == true)
+            throw new InvalidOperationException("A scan is running. Cancel it or wait for it to finish before connecting or re-consenting.");
+    }
+
     [System.Diagnostics.CodeAnalysis.MemberNotNull(nameof(_graphClient), nameof(_spClient), nameof(_exoClient), nameof(_orchestrator))]
     private void InitializeClients()
     {
@@ -208,7 +227,7 @@ public sealed class Engine : IDisposable
         _spClient = new SharePointRestClient(_auth, _graphClient);
         _exoClient = new ExchangeRestClient(_auth);
 
-        _orchestrator = new ScanOrchestrator(_db, _scanRepo, _permRepo, _policyRepo, _logRepo);
+        _orchestrator = new ScanOrchestrator(_db, _scanRepo, _permRepo, _policyRepo, _logRepo, _insightRepo);
         _orchestrator.RegisterProvider(new SharePointScanner(_spClient, _graphClient, _auth));
         _orchestrator.RegisterProvider(new EntraScanner(_graphClient));
         _orchestrator.RegisterProvider(new TeamsScanner(_graphClient));
@@ -372,6 +391,10 @@ public sealed class Engine : IDisposable
     public List<LogEntry> GetScanLogs(long scanId, int? maxLevel = null, string? category = null, int limit = 1000)
         => _logRepo.GetByScan(scanId, maxLevel, category, limit);
 
+    /// <summary>Coverage counters of a scan (category -> key -> value).</summary>
+    public Dictionary<string, Dictionary<string, long>> GetScanInsights(long scanId)
+        => _insightRepo.GetByScan(scanId);
+
     public ThrottleMetrics? GetThrottleMetrics() => _graphClient?.ThrottleManager.GetMetrics();
 
     /// <summary>Pre-check permissions for the requested scan types before starting.</summary>
@@ -414,7 +437,19 @@ public sealed class Engine : IDisposable
 
     // ── Results ─────────────────────────────────────────────────
 
-    public List<ScanInfo> GetScans(string? tenantId = null) => _scanRepo.GetAll(tenantId: tenantId);
+    public List<ScanInfo> GetScans(string? tenantId = null, int limit = 50) => _scanRepo.GetAll(limit, tenantId);
+
+    public ScanInfo? GetScan(long scanId) => _scanRepo.GetById(scanId);
+
+    /// <summary>
+    /// Scan the cmdlets use when none is given: the latest Completed/CompletedWithErrors scan of the
+    /// connected tenant, else of any tenant.
+    /// </summary>
+    public long? GetDefaultScanId()
+    {
+        var tenantId = _auth.IsConnected ? _auth.TenantId : null;
+        return (_scanRepo.GetLatestCompleted(tenantId) ?? (tenantId != null ? _scanRepo.GetLatestCompleted() : null))?.Id;
+    }
 
     public PagedResult<PermissionEntry> QueryPermissions(long scanId, string? category = null,
         string? search = null, int page = 1, int pageSize = 100,
@@ -422,10 +457,15 @@ public sealed class Engine : IDisposable
         Dictionary<string, string>? columnFilters = null)
         => _permRepo.Query(scanId, category, search, page, pageSize, sortColumn, sortDirection, columnFilters);
 
+    /// <summary>Every matching row of a scan, read a page at a time (for the -All cmdlet switch).</summary>
+    public IEnumerable<PermissionEntry> StreamPermissions(long scanId, string? category = null,
+        string[]? riskLevels = null, string? search = null)
+        => _permRepo.Stream(scanId, category, riskLevels, search);
+
     public List<string> GetCategories(long scanId)
         => _permRepo.GetCategories(scanId);
 
-    public PagedResult<PermissionEntry> QueryUserPermissions(long scanId, string userSearch, int page = 1, int pageSize = 100,
+    public UserPermissionsPage QueryUserPermissions(long scanId, string userSearch, int page = 1, int pageSize = 100,
         string? sortColumn = null, string? sortDirection = null,
         Dictionary<string, string>? columnFilters = null)
         => _permRepo.QueryUserPermissions(scanId, userSearch, page, pageSize, sortColumn, sortDirection, columnFilters);
@@ -433,72 +473,164 @@ public sealed class Engine : IDisposable
     public List<PermissionEntry> GetGroupMembers(long scanId, string groupId)
         => _permRepo.GetGroupMembers(scanId, groupId);
 
+    public List<PermissionEntry> GetSharePointGroupMembers(long scanId, string groupName, string? targetPath, string? targetId)
+        => _permRepo.GetSharePointGroupMembers(scanId, groupName, targetPath, targetId);
+
     public List<string> GetFilterOptions(long scanId, string column, string? category = null)
         => _permRepo.GetDistinctValues(scanId, column, category);
 
+    /// <summary>Delete a scan and all its rows. Refused while that scan is running.</summary>
+    public bool DeleteScan(long scanId)
+    {
+        if (_orchestrator?.IsScanning == true && _orchestrator.ActiveScanId == scanId)
+            throw new InvalidOperationException("This scan is still running. Cancel it before deleting it.");
+        var deleted = _scanRepo.Delete(scanId);
+        if (deleted)
+        {
+            InvalidateRiskDeltas();
+            _auditRepo.Log("ScanDeleted", _auth.UserPrincipalName ?? "", $"Deleted scan {scanId}");
+        }
+        return deleted;
+    }
+
     // ── Export ───────────────────────────────────────────────────
+
+    // ClosedXML holds the whole workbook in memory; above this, exports must use CSV.
+    public const long XlsxRowLimit = 250_000;
+
+    private const string XlsxContentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
     public (byte[] bytes, string fileName, string contentType) ExportScan(long scanId, string format, string? category = null)
     {
+        using var ms = new MemoryStream();
+        string fileName = "", contentType = "";
+        ExportScanToStream(scanId, format, category, ms, (f, c) => { fileName = f; contentType = c; });
+        return (ms.ToArray(), fileName, contentType);
+    }
+
+    /// <summary>Export straight to a file (CSV is streamed, never held in memory). Returns the file name used.</summary>
+    public string ExportScanToFile(long scanId, string format, string? category, string path)
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(path));
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
+        string fileName = "";
+        ExportScanToStream(scanId, format, category, fs, (f, _) => fileName = f);
+        return fileName;
+    }
+
+    /// <summary>
+    /// Validate, then call <paramref name="onStart"/> with file name and content type, then write the
+    /// export to <paramref name="output"/>. Validation errors are thrown before anything is written.
+    /// </summary>
+    public void ExportScanToStream(long scanId, string format, string? category, Stream output, Action<string, string> onStart)
+    {
         var scan = _scanRepo.GetById(scanId)
             ?? throw new KeyNotFoundException($"Scan {scanId} not found");
-
+        if (string.IsNullOrWhiteSpace(category)) category = null;
         var catSuffix = category ?? "All";
 
         if (format.Equals("csv", StringComparison.OrdinalIgnoreCase))
         {
-            // Stream the CSV a page at a time so a million-row scan doesn't materialise the whole
-            // result set (entry objects + string) in a default PS session (P3).
-            const int pageSize = 5000;
-            var bytes = _csvExporter.ExportPaged(afterId => _permRepo.GetPage(scanId, category, afterId, pageSize));
+            onStart($"M365Permissions_{catSuffix}_{scanId}.csv", "text/csv; charset=utf-8");
+            _csvExporter.Write(output, _permRepo.Stream(scanId, category));
             _auditRepo.Log("Export", _auth.UserPrincipalName ?? "", $"CSV export: scan {scanId}, category={catSuffix}");
-            return (bytes, $"M365Permissions_{catSuffix}_{scanId}.csv", "text/csv");
+            return;
         }
-        else
-        {
-            // ClosedXML holds the whole workbook in memory. Above a threshold this OOMs, so steer
-            // very large exports to CSV rather than failing opaquely (P3). Uses the whole-scan
-            // count as a cheap upper bound.
-            const long xlsxRowLimit = 250_000;
-            var count = _permRepo.Count(scanId);
-            if (count > xlsxRowLimit)
-                throw new InvalidOperationException(
-                    $"This scan has {count:N0} rows, which is too large for an XLSX export. Please export as CSV instead (or export a single category).");
 
-            var entries = _permRepo.GetAll(scanId, category);
-            var bytes = _excelExporter.Export(entries, catSuffix);
-            _auditRepo.Log("Export", _auth.UserPrincipalName ?? "", $"XLSX export: scan {scanId}, category={catSuffix}");
-            return (bytes, $"M365Permissions_{catSuffix}_{scanId}.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        var count = _permRepo.Count(scanId, category);
+        if (count > XlsxRowLimit)
+            throw new InvalidOperationException(category == null
+                ? $"This scan has {count:N0} rows, which is too large for an XLSX export. Export as CSV instead, or export a single category."
+                : $"Category {category} has {count:N0} rows, which is too large for an XLSX export. Export it as CSV instead.");
+
+        var entries = _permRepo.GetAll(scanId, category);
+        var bytes = _excelExporter.Export(entries, catSuffix, BuildExportMetadata(scan, category));
+        onStart($"M365Permissions_{catSuffix}_{scanId}.xlsx", XlsxContentType);
+        output.Write(bytes);
+        _auditRepo.Log("Export", _auth.UserPrincipalName ?? "", $"XLSX export: scan {scanId}, category={catSuffix}");
+    }
+
+    private ExportMetadata BuildExportMetadata(ScanInfo scan, string? category)
+    {
+        var progress = _scanRepo.GetProgress(scan.Id)
+            .Where(p => category == null || p.Category.Equals(category, StringComparison.OrdinalIgnoreCase)).ToList();
+        var notes = progress.Where(p => p.Status != "Completed")
+            .Select(p => $"{p.Category}: {p.Status}{(p.FailedTargets > 0 ? $", {p.FailedTargets:N0} targets failed" : "")}")
+            .ToList();
+        try
+        {
+            foreach (var (cat, values) in _insightRepo.GetByScan(scan.Id))
+            {
+                if (category != null && !cat.Equals(category, StringComparison.OrdinalIgnoreCase)) continue;
+                foreach (var (key, value) in values)
+                    if (InsightKeys.Describe(key, value) is { } text)
+                        notes.Add($"{cat}: {text}");
+            }
         }
+        catch { /* coverage counters are optional */ }
+
+        return new ExportMetadata
+        {
+            ScanId = scan.Id,
+            TenantDomain = scan.TenantDomain,
+            TenantId = scan.TenantId,
+            StartedAt = scan.StartedAt,
+            CompletedAt = scan.CompletedAt,
+            Status = scan.Status.ToString(),
+            ScanTypes = scan.ScanTypes,
+            Category = category ?? "",
+            ModuleVersion = ModuleVersion,
+            CategoryStatus = progress,
+            PartialNotes = notes,
+            RiskSummary = _scanRepo.GetRiskSummary(scan.Id, category)
+        };
     }
 
     // ── Comparison ──────────────────────────────────────────────
 
-    public ComparisonResult CompareScans(long oldScanId, long newScanId, string? category = null)
-        => _comparisonEngine.Compare(oldScanId, newScanId, category);
+    /// <summary>
+    /// Compare two scans of the same tenant. <paramref name="limit"/> caps each returned list; counts
+    /// are complete. Throws ArgumentException for scans of different tenants.
+    /// </summary>
+    public ComparisonResult CompareScans(long oldScanId, long newScanId, string? category = null, int? limit = null)
+        => _comparisonEngine.Compare(oldScanId, newScanId, string.IsNullOrWhiteSpace(category) ? null : category, limit);
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, RiskDelta> _riskDeltaCache = new();
+
+    private void InvalidateRiskDeltas() => _riskDeltaCache.Clear();
 
     /// <summary>
-    /// Risk delta vs the previous completed scan of the same tenant (O3). Returns null with
-    /// HasPrevious=false when there is no earlier scan to compare against.
+    /// Risk delta vs the previous Completed/CompletedWithErrors scan of the same tenant (O3), over the
+    /// categories completed in both. HasPrevious is false when there is no earlier scan.
     /// </summary>
     public RiskDelta GetRiskDelta(long scanId)
     {
+        if (_riskDeltaCache.TryGetValue(scanId, out var cached)) return cached;
+
         var scan = _scanRepo.GetById(scanId)
             ?? throw new KeyNotFoundException($"Scan {scanId} not found");
 
-        var previous = _scanRepo.GetAll(50, scan.TenantId)
+        var previous = _scanRepo.GetAll(200, scan.TenantId)
             .FirstOrDefault(s => s.Id < scanId &&
                 (s.Status is ScanStatus.Completed or ScanStatus.CompletedWithErrors));
 
         var delta = new RiskDelta { ScanId = scanId, PreviousScanId = previous?.Id };
         if (previous == null) return delta;
 
-        var cmp = _comparisonEngine.Compare(previous.Id, scanId);
-        delta.NewCritical = cmp.Added.Count(e => e.RiskLevel == "Critical");
-        delta.NewHigh = cmp.Added.Count(e => e.RiskLevel == "High");
-        delta.TotalAdded = cmp.Added.Count;
-        delta.TotalRemoved = cmp.Removed.Count;
+        var cmp = _comparisonEngine.Compare(previous.Id, scanId, limit: 0);
+        delta.NewCritical = cmp.NewCriticalCount;
+        delta.NewHigh = cmp.NewHighCount;
+        delta.TotalAdded = cmp.AddedCount;
+        delta.TotalRemoved = cmp.RemovedCount;
+        delta.TotalChanged = cmp.ChangedCount;
+        delta.IncludedCategories = cmp.IncludedCategories;
+        delta.ExcludedCategories = cmp.ExcludedCategories;
+        delta.FlaggedCategories = cmp.FlaggedCategories;
+
+        // Only finished scans are immutable enough to cache.
+        if (scan.Status is ScanStatus.Completed or ScanStatus.CompletedWithErrors)
+            _riskDeltaCache[scanId] = delta;
         return delta;
     }
 
@@ -543,7 +675,8 @@ public sealed class Engine : IDisposable
 
     public (byte[] bytes, string fileName, string contentType) ExportComparison(long oldScanId, long newScanId, string? category = null)
     {
-        var result = _comparisonEngine.Compare(oldScanId, newScanId, category);
+        // One row past the sheet limit is enough to know a sheet was cut off.
+        var result = CompareScans(oldScanId, newScanId, category, ExcelExporter.ComparisonSheetRowLimit + 1);
         var bytes = _excelExporter.ExportComparison(result);
         _auditRepo.Log("ComparisonExport", _auth.UserPrincipalName ?? "", $"Exported comparison: scan {oldScanId} vs {newScanId}");
         return (bytes, $"M365Permissions_Compare_{oldScanId}_vs_{newScanId}.xlsx",
@@ -560,8 +693,8 @@ public sealed class Engine : IDisposable
 
     // ── Risk Summary ────────────────────────────────────────────
 
-    public Dictionary<string, int> GetRiskSummary(long scanId)
-        => _scanRepo.GetRiskSummary(scanId);
+    public Dictionary<string, int> GetRiskSummary(long scanId, string? category = null)
+        => _scanRepo.GetRiskSummary(scanId, string.IsNullOrWhiteSpace(category) ? null : category);
 
     // ── Trends ──────────────────────────────────────────────────
 
@@ -585,70 +718,277 @@ public sealed class Engine : IDisposable
         if (_orchestrator?.IsScanning == true)
             throw new InvalidOperationException("Cannot reset database while a scan is running.");
         _db.ResetDatabase();
+        InvalidateRiskDeltas();
         AuditLog("database_reset", "Database cleared — all scans, permissions, and logs deleted");
     }
 
     // ── Policies ────────────────────────────────────────────────
 
-    public List<Policy> GetPolicies() => _policyRepo.GetAll();
+    // Config key holding built-in policy keys the user deleted, so startup doesn't re-insert them.
+    private const string SuppressedDefaultsKey = "suppressedDefaultPolicies";
 
-    public Policy? GetPolicy(long id) => _policyRepo.GetById(id);
+    public List<Policy> GetPolicies()
+    {
+        var policies = _policyRepo.GetAll();
+        PolicyRepository.AnnotateDefaults(policies, DefaultPolicies.GetAll());
+        return policies;
+    }
 
+    public Policy? GetPolicy(long id)
+    {
+        var policy = _policyRepo.GetById(id);
+        if (policy != null) PolicyRepository.AnnotateDefaults(new[] { policy }, DefaultPolicies.GetAll());
+        return policy;
+    }
+
+    /// <summary>Create a custom policy. Throws PolicyValidationException when it is invalid.</summary>
     public long CreatePolicy(Policy policy)
     {
+        policy.IsDefault = false;
+        policy.DefaultKey = "";
+        policy.DefaultHash = "";
+        ThrowIfInvalid(policy);
         var id = _policyRepo.Create(policy);
+        InvalidateRiskDeltas();
         _auditRepo.Log("PolicyCreated", _auth.UserPrincipalName ?? "", $"Created policy: {policy.Name}");
         return id;
     }
 
+    /// <summary>Create a policy from a JSON body, rejecting unknown properties.</summary>
+    public long CreatePolicy(JsonElement body)
+    {
+        var policy = new Policy();
+        ApplyPolicyPatch(policy, body);
+        return CreatePolicy(policy);
+    }
+
+    /// <summary>Replace a policy's definition. Built-in tracking fields are kept from the stored row.</summary>
     public void UpdatePolicy(Policy policy)
     {
+        var existing = _policyRepo.GetById(policy.Id)
+            ?? throw new KeyNotFoundException($"Policy {policy.Id} not found");
+        policy.IsDefault = existing.IsDefault;
+        policy.DefaultKey = existing.DefaultKey;
+        policy.DefaultHash = existing.DefaultHash;
+        ThrowIfInvalid(policy);
         _policyRepo.Update(policy);
+        InvalidateRiskDeltas();
         _auditRepo.Log("PolicyUpdated", _auth.UserPrincipalName ?? "", $"Updated policy: {policy.Name}");
+    }
+
+    /// <summary>
+    /// Merge the properties present in <paramref name="patch"/> onto the stored policy (missing
+    /// properties keep their value), validate and save.
+    /// </summary>
+    public Policy UpdatePolicy(long id, JsonElement patch)
+    {
+        var policy = _policyRepo.GetById(id) ?? throw new KeyNotFoundException($"Policy {id} not found");
+        ApplyPolicyPatch(policy, patch);
+        UpdatePolicy(policy);
+        return GetPolicy(id)!;
+    }
+
+    private static readonly HashSet<string> PolicyWritableProps = new(StringComparer.OrdinalIgnoreCase)
+        { "name", "description", "enabled", "severity", "categoryFilter", "conditions", "remediation" };
+
+    // Read-only properties a client may echo back from GET; ignored on write.
+    private static readonly HashSet<string> PolicyReadOnlyProps = new(StringComparer.OrdinalIgnoreCase)
+        { "id", "isDefault", "defaultKey", "defaultHash", "createdAt", "updatedAt", "isOutdatedDefault", "isModifiedDefault" };
+
+    private static void ApplyPolicyPatch(Policy policy, JsonElement patch)
+    {
+        if (patch.ValueKind != JsonValueKind.Object)
+            throw new PolicyValidationException(new() { "Request body must be a JSON object." });
+
+        var errors = new List<string>();
+        foreach (var prop in patch.EnumerateObject())
+        {
+            if (PolicyReadOnlyProps.Contains(prop.Name)) continue;
+            if (!PolicyWritableProps.Contains(prop.Name)) { errors.Add($"Unknown property '{prop.Name}'."); continue; }
+            try
+            {
+                switch (prop.Name.ToLowerInvariant())
+                {
+                    case "name": policy.Name = prop.Value.GetString() ?? ""; break;
+                    case "description": policy.Description = prop.Value.GetString() ?? ""; break;
+                    case "enabled": policy.Enabled = prop.Value.GetBoolean(); break;
+                    case "severity": policy.Severity = prop.Value.GetString() ?? ""; break;
+                    case "categoryfilter": policy.CategoryFilter = prop.Value.GetString() ?? ""; break;
+                    case "remediation": policy.Remediation = prop.Value.GetString() ?? ""; break;
+                    case "conditions": policy.Conditions = ParseConditions(prop.Value, errors); break;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                errors.Add($"Property '{prop.Name}' has the wrong type.");
+            }
+        }
+        if (errors.Count > 0) throw new PolicyValidationException(errors);
+    }
+
+    private static List<PolicyCondition> ParseConditions(JsonElement value, List<string> errors)
+    {
+        var list = new List<PolicyCondition>();
+        if (value.ValueKind != JsonValueKind.Array) { errors.Add("Property 'conditions' must be an array."); return list; }
+        foreach (var item in value.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) { errors.Add("Each condition must be an object."); continue; }
+            var cond = new PolicyCondition();
+            foreach (var p in item.EnumerateObject())
+            {
+                switch (p.Name.ToLowerInvariant())
+                {
+                    case "field": cond.Field = p.Value.GetString() ?? ""; break;
+                    case "operator": cond.Operator = p.Value.GetString() ?? ""; break;
+                    case "value": cond.Value = p.Value.ValueKind == JsonValueKind.String ? p.Value.GetString() ?? "" : p.Value.GetRawText(); break;
+                    default: errors.Add($"Unknown condition property '{p.Name}'."); break;
+                }
+            }
+            list.Add(cond);
+        }
+        return list;
+    }
+
+    private static void ThrowIfInvalid(Policy policy)
+    {
+        var errors = PolicyEngine.Validate(policy);
+        if (errors.Count > 0) throw new PolicyValidationException(errors);
     }
 
     public void DeletePolicy(long id)
     {
+        var existing = _policyRepo.GetById(id);
+        if (existing == null) return;
         _policyRepo.Delete(id);
-        _auditRepo.Log("PolicyDeleted", _auth.UserPrincipalName ?? "", $"Deleted policy #{id}");
+        if (existing.IsDefault && existing.DefaultKey.Length > 0)
+        {
+            var suppressed = GetSuppressedDefaults();
+            suppressed.Add(existing.DefaultKey);
+            _configRepo.Set(SuppressedDefaultsKey, string.Join(",", suppressed));
+        }
+        InvalidateRiskDeltas();
+        _auditRepo.Log("PolicyDeleted", _auth.UserPrincipalName ?? "", $"Deleted policy #{id} ({existing.Name})");
     }
 
+    private HashSet<string> GetSuppressedDefaults()
+        => new((_configRepo.Get(SuppressedDefaultsKey) ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
+            StringComparer.OrdinalIgnoreCase);
+
     /// <summary>
-    /// Delete all default policies and re-seed them from built-in definitions.
-    /// Custom (non-default) policies are preserved.
+    /// Delete all default policies and re-seed them from built-in definitions (including ones the
+    /// user deleted). Custom (non-default) policies are preserved.
     /// </summary>
     public int ResetDefaultPolicies()
     {
         _policyRepo.DeleteDefaults();
-        var defaults = DefaultPolicies.GetAll();
-        foreach (var p in defaults)
-            _policyRepo.Create(p);
-        _auditRepo.Log("PoliciesReset", _auth.UserPrincipalName ?? "", $"Reset {defaults.Count} default policies");
-        return defaults.Count;
+        _configRepo.Delete(SuppressedDefaultsKey);
+        var report = _policyRepo.SyncDefaults(DefaultPolicies.GetAll(), DefaultPolicies.LegacyNames);
+        InvalidateRiskDeltas();
+        _auditRepo.Log("PoliciesReset", _auth.UserPrincipalName ?? "", $"Reset {report.Inserted.Count} default policies");
+        return report.Inserted.Count;
     }
 
-    private void SeedDefaultPolicies()
+    /// <summary>What the startup sync of built-in policies changed (for diagnostics and tests).</summary>
+    public DefaultPolicySyncReport? LastDefaultPolicySync { get; private set; }
+
+    private void SyncDefaultPolicies()
     {
-        if (_policyRepo.Count() > 0) return; // Already has policies
-        var defaults = DefaultPolicies.GetAll();
-        foreach (var p in defaults)
-            _policyRepo.Create(p);
+        try
+        {
+            var report = _policyRepo.SyncDefaults(DefaultPolicies.GetAll(), DefaultPolicies.LegacyNames, GetSuppressedDefaults());
+            LastDefaultPolicySync = report;
+            var changes = report.Upgraded.Count + report.LegacyReplaced.Count + report.LegacyRemoved.Count;
+            if (changes > 0)
+                _auditRepo.Log("PoliciesUpgraded", "system",
+                    $"Built-in policies updated: {report.Upgraded.Count + report.LegacyReplaced.Count} upgraded, " +
+                    $"{report.Inserted.Count} added, {report.LegacyRemoved.Count} obsolete removed, {report.KeptEdited.Count} edited kept");
+        }
+        catch (Exception ex)
+        {
+            try { _logRepo.Insert(null, 1, "Policies", $"Built-in policy upgrade failed: {ex.Message}"); } catch { }
+        }
     }
 
-    public PolicyEvaluationResult EvaluatePolicies(long scanId, string? category = null, int limit = 500)
+    private void OnPolicyConfigurationWarning(string message)
     {
+        try { _logRepo.Insert(_orchestrator?.IsScanning == true ? _orchestrator.ActiveScanId : null, 2, "Policies", message); }
+        catch { /* best effort */ }
+    }
+
+    /// <summary>The enabled policies an entry matches, most severe first (with remediation advice).</summary>
+    public List<PolicyViolation> MatchPolicies(PermissionEntry entry)
+        => PolicyEngine.Evaluate(entry, _policyRepo.GetEnabled());
+
+    /// <summary>
+    /// Evaluate every row of a scan against the enabled policies, a page at a time. Returns match
+    /// counts per policy and the first <paramref name="maxViolations"/> violating rows, most severe first.
+    /// </summary>
+    public PolicyEvaluationResult EvaluatePolicies(long scanId, string? category = null, int maxViolations = 500)
+    {
+        if (_scanRepo.GetById(scanId) == null) throw new KeyNotFoundException($"Scan {scanId} not found");
+        if (string.IsNullOrWhiteSpace(category)) category = null;
+        maxViolations = Math.Clamp(maxViolations, 0, 5000);
+
         var policies = _policyRepo.GetEnabled();
-        if (policies.Count == 0) return new();
+        var result = new PolicyEvaluationResult { ScanId = scanId, Category = category };
+        foreach (var p in policies)
+            foreach (var error in PolicyEngine.Validate(p))
+                result.Warnings.Add($"{p.Name}: {error}");
+        if (policies.Count == 0) return result;
 
-        var entries = _permRepo.GetAll(scanId, category);
-        if (entries.Count > limit) entries = entries.Take(limit).ToList();
+        var counts = policies.ToDictionary(p => p.Id, p => new PolicyMatchCount { PolicyId = p.Id, PolicyName = p.Name, Severity = p.Severity });
+        // Keep up to maxViolations rows per severity, then take the most severe overall.
+        var buckets = new Dictionary<int, List<PolicyViolationRow>>();
+        foreach (var entry in _permRepo.Stream(scanId, category))
+        {
+            result.EntriesEvaluated++;
+            var violations = PolicyEngine.Evaluate(entry, policies);
+            if (violations.Count == 0) continue;
+            result.EntriesWithViolations++;
+            foreach (var v in violations)
+                if (counts.TryGetValue(v.PolicyId, out var c)) c.Count++;
 
-        var violations = PolicyEngine.EvaluateBatch(entries, policies);
-        var matchingEntries = new Dictionary<int, PermissionEntry>();
-        foreach (var idx in violations.Keys)
-            matchingEntries[idx] = entries[idx];
+            var rank = PolicyEngine.SeverityRank(violations[0].Severity);
+            if (!buckets.TryGetValue(rank, out var bucket)) buckets[rank] = bucket = new();
+            if (bucket.Count < maxViolations) bucket.Add(new PolicyViolationRow { Entry = entry, Violations = violations });
+        }
 
-        return new PolicyEvaluationResult { Violations = violations, Entries = matchingEntries };
+        result.PerPolicy = counts.Values.Where(c => c.Count > 0)
+            .OrderByDescending(c => PolicyEngine.SeverityRank(c.Severity)).ThenByDescending(c => c.Count).ToList();
+        result.Violations = buckets.OrderByDescending(b => b.Key).SelectMany(b => b.Value).Take(maxViolations).ToList();
+        result.Truncated = result.EntriesWithViolations > result.Violations.Count;
+        return result;
+    }
+
+    /// <summary>
+    /// Re-apply the current enabled policies to the stored rows of a scan (risk is otherwise frozen at
+    /// scan time). Updates risk_level/risk_reason in batches.
+    /// </summary>
+    public RescoreResult RescoreScan(long scanId)
+    {
+        if (_scanRepo.GetById(scanId) == null) throw new KeyNotFoundException($"Scan {scanId} not found");
+        if (_orchestrator?.IsScanning == true && _orchestrator.ActiveScanId == scanId)
+            throw new InvalidOperationException("This scan is still running; re-score it after it finishes.");
+
+        var policies = _policyRepo.GetEnabled();
+        var result = new RescoreResult { ScanId = scanId };
+        const int batchSize = 5000;
+        long afterId = 0;
+        while (true)
+        {
+            var page = _permRepo.GetPage(scanId, null, afterId, batchSize);
+            if (page.Count == 0) break;
+            PolicyEngine.ClassifyBatch(page, policies);
+            result.EntriesChanged += _permRepo.UpdateRisk(page.Select(e => (e.Id, e.RiskLevel, e.RiskReason)).ToList());
+            result.EntriesScored += page.Count;
+            afterId = page[^1].Id;
+        }
+
+        result.RiskSummary = _scanRepo.GetRiskSummary(scanId);
+        InvalidateRiskDeltas();
+        _auditRepo.Log("ScanRescored", _auth.UserPrincipalName ?? "",
+            $"Re-scored scan {scanId} with {policies.Count} policies: {result.EntriesChanged:N0} of {result.EntriesScored:N0} rows changed", scanId);
+        return result;
     }
 
     // ── HTTP Server ─────────────────────────────────────────────
@@ -683,6 +1023,7 @@ public sealed class Engine : IDisposable
     {
         // Cancel running scans
         _orchestrator?.Shutdown();
+        PolicyEngine.ConfigurationWarning -= OnPolicyConfigurationWarning;
 
         // Stop web server (synchronous fallback if StopServerAsync wasn't called)
         _webServer?.Dispose();

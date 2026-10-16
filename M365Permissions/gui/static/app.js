@@ -26,10 +26,28 @@
             });
             return res.json();
         },
+        async del(url) {
+            const res = await fetch(`/api${url}`, { method: 'DELETE' });
+            return res.json();
+        },
         async getBlob(url) {
             return fetch(`/api${url}`);
         }
     };
+
+    // Statuses of a scan that finished and has usable results.
+    const isDoneScan = s => s.status === 'Completed' || s.status === 'CompletedWithErrors';
+
+    // Timestamps without a zone are UTC (older SQLite values); parse them as such.
+    function parseDate(value) {
+        if (!value) return null;
+        const s = String(value);
+        const hasZone = /[zZ]$|[+-]\d\d:?\d\d$/.test(s);
+        const d = new Date(hasZone ? s : s.replace(' ', 'T') + 'Z');
+        return isNaN(d.getTime()) ? null : d;
+    }
+    const fmtDate = v => { const d = parseDate(v); return d ? d.toLocaleDateString() : '-'; };
+    const fmtDateTime = v => { const d = parseDate(v); return d ? d.toLocaleString() : '-'; };
 
     // ── Toast Notifications ─────────────────────────────────────
     function showToast(message, type = 'info', durationMs = 4000) {
@@ -69,7 +87,8 @@
         moduleVersion: '',
         scanRunning: false,
         currentScanId: null,
-        refreshTokenExpiry: null
+        refreshTokenExpiry: null,
+        sharePointAdminUrl: null
     };
 
     let pollInterval = null;
@@ -94,6 +113,7 @@
                 state.scanRunning = res.data.scanning || false;
                 state.currentScanId = res.data.activeScanId;
                 state.refreshTokenExpiry = res.data.refreshTokenExpiry || null;
+                state.sharePointAdminUrl = res.data.sharePointAdminUrl || null;
                 updateNavStatus();
             }
         } catch { /* ignore polling errors */ }
@@ -170,9 +190,13 @@
             </div>
         `;
         overlay.style.display = 'flex';
-        overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) overlay.style.display = 'none';
-        });
+        // Attached once: showModal is called repeatedly on the same overlay.
+        if (!overlay.dataset.backdropClose) {
+            overlay.dataset.backdropClose = '1';
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) overlay.style.display = 'none';
+            });
+        }
     }
 
     function closeModal() {
@@ -275,7 +299,22 @@
     function getRemediationLink(entry) {
         const cat = (entry.category || '').toLowerCase();
         if (cat === 'sharepoint' || cat === 'onedrive') {
-            return { label: 'SharePoint Admin Center', url: `https://${state.tenantDomain?.split('.')[0] || 'tenant'}-admin.sharepoint.com/_layouts/15/online/AdminHome.aspx#/siteManagement` };
+            // The engine knows the real SharePoint tenant name; the tenant domain often differs from it.
+            return state.sharePointAdminUrl
+                ? { label: 'SharePoint Admin Center', url: `${state.sharePointAdminUrl}/_layouts/15/online/AdminHome.aspx#/siteManagement` }
+                : { label: 'Microsoft 365 Admin Center', url: 'https://admin.microsoft.com/' };
+        }
+        if (cat === 'teams') {
+            return { label: 'Teams Admin Center', url: 'https://admin.teams.microsoft.com/teams/manage' };
+        }
+        if (cat === 'azuredevops') {
+            const org = ((entry.targetPath || '').split('/')[1] || '').trim();
+            return org
+                ? { label: 'Azure DevOps Permissions', url: `https://dev.azure.com/${encodeURIComponent(org)}/_settings/groups` }
+                : { label: 'Azure DevOps', url: 'https://aex.dev.azure.com/' };
+        }
+        if (cat === 'purview') {
+            return { label: 'Purview Role Groups', url: 'https://purview.microsoft.com/settings/rolesandscopes' };
         }
         if (cat === 'entra') {
             if ((entry.principalRole || '').toLowerCase().includes('admin')) {
@@ -296,10 +335,16 @@
             return { label: 'Power Automate Admin', url: 'https://admin.powerplatform.microsoft.com/environments' };
         }
         if (cat === 'azure') {
-            return { label: 'Azure Portal', url: 'https://portal.azure.com/#view/Microsoft_Azure_PIMCommon/CommonMenuBlade/~/quickStart' };
+            const scope = entry.targetId || '';
+            return scope.startsWith('/')
+                ? { label: 'Azure Access control (IAM)', url: `https://portal.azure.com/#@${encodeURIComponent(state.tenantDomain || '')}/resource${scope}/users` }
+                : { label: 'Azure Portal', url: 'https://portal.azure.com/#view/Microsoft_Azure_PIMCommon/CommonMenuBlade/~/quickStart' };
         }
         return null;
     }
+
+    const isSharePointGroup = e => (e.principalType || '') === 'SharePoint Group' &&
+        ['sharepoint', 'onedrive'].includes((e.category || '').toLowerCase());
 
     // ── Detail Panel ────────────────────────────────────────────
     function showDetailPanel(entry) {
@@ -326,14 +371,29 @@
             ['Modified', entry.modifiedDateTime]
         ];
 
-        const isGroup = entry.principalType === 'SecurityGroup' || entry.principalType === 'M365Group' ||
-                         entry.targetType === 'SecurityGroup' || entry.targetType === 'M365Group';
-        const groupHint = isGroup ? `<div style="margin-top:12px">
-            <button class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em"
-                onclick="window.m365.showGroupMembers(${Number(entry.scanId) || 'null'}, ${jsArg(entry.targetId)}, ${jsArg(entry.targetPath || entry.principalSysName)})">
-                👥 View Group Members
-            </button>
-        </div>` : '';
+        if (entry.via) fields.splice(3, 0, ['Via Group', entry.via]);
+
+        // Entra group rows: the group is the target (membership rows) or the principal (grants).
+        const groupAsTarget = ['SecurityGroup', 'M365Group', 'DistributionList'].includes(entry.targetType);
+        const groupAsPrincipal = ['SecurityGroup', 'M365Group'].includes(entry.principalType) && entry.principalEntraId;
+        let groupHint = '';
+        if (isSharePointGroup(entry)) {
+            groupHint = `<div style="margin-top:12px">
+                <button class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em"
+                    onclick="window.m365.showSharePointGroupMembers(${Number(entry.scanId) || 'null'}, ${jsArg(entry.principalSysName)}, ${jsArg(entry.targetPath)}, ${jsArg(entry.targetId)})">
+                    👥 View Group Members
+                </button>
+            </div>`;
+        } else if (groupAsTarget || groupAsPrincipal) {
+            const gid = groupAsTarget ? entry.targetId : String(entry.principalEntraId).replace(/_o$/, '');
+            const gname = groupAsTarget ? (entry.targetPath || '') : (entry.principalSysName || '');
+            groupHint = `<div style="margin-top:12px">
+                <button class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em"
+                    onclick="window.m365.showGroupMembers(${Number(entry.scanId) || 'null'}, ${jsArg(gid)}, ${jsArg(gname)})">
+                    👥 View Group Members
+                </button>
+            </div>`;
+        }
 
         const remediation = getRemediationLink(entry);
         const remediationHtml = remediation ? `<div style="margin-top:12px">
@@ -346,8 +406,69 @@
             <table class="detail-table">
                 ${fields.filter(([,v]) => v).map(([k, v]) => `<tr><td class="detail-label">${escapeHtml(k)}</td><td>${escapeHtml(v)}</td></tr>`).join('')}
             </table>
+            <div id="detailPolicies"></div>
             ${groupHint}
             ${remediationHtml}
+            ${detailCloudTip(entry)}
+        `);
+        loadMatchedPolicies(entry);
+    }
+
+    /** One Cloud Edition tip that fits the row: link details, item-level depth, mailbox folders. */
+    function detailCloudTip(entry) {
+        const C = window.M365Cloud;
+        if (entry.through === 'SharingLink') return C.tip('sharingLink', { compact: true });
+        if (['File', 'Folder', 'Item', 'Library', 'List'].includes(entry.targetType)) return C.tip('itemLevel', { compact: true });
+        if (entry.category === 'Exchange') return C.tip('exchangeFolders', { compact: true });
+        return '';
+    }
+
+    // Matched policies with their remediation advice, evaluated against the current policies.
+    async function loadMatchedPolicies(entry) {
+        if (!entry.riskLevel || entry.riskLevel === 'Info') return;
+        try {
+            const res = await api.post('/policies/match', { ...entry, scanId: Number(entry.scanId) || 0 });
+            const el = document.getElementById('detailPolicies');
+            if (!el || !res.success || !res.data || res.data.length === 0) return;
+            el.innerHTML = `<div class="detail-policies">
+                <div class="detail-policies-title">What to do</div>
+                ${res.data.map(v => `<div class="detail-policy">
+                    <div><span class="risk-badge risk-${escapeAttr((v.severity || 'info').toLowerCase())}">${escapeHtml(v.severity)}</span>
+                        <strong>${escapeHtml(v.policyName)}</strong></div>
+                    ${v.remediation ? `<div class="detail-policy-remediation">${escapeHtml(v.remediation)}</div>` : ''}
+                </div>`).join('')}
+            </div>${window.M365Cloud.tip('riskQueue', { compact: true })}`;
+        } catch { /* advice is optional */ }
+    }
+
+    async function showSharePointGroupMembers(scanId, groupName, targetPath, targetId) {
+        if (!scanId || !groupName) { showToast('No scan data available for group lookup', 'error'); return; }
+        const title = `Members of ${groupName}`;
+        showModal(title, '<div class="empty-state"><p>Loading...</p></div>');
+        try {
+            const q = `group=${encodeURIComponent(groupName)}&targetPath=${encodeURIComponent(targetPath || '')}&targetId=${encodeURIComponent(targetId || '')}`;
+            const res = await api.get(`/scans/${scanId}/sharepoint-group-members?${q}`);
+            renderMemberList(title, res.success ? res.data : null);
+        } catch (e) {
+            showModal(title, `<p>Error loading members: ${escapeHtml(e.message)}</p>`);
+        }
+    }
+
+    function renderMemberList(title, members) {
+        if (!members || members.length === 0) {
+            showModal(title, '<div class="empty-state"><p>No members found in scan data</p></div>');
+            return;
+        }
+        showModal(`${title} (${members.length})`, `
+            <table>
+                <thead><tr><th>Name</th><th>UPN</th><th>Type</th><th>Entra ID</th></tr></thead>
+                <tbody>${members.map(m => `<tr>
+                    <td>${escapeHtml(m.principalSysName || '')}</td>
+                    <td>${escapeHtml(m.principalEntraUpn || '')}</td>
+                    <td>${escapeHtml(m.principalType || '')}</td>
+                    <td style="font-size:0.8em;color:var(--text-muted)">${escapeHtml(m.principalEntraId || '')}</td>
+                </tr>`).join('')}</tbody>
+            </table>
         `);
     }
 
@@ -357,26 +478,7 @@
         showModal(`Members of ${groupName}`, '<div class="empty-state"><p>Loading...</p></div>');
         try {
             const res = await api.get(`/scans/${scanId}/group-members?groupId=${encodeURIComponent(groupId)}`);
-            if (!res.success || !res.data) {
-                showModal(`Members of ${groupName}`, '<div class="empty-state"><p>No members found</p></div>');
-                return;
-            }
-            const members = res.data;
-            if (members.length === 0) {
-                showModal(`Members of ${groupName}`, '<div class="empty-state"><p>No members found in scan data</p></div>');
-                return;
-            }
-            showModal(`Members of ${groupName} (${members.length})`, `
-                <table>
-                    <thead><tr><th>Name</th><th>UPN</th><th>Type</th><th>Entra ID</th></tr></thead>
-                    <tbody>${members.map(m => `<tr>
-                        <td>${escapeHtml(m.principalSysName || '')}</td>
-                        <td>${escapeHtml(m.principalEntraUpn || '')}</td>
-                        <td>${escapeHtml(m.principalType || '')}</td>
-                        <td style="font-size:0.8em;color:var(--text-muted)">${escapeHtml(m.principalEntraId || '')}</td>
-                    </tr>`).join('')}</tbody>
-                </table>
-            `);
+            renderMemberList(`Members of ${groupName}`, res.success ? res.data : null);
         } catch (e) {
             showModal(`Members of ${groupName}`, `<p>Error loading members: ${escapeHtml(e.message)}</p>`);
         }
@@ -402,11 +504,12 @@
         principalType: 'principal_type', riskLevel: 'risk_level'
     };
 
-    function buildSortableHeader(columns, onSort) {
+    // st: the table's own state object (Results uses tableState, User Lookup userTableState).
+    function buildSortableHeader(columns, onSort, st = tableState) {
         return `<thead><tr>${columns.map(col => {
-            const isSorted = tableState.sortColumn === col.db;
-            const arrow = isSorted ? (tableState.sortDirection === 'asc' ? ' ↑' : ' ↓') : '';
-            const filterHtml = col.filterable ? buildFilterControl(col) : '';
+            const isSorted = st.sortColumn === col.db;
+            const arrow = isSorted ? (st.sortDirection === 'asc' ? ' ↑' : ' ↓') : '';
+            const filterHtml = col.filterable ? buildFilterControl(col, st) : '';
             return `<th>
                 <div class="th-content" style="cursor:pointer" data-sort="${col.db}">
                     <span class="th-label">${escapeHtml(col.label)}${arrow}</span>
@@ -416,10 +519,11 @@
         }).join('')}</tr></thead>`;
     }
 
-    function buildFilterControl(col) {
+    function buildFilterControl(col, st = tableState) {
         if (dropdownFilterColumns.has(col.key)) {
-            const options = tableState.filterOptions[col.db] || [];
-            const selected = (tableState.columnFilters[col.db] || '').split('|').filter(Boolean);
+            // Keep active filter values selectable even when the option list doesn't contain them.
+            const selected = (st.columnFilters[col.db] || '').split('|').filter(Boolean);
+            const options = [...new Set([...(st.filterOptions[col.db] || []), ...selected])];
             const selectedSet = new Set(selected);
             if (options.length === 0) return '';
             return `<div class="th-filter">
@@ -429,22 +533,24 @@
                 </select>
             </div>`;
         }
-        const val = tableState.columnFilters[col.db] || '';
+        const val = st.columnFilters[col.db] || '';
         return `<div class="th-filter">
             <input type="text" class="filter-input" data-filter-col="${col.db}"
                 placeholder="Filter..." value="${escapeAttr(val)}">
         </div>`;
     }
 
-    function attachTableListeners(tableEl, onSort, onFilter) {
+    function attachTableListeners(tableEl, onSort, onFilter, st) {
+        // Resolve the state at event time: renderResults/resetTableState replace tableState.
+        const S = () => st || tableState;
         tableEl.querySelectorAll('.th-content[data-sort]').forEach(th => {
             th.addEventListener('click', () => {
                 const col = th.dataset.sort;
-                if (tableState.sortColumn === col) {
-                    tableState.sortDirection = tableState.sortDirection === 'asc' ? 'desc' : 'asc';
+                if (S().sortColumn === col) {
+                    S().sortDirection = S().sortDirection === 'asc' ? 'desc' : 'asc';
                 } else {
-                    tableState.sortColumn = col;
-                    tableState.sortDirection = 'asc';
+                    S().sortColumn = col;
+                    S().sortDirection = 'asc';
                 }
                 onSort();
             });
@@ -453,7 +559,7 @@
         tableEl.querySelectorAll('.filter-input').forEach(input => {
             input.addEventListener('input', debounce(() => {
                 const col = input.dataset.filterCol;
-                tableState.columnFilters[col] = input.value;
+                S().columnFilters[col] = input.value;
                 onFilter();
             }, 400));
         });
@@ -462,7 +568,7 @@
             sel.addEventListener('change', () => {
                 const col = sel.dataset.filterCol;
                 const selected = Array.from(sel.selectedOptions).map(o => o.value);
-                tableState.columnFilters[col] = selected.join('|');
+                S().columnFilters[col] = selected.join('|');
                 sel.title = selected.length ? selected.join(', ') : 'All';
                 onFilter();
             });
@@ -470,30 +576,27 @@
     }
 
     // ── Quick Filter Presets ────────────────────────────────────
-    async function applyQuickFilter(preset) {
-        resetTableState();
-        // Toggle active state on quick filter pills
-        document.querySelectorAll('#quickFilters .btn-active').forEach(b => b.classList.remove('btn-active'));
-        const btn = event && event.target ? event.target : null;
-        if (btn) btn.classList.add('btn-active');
+    // Column filters per quick-filter preset (values match the scanners' vocabulary).
+    const QUICK_FILTERS = {
+        'critical-high': { risk_level: 'Critical|High' },
+        'external': { principal_type: 'Guest|External User|ExternalUser|External Group' },
+        'anonymous': { principal_type: 'Anonymous' },
+        'admin-roles': { category: 'Entra', through: 'DirectoryRoleAssignment|GroupMember|PIM-Eligible' },
+        'full-access': { principal_role: 'FullAccess' },
+        'critical': { risk_level: 'Critical' },
+        'high': { risk_level: 'High' },
+        'medium': { risk_level: 'Medium' },
+        'low': { risk_level: 'Low' },
+        'info': { risk_level: 'Info' }
+    };
 
-        switch (preset) {
-            case 'critical-high':
-                tableState.columnFilters['risk_level'] = 'Critical|High';
-                break;
-            case 'external':
-                tableState.columnFilters['principal_type'] = 'Guest';
-                break;
-            case 'anonymous':
-                tableState.columnFilters['through'] = 'AnonymousLink';
-                break;
-            case 'admin-roles':
-                tableState.columnFilters['category'] = 'Entra';
-                break;
-            case 'full-access':
-                tableState.columnFilters['principal_role'] = 'FullAccess';
-                break;
-        }
+    async function applyQuickFilter(preset, btn) {
+        resetTableState();
+        document.querySelectorAll('#quickFilters .btn-active').forEach(b => b.classList.remove('btn-active'));
+        const pill = btn || document.querySelector(`#quickFilters [data-preset="${preset}"]`);
+        if (pill) pill.classList.add('btn-active');
+
+        Object.assign(tableState.columnFilters, QUICK_FILTERS[preset] || {});
         currentPage = 1;
         await loadFilterOptions();
         await loadResults();
@@ -518,7 +621,7 @@
                     </div>
                     <div class="stat-card">
                         <div class="stat-value" id="statPerms">—</div>
-                        <div class="stat-label">Total Permissions</div>
+                        <div class="stat-label" id="statPermsLabel">Permissions (latest scan)</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value" id="statStatus">—</div>
@@ -547,7 +650,7 @@
                     <div>
                         <strong>⚡ This scan worked hard.</strong>
                         <p id="painText" style="margin:6px 0;color:var(--text-muted);font-size:0.9em"></p>
-                        <a href="https://m365permissions.com" target="_blank" rel="noopener" class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em;text-decoration:none">Learn about the hosted version</a>
+                        <a href="${window.M365Cloud.link('/evaluate', 'dashboard-long-scan')}" target="_blank" rel="noopener" class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em;text-decoration:none">How the ${window.M365Cloud.NAME} works</a>
                     </div>
                     <button class="btn-icon" title="Dismiss" onclick="window.m365.dismissPain()" style="background:none;border:none;cursor:pointer;font-size:1.2em;color:var(--text-muted)">✕</button>
                 </div>
@@ -555,13 +658,18 @@
             <div class="card" id="riskSummaryCard" style="display:none">
                 <h2>Risk Overview (Latest Scan)</h2>
                 <div class="stats-grid" id="riskStats"></div>
+                <div id="riskTip"></div>
             </div>
+            <div id="coverageSlot"></div>
             <div class="card" id="deltaCard" style="display:none">
-                <h2>Changes Since Previous Scan</h2>
+                <h2 id="deltaTitle">Changes Since Previous Scan</h2>
+                <p id="deltaHeadline" class="delta-headline"></p>
                 <div class="stats-grid" id="deltaStats"></div>
+                <div id="deltaCoverage"></div>
                 <div style="margin-top:8px">
                     <a id="deltaCompareLink" href="#/compare" class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em;text-decoration:none">View Full Comparison</a>
                 </div>
+                <div id="deltaTip"></div>
             </div>
             <div class="card" id="recentScansCard" style="display:none">
                 <h2>Recent Scans</h2>
@@ -601,19 +709,19 @@
         try {
             const scans = await api.get('/scans' + tenantQuery());
             if (scans.success && scans.data.length > 0) {
-                const isDone = s => s.status === 'Completed' || s.status === 'CompletedWithErrors';
-                const completedScans = scans.data.filter(isDone);
+                const completedScans = scans.data.filter(isDoneScan);
                 document.getElementById('statScans').textContent = completedScans.length;
-                const totalPerms = completedScans.reduce((sum, s) => sum + (s.totalPermissions || 0), 0);
-                document.getElementById('statPerms').textContent = totalPerms.toLocaleString();
+                if (completedScans.length > 0) {
+                    document.getElementById('statPerms').textContent = (completedScans[0].totalPermissions || 0).toLocaleString();
+                    document.getElementById('statPermsLabel').textContent = `Permissions (scan #${completedScans[0].id})`;
+                }
                 document.getElementById('recentScansCard').style.display = '';
 
-                // $1: convert on experienced pain, quietly. A scan that took a long time or was very
-                // large is where the hosted (managed-identity, managed-infra) version pays off.
+                // A scan that took long or was very large is where scheduled, unattended Cloud Edition scans pay off.
                 const latest = completedScans[0];
-                if (latest && !localStorage.getItem('m365_painDismissed_' + latest.id)) {
+                if (latest && window.M365Cloud.tipsEnabled() && !localStorage.getItem('m365_painDismissed_' + latest.id)) {
                     const durMs = latest.completedAt && latest.startedAt
-                        ? (new Date(latest.completedAt) - new Date(latest.startedAt)) : 0;
+                        ? (parseDate(latest.completedAt) - parseDate(latest.startedAt)) : 0;
                     const hours = durMs / 3600000;
                     const perms = latest.totalPermissions || 0;
                     if (hours >= 2 || perms >= 250000) {
@@ -623,7 +731,9 @@
                             const reason = hours >= 2
                                 ? `Scan #${latest.id} took ${hours.toFixed(1)} hours`
                                 : `Scan #${latest.id} found ${perms.toLocaleString()} permissions`;
-                            painText.textContent = `${reason}. The hosted version scans with managed identity auth on managed infrastructure — faster, unattended, and continuous.`;
+                            painText.textContent = `${reason} and needed this workstation and your sign-in throughout. ` +
+                                `The ${window.M365Cloud.NAME} runs scans like this unattended on a schedule from your own Azure subscription, ` +
+                                'with managed identity and delta scans that only re-read what changed.';
                             painCard.dataset.scanId = latest.id;
                             painCard.style.display = '';
                         }
@@ -634,12 +744,13 @@
                 tbody.innerHTML = scans.data.slice(0, 10).map(s => `<tr>
                     <td>${s.id}</td>
                     <td title="${escapeAttr(s.tenantDomain || '')}" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(s.tenantDomain || '—')}</td>
-                    <td>${new Date(s.startedAt).toLocaleString()}</td>
+                    <td>${fmtDateTime(s.startedAt)}</td>
                     <td>${escapeHtml(s.scanTypes || '')}</td>
                     <td><span style="color:${s.status === 'Completed' ? 'var(--success)' : s.status === 'CompletedWithErrors' ? 'var(--warning)' : s.status === 'Failed' ? 'var(--error)' : 'var(--text-muted)'}">${s.status}</span></td>
                     <td>${s.totalPermissions ? s.totalPermissions.toLocaleString() : '—'}</td>
                     <td>
                         <span class="scan-notes-text" id="scanNotes${s.id}" title="Click to edit"
+                            data-notes="${escapeAttr(s.notes || '')}"
                             onclick="window.m365.editScanNotes(${s.id})"
                             style="cursor:pointer;max-width:150px;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-muted);font-size:0.85em">
                             ${escapeHtml(s.notes || s.tags || '—')}
@@ -648,6 +759,8 @@
                     <td>
                         <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em"
                             onclick="location.hash='#/results?id=${s.id}'">View</button>
+                        ${s.status === 'Running' || s.status === 'Pending' ? '' : `<button class="btn btn-secondary btn-delete-scan" title="Delete this scan and its results"
+                            onclick="window.m365.deleteScan(${s.id})">🗑</button>`}
                     </td>
                 </tr>`).join('');
 
@@ -662,9 +775,11 @@
                             const riskData = riskRes.data;
                             const levels = ['Critical', 'High', 'Medium', 'Low', 'Info'];
                             const colors = { Critical: '#b71c1c', High: '#f44336', Medium: '#ff9800', Low: '#4caf50', Info: '#2196f3' };
+                            if ((riskData.Critical || 0) + (riskData.High || 0) > 0)
+                                document.getElementById('riskTip').innerHTML = window.M365Cloud.tip('riskQueue');
                             document.getElementById('riskStats').innerHTML = levels.map(l => {
                                 const count = riskData[l] || 0;
-                                return `<div class="stat-card" style="cursor:pointer" onclick="location.hash='#/results?id=${latestId}';setTimeout(()=>window.m365.applyQuickFilter('${l.toLowerCase() === 'critical' || l.toLowerCase() === 'high' ? 'critical-high' : ''}'),300)">
+                                return `<div class="stat-card" style="cursor:pointer" title="Show ${l} findings" onclick="location.hash='#/results?id=${latestId}&risk=${l}'">
                                     <div class="stat-value" style="color:${colors[l]}">${count.toLocaleString()}</div>
                                     <div class="stat-label">${l}</div>
                                 </div>`;
@@ -672,25 +787,33 @@
                         }
                     } catch { }
 
-                    // Auto-compare with previous scan (already tenant-scoped by API)
+                    try {
+                        const insRes = await api.get(`/scans/${latestId}/insights`);
+                        if (insRes.success)
+                            document.getElementById('coverageSlot').innerHTML = window.M365Cloud.coverageCard(insRes.data, latestId);
+                    } catch { /* best effort */ }
+
+                    // Counts-only delta vs the previous completed scan of this tenant (server picks it).
                     if (completedScans.length >= 2) {
                         try {
                             const newId = completedScans[0].id;
-                            const oldId = completedScans[1].id;
-                            const cmpRes = await api.post('/compare', { oldScanId: oldId, newScanId: newId });
-                            if (cmpRes.success && cmpRes.data) {
-                                const r = cmpRes.data;
-                                const addedCount = (r.added || []).length;
-                                const removedCount = (r.removed || []).length;
-                                const changedCount = (r.changed || []).length;
-                                if (addedCount > 0 || removedCount > 0 || changedCount > 0) {
-                                    document.getElementById('deltaCard').style.display = '';
-                                    document.getElementById('deltaStats').innerHTML = `
-                                        <div class="stat-card"><div class="stat-value" style="color:var(--success)">+${addedCount}</div><div class="stat-label">Added</div></div>
-                                        <div class="stat-card"><div class="stat-value" style="color:var(--error)">-${removedCount}</div><div class="stat-label">Removed</div></div>
-                                        <div class="stat-card"><div class="stat-value" style="color:var(--warning)">~${changedCount}</div><div class="stat-label">Changed</div></div>
-                                    `;
-                                }
+                            const dRes = await api.get(`/scans/${newId}/risk-delta`);
+                            const d = dRes.success ? dRes.data : null;
+                            if (d && d.previousScanId) {
+                                document.getElementById('deltaCard').style.display = '';
+                                document.getElementById('deltaTitle').textContent = `Changes Since Scan #${d.previousScanId}`;
+                                document.getElementById('deltaHeadline').innerHTML = (d.newCritical || d.newHigh)
+                                    ? `<span style="color:#b71c1c;font-weight:600">${d.newCritical.toLocaleString()} new Critical</span> / <span style="color:#f44336;font-weight:600">${d.newHigh.toLocaleString()} new High</span> since scan #${d.previousScanId}`
+                                    : `No new Critical or High findings since scan #${d.previousScanId}`;
+                                document.getElementById('deltaStats').innerHTML = `
+                                    <div class="stat-card"><div class="stat-value" style="color:var(--success)">+${d.totalAdded.toLocaleString()}</div><div class="stat-label">Added</div></div>
+                                    <div class="stat-card"><div class="stat-value" style="color:var(--error)">-${d.totalRemoved.toLocaleString()}</div><div class="stat-label">Removed</div></div>
+                                    <div class="stat-card"><div class="stat-value" style="color:var(--warning)">~${d.totalChanged.toLocaleString()}</div><div class="stat-label">Changed</div></div>
+                                `;
+                                document.getElementById('deltaCoverage').innerHTML = coverageNotice(d.excludedCategories, d.flaggedCategories);
+                                document.getElementById('deltaCompareLink').href = `#/compare?old=${d.previousScanId}&new=${newId}`;
+                                if (d.totalAdded + d.totalRemoved + d.totalChanged > 0)
+                                    document.getElementById('deltaTip').innerHTML = window.M365Cloud.tip('changes');
                             }
                         } catch { }
                     }
@@ -700,6 +823,36 @@
     }
 
     // Scan
+    /** Append a Cloud Edition tip to the first card of the current page. */
+    function addPageTip(key) {
+        document.querySelector('#app .card')?.insertAdjacentHTML('beforeend', window.M365Cloud.tip(key));
+    }
+
+    /** Collapsed side-by-side of this module and the Cloud Edition (empty when Cloud Edition tips are off). */
+    function editionComparison(context) {
+        const C = window.M365Cloud;
+        if (!C.tipsEnabled()) return '';
+        const rows = [
+            ['Scanning', 'On demand, from this workstation while you are signed in', 'Scheduled (continuous, daily, weekly, monthly) and unattended with managed identity, in your own Azure subscription'],
+            ['Depth', 'Sites, subsites, lists and libraries, groups expanded, sharing links', 'Also every file and folder with unique permissions, mailbox folders, delta scans for large tenants'],
+            ['Changes', 'Compare two scans yourself', 'Every run compared automatically, first-seen and removed dates, change timeline, email and Microsoft Sentinel alerts'],
+            ['Risk', 'Policies with severity and remediation advice', 'Risk queue that tracks each finding to closure and re-checks fixes on the next scan'],
+            ['Sharing results', 'Local database and exports', 'Multi-user portal with Entra ID single sign-on, audit trail, scheduled email reports, SQL access for Power BI']
+        ];
+        return `<details class="edition-details" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border);font-size:0.9em">
+            <summary style="cursor:pointer;color:var(--text-muted)">This module or the ${C.NAME}?</summary>
+            <table class="edition-compare">
+                <thead><tr><th></th><th>This module</th><th>${C.NAME}</th></tr></thead>
+                <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r[0])}</strong></td><td>${escapeHtml(r[1])}</td><td>${escapeHtml(r[2])}</td></tr>`).join('')}</tbody>
+            </table>
+            <div style="margin-top:8px;color:var(--text-muted);font-size:0.9em">
+                No per-user licensing: billed through your Azure invoice.
+                <a href="${C.link('/evaluate', context)}" target="_blank" rel="noopener" style="color:var(--accent)">Evaluate the ${C.NAME}</a> ·
+                <a href="${C.link('/pricing', context)}" target="_blank" rel="noopener" style="color:var(--accent)">Pricing</a>
+            </div>
+        </details>`;
+    }
+
     async function renderScan() {
         const app = document.getElementById('app');
         const isScanning = state.scanRunning;
@@ -710,148 +863,60 @@
                 icon: '📁',
                 label: 'SharePoint Online',
                 checked: true,
-                scans: [
-                    'Site collection administrators',
-                    'Site / library / list role assignments',
-                    'Graph site permissions (app-only grants)',
-                    'Sharing links and anonymous access',
-                ],
-                notScanned: [
-                    'Individual file/item-level permissions',
-                ],
             },
             {
                 val: 'Entra',
                 icon: '🔐',
                 label: 'Entra ID',
                 checked: true,
-                scans: [
-                    'Directory role assignments (active & PIM-eligible)',
-                    'App registrations and their API permissions',
-                    'OAuth2 permission grants (admin & user consent)',
-                    'Group memberships and ownership',
-                ],
-                notScanned: [
-                    'Administrative units',
-                ],
             },
             {
                 val: 'Teams',
                 icon: '👥',
                 label: 'Microsoft Teams',
                 checked: false,
-                scans: [
-                    'Team owners, members and guests',
-                    'Private & shared channel memberships',
-                ],
-                notScanned: [
-                    'Channel messages / files',
-                    'Meeting and app permissions',
-                ],
             },
             {
                 val: 'Exchange',
                 icon: '📧',
                 label: 'Exchange Online',
                 checked: true,
-                scans: [
-                    'Mailbox Full Access delegates',
-                    'Send As / Send on Behalf permissions',
-                ],
-                notScanned: [
-                    'Individual folder-level permissions',
-                    'Transport rules and mail flow',
-                ],
             },
             {
                 val: 'OneDrive',
                 icon: '☁️',
                 label: 'OneDrive for Business',
                 checked: false,
-                scans: [
-                    'OneDrive site administrators',
-                    'Sharing permissions on personal sites',
-                    'External sharing configuration',
-                    'Only active user sites'
-                ],
-                notScanned: [
-                    'Individual file/folder-level sharing',
-                    'Inactive or deleted user sites'
-                ],
             },
             {
                 val: 'PowerBI',
                 icon: '📊',
                 label: 'Power BI',
                 checked: false,
-                scans: [
-                    'Workspace role assignments (Admin, Member, Contributor, Viewer)',
-                    'Workspace ownership',
-                ],
-                notScanned: [
-                    'Dataflow connections',
-                ],
             },
             {
                 val: 'PowerAutomate',
                 icon: '⚡',
                 label: 'Power Platform',
                 checked: false,
-                scans: [
-                    'Environment role assignments',
-                    'Power Automate flow ownership and sharing',
-                    'Power Apps ownership and sharing',
-                    'Custom connector permissions',
-                ],
-                notScanned: [
-                    'Connection reference credentials',
-                ],
             },
             {
                 val: 'Azure',
                 icon: '🌐',
                 label: 'Azure RBAC',
                 checked: false,
-                scans: [
-                    'Subscription-level role assignments',
-                    'Resource group-level role assignments',
-                    'Management group role assignments',
-                    'Azure PIM-eligible assignments',
-                    'Classic administrator roles',
-                ],
-                notScanned: [
-                    'Resource-level role assignments',
-                    'Azure Policy assignments',
-                ],
             },
             {
                 val: 'AzureDevOps',
                 icon: '🔧',
                 label: 'Azure DevOps',
                 checked: false,
-                scans: [
-                    'Organization membership enumeration',
-                    'Project-level security group memberships',
-                    'Organization-level group memberships (Project Collection Administrators, etc.)',
-                    'Team membership resolution',
-                ],
-                notScanned: [
-                    'Repository-level permissions (branch policies, etc.)',
-                    'Pipeline permissions and service connections',
-                    'Area / iteration path security',
-                ],
             },
             {
                 val: 'Purview',
                 icon: '🛡️',
                 label: 'Purview Compliance',
                 checked: false,
-                scans: [
-                    'Compliance Center role groups (Get-RoleGroup)',
-                    'Role group members (Get-RoleGroupMember)',
-                    'Built-in and custom compliance role groups',
-                ],
-                notScanned: [],
             },
         ];
 
@@ -877,15 +942,7 @@
                                         <span style="font-weight:700;font-size:1.05em">${t.label}</span>
                                     </div>
                                     <div style="font-size:0.8em;line-height:1.5;flex:1">
-                                        <div style="color:var(--text-muted);margin-bottom:6px;font-weight:600">✅ What is scanned:</div>
-                                        <ul style="margin:0 0 8px 16px;padding:0;color:var(--text-secondary)">
-                                            ${t.scans.map(s => `<li>${s}</li>`).join('')}
-                                        </ul>
-                                        ${t.notScanned.length ? `
-                                        <div style="color:var(--text-muted);margin-bottom:4px;font-weight:600">🔒 Only in hosted edition:</div>
-                                        <ul style="margin:0 0 0 16px;padding:0;color:var(--text-muted);font-style:italic">
-                                            ${t.notScanned.map(s => `<li>${s}</li>`).join('')}
-                                        </ul>` : ''}
+                                        ${window.M365Cloud.coverageHtml(t.val)}
                                     </div>
                                 </label>
                             `).join('')}
@@ -897,29 +954,12 @@
                                 onclick="document.querySelectorAll('.scan-cat-card input').forEach(c=>{c.checked=false;c.dispatchEvent(new Event('change'))})">Clear All</button>
                         </div>
                     </div>
-                    <div style="margin:16px 0;padding:14px 16px;background:var(--bg-input);border:1px solid var(--border);border-radius:10px;font-size:0.85em;line-height:1.6">
-                        <strong>💡 Need deeper scanning?</strong><br>
-                        <a href="https://m365permissions.com" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">M365Permissions.com</a>
-                        offers additional scanning depth including item-level SharePoint, Teams &amp; OneDrive permissions,
-                        Exchange folder-level permissions, security roles at any level, continuous scans, historical tracking and actionable built in reports.
-                    </div>
                     <div id="precheckResults" style="display:none;margin-bottom:12px"></div>
                     <div class="btn-group">
                         <button class="btn btn-secondary" id="btnPrecheck" onclick="window.m365.precheckScan()">🔍 Pre-check Permissions</button>
                         <button class="btn btn-primary" id="btnStartScan" onclick="window.m365.startScan()">▶ Start Scan</button>
                     </div>
-                    <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
-                        <div style="font-size:0.8em;color:var(--text-muted);margin-bottom:6px">Available in the hosted version — <a href="https://m365permissions.com" target="_blank" rel="noopener" style="color:var(--accent)">m365permissions.com</a>:</div>
-                        <div class="btn-group" style="opacity:0.55;flex-wrap:wrap">
-                            <button class="btn btn-secondary" disabled title="Continuous, unattended scanning — hosted version">🔁 Continuous scans</button>
-                            <button class="btn btn-secondary" disabled title="Email/SIEM alerts on new critical findings — hosted version">🔔 Email/SIEM alerts</button>
-                            <button class="btn btn-secondary" disabled title="Continuous item-level SharePoint/OneDrive scanning — hosted version">🔬 Item-level scan</button>
-                            <button class="btn btn-secondary" disabled title="Track and action risky findings to remediation — hosted version">📋 Risk remediation queue</button>
-                            <button class="btn btn-secondary" disabled title="Ready-made oversharing reports — hosted version">📊 Oversharing reports</button>
-                            <button class="btn btn-secondary" disabled title="Push findings to third-party tools — hosted version">🔌 Third party integrations</button>
-                        </div>
-                        <div style="font-size:0.75em;color:var(--text-muted);margin-top:6px">Local = interactive, top-level snapshots. Hosted = continuous, item-level monitoring with managed identity auth.</div>
-                    </div>
+                    ${editionComparison('scan-page')}
                 `}
             </div>
             <div class="card" id="progressCard" style="${isScanning ? '' : 'display:none'}">
@@ -1040,7 +1080,8 @@
                     }
                 } catch { }
 
-                const done = p.overallStatus === 'Completed' || p.overallStatus === 'Failed' || p.overallStatus === 'Cancelled';
+                const finished = p.overallStatus === 'Completed' || p.overallStatus === 'CompletedWithErrors';
+                const done = finished || p.overallStatus === 'Failed' || p.overallStatus === 'Cancelled';
                 if (done) {
                     clearInterval(pollInterval);
                     pollInterval = null;
@@ -1048,7 +1089,7 @@
                     updateNavStatus();
                     const btnCancel2 = document.getElementById('btnCancelScan2');
                     if (btnCancel2) btnCancel2.style.display = 'none';
-                    if (p.overallStatus === 'Completed' && fill) fill.style.width = '100%';
+                    if (finished && fill) fill.style.width = '100%';
 
                     // Show completion actions in the progress card
                     const progressCard = document.getElementById('progressCard');
@@ -1056,11 +1097,12 @@
                         const actionsDiv = document.createElement('div');
                         actionsDiv.className = 'btn-group';
                         actionsDiv.style.marginTop = '16px';
-                        if (p.overallStatus === 'Completed' && p.scanId) {
+                        if (finished && p.scanId) {
                             actionsDiv.innerHTML = `
                                 <a class="btn btn-primary" href="#/results?id=${p.scanId}">📋 View Results</a>
                                 <button class="btn btn-secondary" onclick="location.hash='#/scan';window.m365.route()">🔄 New Scan</button>
                             `;
+                            actionsDiv.insertAdjacentHTML('afterend', window.M365Cloud.tip('schedule'));
                         } else {
                             actionsDiv.innerHTML = `
                                 <button class="btn btn-secondary" onclick="location.hash='#/scan';window.m365.route()">🔄 New Scan</button>
@@ -1069,8 +1111,13 @@
                         progressCard.appendChild(actionsDiv);
                     }
 
-                    showToast(p.overallStatus === 'Completed' ? 'Scan completed!' : p.overallStatus === 'Failed' ? 'Scan failed' : 'Scan cancelled',
-                        p.overallStatus === 'Completed' ? 'success' : 'error');
+                    const toast = {
+                        Completed: ['Scan completed!', 'success'],
+                        CompletedWithErrors: ['Scan completed with errors: some services failed or were skipped. Check the log above.', 'warning'],
+                        Failed: ['Scan failed', 'error'],
+                        Cancelled: ['Scan cancelled', 'error']
+                    }[p.overallStatus];
+                    showToast(toast[0], toast[1], p.overallStatus === 'CompletedWithErrors' ? 10000 : 4000);
                 }
             } catch { }
         }, 2000);
@@ -1087,16 +1134,20 @@
         const app = document.getElementById('app');
         const params = new URLSearchParams(window.location.hash.split('?')[1] || '');
         const scanId = params.get('id');
+        // Dashboard risk tiles link here with &risk=<level>; applied before the first load.
+        const riskParam = params.get('risk');
+        if (riskParam && ['Critical', 'High', 'Medium', 'Low', 'Info'].includes(riskParam))
+            tableState.columnFilters['risk_level'] = riskParam;
 
         app.innerHTML = `
             <div class="card">
                 <h2>Scan Results</h2>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px" id="quickFilters">
-                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" onclick="window.m365.applyQuickFilter('critical-high')">🔴 Critical/High</button>
-                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" onclick="window.m365.applyQuickFilter('external')">👤 External Users</button>
-                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" onclick="window.m365.applyQuickFilter('anonymous')">🔗 Anonymous Links</button>
-                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" onclick="window.m365.applyQuickFilter('admin-roles')">🛡️ Admin Roles</button>
-                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" onclick="window.m365.applyQuickFilter('full-access')">📬 Full Access</button>
+                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" data-preset="critical-high" onclick="window.m365.applyQuickFilter('critical-high', this)">🔴 Critical/High</button>
+                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" data-preset="external" onclick="window.m365.applyQuickFilter('external', this)">👤 External Users</button>
+                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" data-preset="anonymous" onclick="window.m365.applyQuickFilter('anonymous', this)">🔗 Anonymous Links</button>
+                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" data-preset="admin-roles" onclick="window.m365.applyQuickFilter('admin-roles', this)">🛡️ Admin Roles</button>
+                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" data-preset="full-access" onclick="window.m365.applyQuickFilter('full-access', this)">📬 Full Access</button>
                     <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.8em" onclick="window.m365.clearFilters()">✕ Clear</button>
                 </div>
                 <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;align-items:flex-end">
@@ -1123,6 +1174,7 @@
                 </div>
                 <div class="pagination" id="pagination"></div>
             </div>
+            <div id="resultsCoverage"></div>
         `;
 
         try {
@@ -1130,7 +1182,7 @@
             if (scans.success && scans.data.length > 0) {
                 const sel = document.getElementById('scanSelect');
                 sel.innerHTML = '<option value="">— Select a scan —</option>' + scans.data.map(s =>
-                    `<option value="${s.id}" ${s.id == scanId ? 'selected' : ''}>Scan #${s.id} — ${s.tenantDomain ? s.tenantDomain + ' — ' : ''}${new Date(s.startedAt).toLocaleDateString()} — ${s.scanTypes} (${s.status})</option>`
+                    `<option value="${s.id}" ${s.id == scanId ? 'selected' : ''}>Scan #${s.id} · ${s.tenantDomain ? escapeHtml(s.tenantDomain) + ' · ' : ''}${fmtDate(s.startedAt)} · ${escapeHtml(s.scanTypes)} (${s.status})</option>`
                 ).join('');
 
                 sel.addEventListener('change', () => { resetTableState(); loadCategories(); loadFilterOptions(); loadResults(); });
@@ -1161,6 +1213,17 @@
                     res.data.map(c => `<option value="${c}">${c}</option>`).join('');
             }
         } catch { }
+
+        // What this scan saw but did not itemize (sharing links, item-level access, unreadable sites).
+        const coverage = document.getElementById('resultsCoverage');
+        if (coverage) {
+            coverage.innerHTML = '';
+            try {
+                const ins = await api.get(`/scans/${scanId}/insights`);
+                if (ins.success && document.getElementById('scanSelect')?.value === scanId)
+                    coverage.innerHTML = window.M365Cloud.coverageCard(ins.data, scanId);
+            } catch { /* best effort */ }
+        }
     }
 
     async function loadFilterOptions() {
@@ -1229,8 +1292,10 @@
                     <tbody>${items.map((p, idx) => {
                         const principal = p.principalEntraUpn || p.principalSysName || p.principalEntraId || '';
                         const isGroupType = p.principalType === 'SecurityGroup' || p.principalType === 'M365Group';
-                        const principalHtml = isGroupType
-                            ? `<span class="group-link" onclick="event.stopPropagation();window.m365.showGroupMembers(${Number(scanId) || 'null'},${jsArg(p.principalEntraId || p.principalSysId || '')},${jsArg(principal)})" title="Click to view group members">👥 ${escapeHtml(principal)}</span>`
+                        const principalHtml = isSharePointGroup(p)
+                            ? `<span class="group-link" onclick="event.stopPropagation();window.m365.showSharePointGroupMembers(${Number(scanId) || 'null'},${jsArg(p.principalSysName || '')},${jsArg(p.targetPath || '')},${jsArg(p.targetId || '')})" title="Click to view group members">👥 ${escapeHtml(principal)}</span>`
+                            : isGroupType
+                            ? `<span class="group-link" onclick="event.stopPropagation();window.m365.showGroupMembers(${Number(scanId) || 'null'},${jsArg(String(p.principalEntraId || p.principalSysId || '').replace(/_o$/, ''))},${jsArg(principal)})" title="Click to view group members">👥 ${escapeHtml(principal)}</span>`
                             : escapeHtml(principal);
                         const cellMap = {
                             riskLevel: `<td><span class="risk-badge risk-${(p.riskLevel || 'low').toLowerCase()}">${escapeHtml(p.riskLevel || '')}</span></td>`,
@@ -1267,7 +1332,9 @@
             }
 
             const pagDiv = document.getElementById('pagination');
-            pagDiv.innerHTML = `
+            pagDiv.innerHTML = totalPages <= 1
+                ? `<span class="page-info">${totalCount.toLocaleString()} result${totalCount === 1 ? '' : 's'}</span>`
+                : `
                 <button ${currentPage <= 1 ? 'disabled' : ''} onclick="window.m365.loadResults(${currentPage - 1})">← Prev</button>
                 <span class="page-info">Page ${currentPage} of ${totalPages} (${totalCount.toLocaleString()} results)</span>
                 <button ${currentPage >= totalPages ? 'disabled' : ''} onclick="window.m365.loadResults(${currentPage + 1})">Next →</button>
@@ -1309,12 +1376,13 @@
                 <div class="pagination" id="userPagination"></div>
             </div>
         `;
+        addPageTip('userLookup');
 
         try {
             const scans = await api.get('/scans' + tenantQuery());
             if (scans.success && scans.data.length > 0) {
                 const sel = document.getElementById('userLookupScan');
-                const completedScans = scans.data.filter(s => s.status === 'Completed');
+                const completedScans = scans.data.filter(isDoneScan);
                 if (completedScans.length === 0) {
                     sel.innerHTML = '<option value="">No completed scans available</option>';
                     document.getElementById('userLookupNotice').innerHTML = `
@@ -1322,9 +1390,13 @@
                     `;
                 } else {
                     sel.innerHTML = completedScans.map(s =>
-                        `<option value="${s.id}">Scan #${s.id} — ${new Date(s.startedAt).toLocaleDateString()} — ${s.scanTypes} (${(s.totalPermissions || 0).toLocaleString()} perms)</option>`
+                        `<option value="${s.id}" data-types="${escapeAttr(s.scanTypes || '')}" data-status="${escapeAttr(s.status)}">Scan #${s.id} · ${fmtDate(s.startedAt)} · ${escapeHtml(s.scanTypes)} (${(s.totalPermissions || 0).toLocaleString()} perms${s.status === 'CompletedWithErrors' ? ', with errors' : ''})</option>`
                     ).join('');
-                    sel.addEventListener('change', updateScanNotice);
+                    sel.addEventListener('change', () => {
+                        updateScanNotice();
+                        userTableState = { sortColumn: null, sortDirection: 'asc', columnFilters: {}, filterOptions: {} };
+                        document.getElementById('userResultsCard').style.display = 'none';
+                    });
                     updateScanNotice();
                 }
             } else {
@@ -1346,14 +1418,16 @@
         if (!sel || !notice) return;
         const option = sel.selectedOptions[0];
         if (!option) return;
-        const text = option.textContent;
+        // Exact category match: "Azure" must not count as covered by "AzureDevOps".
+        const types = new Set((option.dataset.types || '').split(',').map(t => t.trim()).filter(Boolean));
         const allTypes = ['SharePoint', 'Entra', 'Teams', 'Exchange', 'OneDrive', 'PowerBI', 'PowerAutomate', 'Azure', 'AzureDevOps', 'Purview'];
-        const missing = allTypes.filter(t => !text.includes(t));
-        if (missing.length > 0) {
-            notice.innerHTML = `<div class="notice notice-info">This scan did not include: <strong>${missing.join(', ')}</strong>. Results for those services will not appear.</div>`;
-        } else {
-            notice.innerHTML = '';
-        }
+        const missing = allTypes.filter(t => !types.has(t));
+        const parts = [];
+        if (missing.length > 0)
+            parts.push(`<div class="notice notice-info">This scan did not include: <strong>${missing.join(', ')}</strong>. Results for those services will not appear.</div>`);
+        if (option.dataset.status === 'CompletedWithErrors')
+            parts.push('<div class="notice notice-warning">This scan completed with errors; some services may be incomplete.</div>');
+        notice.innerHTML = parts.join('');
     }
 
     let userLookupPage = 1;
@@ -1380,59 +1454,71 @@
         }
 
         try {
+            // Filter dropdown values for this scan, loaded once per scan.
+            if (userTableState.optionsScanId !== scanId) {
+                const cols = ['category', 'target_type', 'through', 'access_type', 'tenure', 'risk_level'];
+                const opts = await Promise.all(cols.map(c => api.get(`/scans/${scanId}/filter-options?column=${c}`).catch(() => null)));
+                userTableState.filterOptions = {};
+                opts.forEach((r, i) => { if (r && r.success) userTableState.filterOptions[cols[i]] = r.data; });
+                userTableState.optionsScanId = scanId;
+            }
+
             const res = await api.get(url);
             if (!res.success) { showToast(res.error || 'Search failed', 'error'); return; }
 
             const { items, totalCount } = res.data;
+            const via = res.data.via || {};
             const totalPages = Math.ceil(totalCount / 50);
             const card = document.getElementById('userResultsCard');
             card.style.display = '';
 
-            document.getElementById('userResultsTitle').textContent = `Results for "${user}" (${totalCount.toLocaleString()} permissions)`;
+            document.getElementById('userResultsTitle').textContent =
+                `Results for "${user}" (${totalCount.toLocaleString()} permissions${res.data.exactMatch ? ', exact UPN match' : ''})`;
 
             const columns = [
+                { key: 'riskLevel', db: 'risk_level', label: 'Risk', filterable: true },
                 { key: 'category', db: 'category', label: 'Category', filterable: true },
                 { key: 'targetPath', db: 'target_path', label: 'Target', filterable: false },
                 { key: 'targetType', db: 'target_type', label: 'Type', filterable: true },
                 { key: 'principalRole', db: 'principal_role', label: 'Role', filterable: false },
                 { key: 'through', db: 'through', label: 'Through', filterable: true },
+                { key: 'via', db: 'via', label: 'Via Group', filterable: false, sortable: false },
                 { key: 'accessType', db: 'access_type', label: 'Access', filterable: true },
                 { key: 'tenure', db: 'tenure', label: 'Tenure', filterable: true }
             ];
-
-            const savedState = tableState;
-            tableState = userTableState;
 
             const tableDiv = document.getElementById('userResultsTable');
             if (items.length === 0) {
                 tableDiv.innerHTML = '<div class="empty-state"><p>No permissions found for this user in the selected scan.</p></div>';
             } else {
                 tableDiv.innerHTML = `<table id="userResultsTableEl">
-                    ${buildSortableHeader(columns, () => searchUserPerms())}
+                    ${buildSortableHeader(columns, () => searchUserPerms(), userTableState)}
                     <tbody>${items.map((p, idx) => `<tr class="clickable-row" data-uidx="${idx}">
+                        <td><span class="risk-badge risk-${escapeAttr((p.riskLevel || 'low').toLowerCase())}">${escapeHtml(p.riskLevel || '')}</span></td>
                         <td>${escapeHtml(p.category || '')}</td>
-                        <td title="${escapeHtml(p.targetPath || '')}">${escapeHtml(truncate(p.targetPath, 45))}</td>
+                        <td title="${escapeAttr(p.targetPath || '')}">${escapeHtml(truncate(p.targetPath, 45))}</td>
                         <td>${escapeHtml(p.targetType || '')}</td>
                         <td>${escapeHtml(p.principalRole || '')}</td>
                         <td>${escapeHtml(p.through || '')}</td>
+                        <td>${escapeHtml(via[p.id] || '')}</td>
                         <td>${escapeHtml(p.accessType || '')}</td>
                         <td>${escapeHtml(p.tenure || '')}</td>
                     </tr>`).join('')}</tbody>
                 </table>`;
 
                 const userTableEl = document.getElementById('userResultsTableEl');
-                attachTableListeners(userTableEl, () => searchUserPerms(), () => { userLookupPage = 1; searchUserPerms(); });
+                // "via" is computed per row and can't be sorted server-side.
+                userTableEl.querySelector('.th-content[data-sort="via"]')?.removeAttribute('data-sort');
+                attachTableListeners(userTableEl, () => searchUserPerms(), () => { userLookupPage = 1; searchUserPerms(); }, userTableState);
 
                 userTableEl.querySelectorAll('.clickable-row').forEach(row => {
                     row.addEventListener('click', () => {
                         const idx = parseInt(row.dataset.uidx);
                         const entry = items[idx];
-                        if (entry) { entry.scanId = scanId; showDetailPanel(entry); }
+                        if (entry) { entry.scanId = scanId; entry.via = via[entry.id] || ''; showDetailPanel(entry); }
                     });
                 });
             }
-
-            tableState = savedState;
 
             const pagDiv = document.getElementById('userPagination');
             pagDiv.innerHTML = totalPages > 1 ? `
@@ -1446,7 +1532,27 @@
     }
 
     // Compare
+    const COMPARE_LIMIT = 500; // rows per list returned by /api/compare; counts are always complete
+    let lastCompare = null;
+
+    // Value of a ChangedFields entry ("TargetPath") on a camelCase entry object.
+    function changeValue(entry, field) {
+        const v = entry ? entry[field.charAt(0).toLowerCase() + field.slice(1)] : '';
+        return v === undefined || v === null || v === '' ? '(empty)' : v;
+    }
+
+    // Banner listing categories left out of (or only partly in) a comparison.
+    function coverageNotice(excluded, flagged) {
+        const parts = [];
+        if (excluded && excluded.length)
+            parts.push(`<div class="notice notice-warning"><strong>Not compared:</strong> ${excluded.map(n => `${escapeHtml(n.category)} (${escapeHtml(n.reason)})`).join('; ')}</div>`);
+        if (flagged && flagged.length)
+            parts.push(`<div class="notice notice-info"><strong>Partial:</strong> ${flagged.map(n => `${escapeHtml(n.category)} (${escapeHtml(n.reason)})`).join('; ')}</div>`);
+        return parts.join('');
+    }
+
     async function renderCompare() {
+        lastCompare = null;
         const app = document.getElementById('app');
         app.innerHTML = `
             <div class="card">
@@ -1460,6 +1566,13 @@
                         <label>Comparison Scan</label>
                         <select id="newScanSelect" style="width:100%;padding:10px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;color:var(--text)"></select>
                     </div>
+                    <div class="form-group" style="min-width:160px">
+                        <label>Category</label>
+                        <select id="compareCategory" style="width:100%;padding:10px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;color:var(--text)">
+                            <option value="">All categories</option>
+                            ${['SharePoint', 'Entra', 'Teams', 'Exchange', 'OneDrive', 'PowerBI', 'PowerAutomate', 'Azure', 'AzureDevOps', 'Purview'].map(c => `<option value="${c}">${c}</option>`).join('')}
+                        </select>
+                    </div>
                 </div>
                 <div class="btn-group">
                     <button class="btn btn-primary" onclick="window.m365.runCompare()">🔄 Compare</button>
@@ -1468,24 +1581,35 @@
             </div>
             <div class="card" id="compareResults" style="display:none">
                 <h2>Comparison Results</h2>
+                <div id="compareCoverage"></div>
                 <div class="stats-grid" id="compareStats"></div>
+                <div class="btn-group compare-tabs" id="compareTabs"></div>
+                <p id="compareNotice" class="compare-notice"></p>
                 <div class="table-wrapper" id="compareTable"></div>
             </div>
         `;
+        addPageTip('compare');
 
         try {
             const scans = await api.get('/scans' + tenantQuery());
             if (scans.success && scans.data.length > 0) {
-                const completedScans = scans.data.filter(s => s.status === 'Completed');
+                const completedScans = scans.data.filter(isDoneScan);
                 if (completedScans.length >= 1) {
                     const options = completedScans.map(s =>
-                        `<option value="${s.id}">Scan #${s.id} — ${s.tenantDomain ? s.tenantDomain + ' — ' : ''}${new Date(s.startedAt).toLocaleDateString()} (${s.scanTypes}, ${s.totalPermissions || 0} perms)</option>`
+                        `<option value="${s.id}">Scan #${s.id} · ${s.tenantDomain ? escapeHtml(s.tenantDomain) + ' · ' : ''}${fmtDate(s.startedAt)} (${escapeHtml(s.scanTypes)}, ${(s.totalPermissions || 0).toLocaleString()} perms${s.status === 'CompletedWithErrors' ? ', with errors' : ''})</option>`
                     ).join('');
                     document.getElementById('oldScanSelect').innerHTML = options;
                     document.getElementById('newScanSelect').innerHTML = options;
                     document.getElementById('newScanSelect').selectedIndex = 0;
                     if (completedScans.length > 1)
                         document.getElementById('oldScanSelect').selectedIndex = 1;
+                    // Deep link from the dashboard: #/compare?old=1&new=2 runs right away.
+                    const hp = new URLSearchParams(window.location.hash.split('?')[1] || '');
+                    if (hp.get('old') && hp.get('new')) {
+                        document.getElementById('oldScanSelect').value = hp.get('old');
+                        document.getElementById('newScanSelect').value = hp.get('new');
+                        window.m365.runCompare();
+                    }
                 } else {
                     document.getElementById('oldScanSelect').innerHTML = '<option>No completed scans</option>';
                     document.getElementById('newScanSelect').innerHTML = '<option>No completed scans</option>';
@@ -1516,6 +1640,7 @@
                 <div class="table-wrapper" id="trendTableBody"></div>
             </div>
         `;
+        addPageTip('trends');
 
         try {
             const trendsTenantId = state.tenantId ? `&tenantId=${encodeURIComponent(state.tenantId)}` : '';
@@ -1561,7 +1686,7 @@
                     <tbody>${data.map(d => `<tr>
                         ${showMultipleTenants ? `<td title="${escapeAttr(d.tenantDomain || '')}">${escapeHtml(truncate(d.tenantDomain || 'Unknown', 30))}</td>` : ''}
                         <td>#${d.scanId}</td>
-                        <td>${new Date(d.startedAt).toLocaleDateString()}</td>
+                        <td>${fmtDate(d.startedAt)}</td>
                         <td>${d.totalPermissions.toLocaleString()}</td>
                         <td style="color:#b71c1c">${d.critical}</td>
                         <td style="color:#f44336">${d.high}</td>
@@ -1647,7 +1772,8 @@
 
     // Policies
     let policyConditions = [];
-    let lastEvalEntries = {};
+    let lastEvalRows = [];
+    let policyCache = [];
 
     const POLICY_FIELDS = [
         { value: 'category', label: 'Category' },
@@ -1709,9 +1835,11 @@
             <div class="card">
                 <h2>📜 Policy Rules</h2>
                 <p style="color:var(--text-muted);margin-bottom:16px">Policies define risk scoring rules. Each policy contains one or more conditions (all must match). During scans, permissions are scored by the highest-severity matching policy.</p>
-                <div class="btn-group" style="margin-bottom:16px">
+                <div class="btn-group" style="margin-bottom:16px;align-items:center;flex-wrap:wrap">
                     <button class="btn btn-primary" onclick="window.m365.showPolicyForm()">+ New Policy</button>
-                    <button class="btn btn-secondary" id="evalPoliciesBtn" onclick="window.m365.evaluatePolicies()">▶ Evaluate Latest Scan</button>
+                    <select id="evalScanSelect" title="Scan to evaluate or re-score" style="padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;color:var(--text);max-width:320px"></select>
+                    <button class="btn btn-secondary" id="evalPoliciesBtn" onclick="window.m365.evaluatePolicies()" title="Count matches of the current policies over every row of the selected scan">▶ Evaluate Scan</button>
+                    <button class="btn btn-secondary" id="rescoreBtn" onclick="window.m365.rescoreScan()" title="Re-apply the current policies to the stored risk levels of the selected scan">♻ Re-score this scan</button>
                     <button class="btn btn-secondary" onclick="window.m365.resetDefaultPolicies()" title="Delete all default policies and re-create them from built-in definitions">🔄 Reset Defaults</button>
                 </div>
                 <div class="table-wrapper" id="policiesTable">
@@ -1719,10 +1847,21 @@
                 </div>
             </div>
             <div class="card" id="violationsCard" style="display:none">
-                <h2>Policy Violations</h2>
+                <h2 id="violationsTitle">Policy Violations</h2>
+                <div id="violationsSummary"></div>
                 <div class="table-wrapper" id="violationsTable"></div>
             </div>
         `;
+        addPageTip('policies');
+
+        try {
+            const scans = await api.get('/scans' + tenantQuery());
+            const sel = document.getElementById('evalScanSelect');
+            const done = scans.success ? scans.data.filter(isDoneScan) : [];
+            sel.innerHTML = done.length === 0
+                ? '<option value="">No completed scans</option>'
+                : done.map(s => `<option value="${s.id}">Scan #${s.id} · ${fmtDate(s.startedAt)} · ${escapeHtml(s.scanTypes)}${s.status === 'CompletedWithErrors' ? ' (with errors)' : ''}</option>`).join('');
+        } catch { /* evaluation buttons report the missing scan */ }
 
         await loadPolicies();
     }
@@ -1733,6 +1872,7 @@
             if (!res.success || !res.data) return;
 
             const policies = res.data;
+            policyCache = policies;
             const tableDiv = document.getElementById('policiesTable');
             if (policies.length === 0) {
                 tableDiv.innerHTML = '<div class="empty-state"><p>No policies defined yet. Create your first rule or click "Reset Defaults" to load built-in policies.</p></div>';
@@ -1745,10 +1885,13 @@
                     const conds = (p.conditions || []);
                     const condSummary = conds.length === 0 ? '<em>none</em>'
                         : conds.map(c => `<span style="white-space:nowrap">${escapeHtml(c.field)} ${escapeHtml(c.operator)} <code>${escapeHtml(c.value?.length > 40 ? c.value.substring(0,37)+'...' : c.value)}</code></span>`).join(' <strong>AND</strong> ');
-                    const defaultBadge = p.isDefault ? ' <span style="font-size:0.7em;background:var(--bg-input);color:var(--text-muted);padding:1px 5px;border-radius:4px;vertical-align:middle">default</span>' : '';
+                    const defaultBadge = (p.isDefault ? ' <span class="policy-badge">default</span>' : '')
+                        + (p.isOutdatedDefault ? ' <span class="policy-badge policy-badge-warn" title="You edited this built-in policy and a newer built-in version is available. Reset Defaults loads it (and discards your edits).">update available</span>'
+                            : p.isModifiedDefault ? ' <span class="policy-badge" title="You edited this built-in policy; it won\'t be upgraded automatically.">edited</span>' : '');
+                    const tip = [p.description, p.remediation ? 'What to do: ' + p.remediation : ''].filter(Boolean).join('\n\n');
                     return `<tr>
                     <td><span style="color:${p.enabled ? 'var(--success)' : 'var(--text-muted)'};cursor:pointer" onclick="window.m365.togglePolicy(${p.id},${!p.enabled})" title="Click to ${p.enabled ? 'disable' : 'enable'}">${p.enabled ? '●' : '○'}</span></td>
-                    <td title="${escapeAttr(p.description || '')}">${escapeHtml(p.name)}${defaultBadge}</td>
+                    <td title="${escapeAttr(tip)}">${escapeHtml(p.name)}${defaultBadge}</td>
                     <td><span class="risk-badge risk-${(p.severity || 'high').toLowerCase()}">${escapeHtml(p.severity)}</span></td>
                     <td style="font-size:0.8em;line-height:1.5;max-width:400px">${condSummary}</td>
                     <td>${escapeHtml(p.categoryFilter || 'All')}</td>
@@ -1810,6 +1953,13 @@
                 <div class="form-group">
                     <label>Default Timeout (minutes)</label>
                     <input id="cfgTimeout" type="number" value="${cfg.defaultTimeoutMinutes || 120}" min="1" max="1440">
+                </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                        <input id="cfgCloudTips" type="checkbox" ${window.M365Cloud.tipsEnabled() ? 'checked' : ''} style="width:auto"
+                            onchange="window.M365Cloud.setTipsEnabled(this.checked)">
+                        Show ${window.M365Cloud.NAME} tips (stored in this browser; re-enabling also shows tips you hid)
+                    </label>
                 </div>
                 <div class="btn-group">
                     <button class="btn btn-primary" onclick="window.m365.saveSettings()">💾 Save</button>
@@ -1877,21 +2027,24 @@
                 if (res.success) {
                     await refreshStatus();
                     showToast(`Connected to ${state.tenantDomain}`, 'success');
-                    // Check tenant size and display recommendation
-                    try {
-                        const countRes = await api.get('/user-count');
-                        if (countRes.success && countRes.data && countRes.data.recommendation) {
-                            showToast(`${countRes.data.userCount.toLocaleString()} users detected`, 'info');
-                            showModal('Tenant Size Notice', `
-                                <p style="margin-bottom:12px"><strong>${countRes.data.userCount.toLocaleString()}</strong> user accounts detected in this tenant.</p>
-                                <p style="color:var(--text-muted)">${escapeHtml(countRes.data.recommendation)}</p>
-                                <div style="margin-top:16px">
-                                    <a href="https://m365permissions.com" target="_blank" rel="noopener" class="btn btn-primary" style="text-decoration:none">Learn More</a>
-                                    <button class="btn btn-secondary" style="margin-left:8px" onclick="document.getElementById('modalOverlay').style.display='none'">Continue</button>
-                                </div>
-                            `);
-                        }
-                    } catch { /* best effort */ }
+                    // Larger tenants: explain once per tenant what scheduled Cloud Edition scans would change.
+                    const sizeKey = 'm365_sizeNotice_' + (state.tenantId || state.tenantDomain || '');
+                    if (window.M365Cloud.tipsEnabled() && !localStorage.getItem(sizeKey)) {
+                        try {
+                            const countRes = await api.get('/user-count');
+                            if (countRes.success && countRes.data && countRes.data.recommendation) {
+                                localStorage.setItem(sizeKey, '1');
+                                showModal('Scanning a larger tenant', `
+                                    <p style="margin-bottom:12px"><strong>${countRes.data.userCount.toLocaleString()}</strong> enabled member accounts in this tenant. This module scans it fine; it just runs on demand from this workstation.</p>
+                                    <p style="color:var(--text-muted)">${escapeHtml(countRes.data.recommendation)}</p>
+                                    <div style="margin-top:16px">
+                                        <a href="${window.M365Cloud.link('/evaluate', 'tenant-size')}" target="_blank" rel="noopener" class="btn btn-secondary" style="text-decoration:none">Evaluate the ${window.M365Cloud.NAME}</a>
+                                        <button class="btn btn-primary" style="margin-left:8px" onclick="document.getElementById('modalOverlay').style.display='none'">Continue</button>
+                                    </div>
+                                `);
+                            }
+                        } catch { /* best effort */ }
+                    }
                     navigate();
                 } else {
                     showToast(res.error || 'Connection failed', 'error');
@@ -2051,18 +2204,33 @@
                 // Use configured output format
                 const cfgRes = await api.get('/config');
                 const format = (cfgRes.success && cfgRes.data?.outputFormat) ? cfgRes.data.outputFormat.toLowerCase() : 'xlsx';
-                const res = await api.getBlob(`/scans/${scanId}/export?format=${format}`);
-                if (!res.ok) { showToast('Export failed', 'error'); return; }
+                const category = document.getElementById('categoryFilter')?.value || '';
+                showToast(`Preparing ${format.toUpperCase()} export${category ? ` of ${category}` : ''}…`, 'info');
+                const res = await api.getBlob(`/scans/${scanId}/export?format=${format}${category ? '&category=' + encodeURIComponent(category) : ''}`);
+                if (!res.ok) {
+                    let msg = 'Export failed';
+                    try { const j = await res.json(); if (j.error) msg = j.error; } catch { /* not JSON */ }
+                    if (/too large for an XLSX export/i.test(msg) && window.M365Cloud.tipsEnabled())
+                        showModal('Export too large for Excel', `<p>${escapeHtml(msg)}</p>${window.M365Cloud.tip('largeExport')}`);
+                    else
+                        showToast(msg, 'error', 10000);
+                    return;
+                }
                 const blob = await res.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `M365Permissions_Scan${scanId}.${format}`;
+                a.download = `M365Permissions_${category || 'All'}_${scanId}.${format}`;
                 document.body.appendChild(a);
                 a.click();
                 a.remove();
                 URL.revokeObjectURL(url);
                 showToast('Export downloaded', 'success');
+                // Once per browser: scheduled email reports are the Cloud Edition's answer to repeated exports.
+                if (!localStorage.getItem('m365_exportTipShown') && window.M365Cloud.tipsEnabled()) {
+                    localStorage.setItem('m365_exportTipShown', '1');
+                    document.getElementById('resultsCoverage')?.insertAdjacentHTML('afterbegin', window.M365Cloud.tip('export'));
+                }
             } catch (e) {
                 showToast('Export failed: ' + e.message, 'error');
             }
@@ -2073,12 +2241,18 @@
             const newId = document.getElementById('newScanSelect')?.value;
             if (!oldId || !newId) { showToast('Select two scans first', 'error'); return; }
             try {
+                const category = document.getElementById('compareCategory')?.value || '';
                 const res = await fetch('/api/compare/export', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ oldScanId: parseInt(oldId), newScanId: parseInt(newId) })
+                    body: JSON.stringify({ oldScanId: parseInt(oldId), newScanId: parseInt(newId), category: category || null })
                 });
-                if (!res.ok) { showToast('Export failed', 'error'); return; }
+                if (!res.ok) {
+                    let msg = 'Export failed';
+                    try { const j = await res.json(); if (j.error) msg = j.error; } catch { /* not JSON */ }
+                    showToast(msg, 'error', 10000);
+                    return;
+                }
                 const blob = await res.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -2100,59 +2274,65 @@
             if (!oldId || !newId) { showToast('Select two scans', 'error'); return; }
             if (oldId === newId) { showToast('Select two different scans', 'error'); return; }
 
+            const category = document.getElementById('compareCategory')?.value || '';
             try {
-                const res = await api.post('/compare', { oldScanId: parseInt(oldId), newScanId: parseInt(newId) });
-                if (!res.success) { showToast(res.error || 'Compare failed', 'error'); return; }
+                const res = await api.post('/compare', { oldScanId: parseInt(oldId), newScanId: parseInt(newId), category: category || null, limit: COMPARE_LIMIT });
+                if (!res.success) { showToast(res.error || 'Compare failed', 'error', 10000); return; }
 
                 const r = res.data;
+                lastCompare = { r, newScanId: parseInt(newId), oldScanId: parseInt(oldId) };
                 document.getElementById('compareResults').style.display = '';
                 document.getElementById('btnExportCompare').style.display = '';
+                document.getElementById('compareCoverage').innerHTML = coverageNotice(r.excludedCategories, r.flaggedCategories);
                 document.getElementById('compareStats').innerHTML = `
-                    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${r.added?.length || 0}</div><div class="stat-label">Added</div></div>
-                    <div class="stat-card"><div class="stat-value" style="color:var(--error)">${r.removed?.length || 0}</div><div class="stat-label">Removed</div></div>
-                    <div class="stat-card"><div class="stat-value" style="color:var(--warning)">${r.changed?.length || 0}</div><div class="stat-label">Changed</div></div>
+                    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${r.addedCount.toLocaleString()}</div><div class="stat-label">Added</div></div>
+                    <div class="stat-card"><div class="stat-value" style="color:var(--error)">${r.removedCount.toLocaleString()}</div><div class="stat-label">Removed</div></div>
+                    <div class="stat-card"><div class="stat-value" style="color:var(--warning)">${r.changedCount.toLocaleString()}</div><div class="stat-label">Changed</div></div>
+                    <div class="stat-card"><div class="stat-value" style="color:#b71c1c">${r.newCriticalCount.toLocaleString()}</div><div class="stat-label">New/escalated Critical</div></div>
+                    <div class="stat-card"><div class="stat-value" style="color:#f44336">${r.newHighCount.toLocaleString()}</div><div class="stat-label">New/escalated High</div></div>
                 `;
-
-                const all = [
-                    ...(r.added || []).map(p => ({ ...p, changeType: 'Added' })),
-                    ...(r.removed || []).map(p => ({ ...p, changeType: 'Removed' })),
-                    ...(r.changed || []).map(c => ({
-                        changeType: 'Changed',
-                        category: (c.new || c.old || {}).category || '',
-                        targetPath: (c.new || c.old || {}).targetPath || '',
-                        principalEntraUpn: (c.new || c.old || {}).principalEntraUpn || '',
-                        principalSysName: (c.new || c.old || {}).principalSysName || '',
-                        principalRole: (c.new || c.old || {}).principalRole || '',
-                        through: (c.changedFields || []).join(', ')
-                    }))
-                ];
-
-                document.getElementById('compareTable').innerHTML = all.length === 0
-                    ? '<div class="empty-state"><p>No differences found</p></div>'
-                    : `<table>
-                        <thead><tr><th>Change</th><th>Category</th><th>Target</th><th>Principal</th><th>Role</th><th>Details</th></tr></thead>
-                        <tbody>${all.slice(0, 500).map(c => {
-                            const principal = c.principalEntraUpn || c.principalSysName || '';
-                            return `<tr class="clickable-row" onclick="window.m365.showCompareDetail(this)" data-json="${escapeAttr(JSON.stringify(c))}">
-                                <td style="color:var(--${c.changeType === 'Added' ? 'success' : c.changeType === 'Removed' ? 'error' : 'warning'})">${c.changeType}</td>
-                                <td>${escapeHtml(c.category || '')}</td>
-                                <td title="${escapeHtml(c.targetPath || '')}">${escapeHtml(truncate(c.targetPath, 40))}</td>
-                                <td>${escapeHtml(principal)}</td>
-                                <td>${escapeHtml(c.principalRole || '')}</td>
-                                <td>${escapeHtml(c.through || '')}</td>
-                            </tr>`;
-                        }).join('')}</tbody>
-                    </table>`;
+                const firstTab = r.addedCount ? 'added' : r.removedCount ? 'removed' : r.changedCount ? 'changed' : 'added';
+                window.m365.showCompareTab(firstTab);
             } catch (e) {
                 showToast('Compare failed: ' + e.message, 'error');
             }
         },
 
-        showCompareDetail(row) {
-            try {
-                const entry = JSON.parse(row.dataset.json);
-                showDetailPanel(entry);
-            } catch { }
+        showCompareTab(tab) {
+            if (!lastCompare) return;
+            const r = lastCompare.r;
+            const counts = { added: r.addedCount, removed: r.removedCount, changed: r.changedCount };
+            document.getElementById('compareTabs').innerHTML = ['added', 'removed', 'changed'].map(t =>
+                `<button class="btn btn-secondary${t === tab ? ' btn-active' : ''}" onclick="window.m365.showCompareTab('${t}')">${t[0].toUpperCase() + t.slice(1)} (${counts[t].toLocaleString()})</button>`
+            ).join('');
+
+            const rows = tab === 'changed'
+                ? (r.changed || []).map(c => ({ ...(c.new || c.old || {}), changeType: 'Changed', details: (c.changedFields || []).map(f => `${f}: ${changeValue(c.old, f)} → ${changeValue(c.new, f)}`).join('; ') }))
+                : (r[tab] || []).map(p => ({ ...p, changeType: tab === 'added' ? 'Added' : 'Removed', details: p.through || '' }));
+            lastCompare.rows = rows;
+            document.getElementById('compareNotice').textContent = rows.length < counts[tab]
+                ? `Showing the first ${rows.length.toLocaleString()} of ${counts[tab].toLocaleString()}. Export the comparison for the full list.`
+                : '';
+
+            document.getElementById('compareTable').innerHTML = rows.length === 0
+                ? '<div class="empty-state"><p>No differences found</p></div>'
+                : `<table>
+                    <thead><tr><th>Risk</th><th>Category</th><th>Target</th><th>Principal</th><th>Role</th><th>${tab === 'changed' ? 'Changes' : 'Through'}</th></tr></thead>
+                    <tbody>${rows.map((c, i) => `<tr class="clickable-row" onclick="window.m365.showCompareDetail(${i})">
+                        <td><span class="risk-badge risk-${escapeAttr((c.riskLevel || 'low').toLowerCase())}">${escapeHtml(c.riskLevel || '')}</span></td>
+                        <td>${escapeHtml(c.category || '')}</td>
+                        <td title="${escapeAttr(c.targetPath || '')}">${escapeHtml(truncate(c.targetPath, 40))}</td>
+                        <td>${escapeHtml(c.principalEntraUpn || c.principalSysName || c.principalSysId || c.principalEntraId || '')}</td>
+                        <td>${escapeHtml(c.principalRole || '')}</td>
+                        <td title="${escapeAttr(c.details || '')}">${escapeHtml(truncate(c.details || '', 80))}</td>
+                    </tr>`).join('')}</tbody>
+                </table>`;
+        },
+
+        showCompareDetail(idx) {
+            const entry = lastCompare && lastCompare.rows ? lastCompare.rows[idx] : null;
+            if (!entry) return;
+            showDetailPanel({ ...entry, scanId: entry.scanId || lastCompare.newScanId });
         },
 
         async saveSettings() {
@@ -2213,13 +2393,14 @@
         },
 
         async editScanNotes(scanId) {
-            const notes = prompt('Edit scan notes:');
+            const el = document.getElementById(`scanNotes${scanId}`);
+            const notes = prompt('Edit scan notes:', el?.dataset.notes || '');
             if (notes === null) return;
             try {
-                const res = await api.put(`/scans/${scanId}`, { notes: notes, tags: '' });
+                // Only notes: omitting tags leaves them unchanged.
+                const res = await api.put(`/scans/${scanId}`, { notes: notes });
                 if (res.success) {
-                    const el = document.getElementById(`scanNotes${scanId}`);
-                    if (el) el.textContent = notes || '—';
+                    if (el) { el.textContent = notes || '-'; el.dataset.notes = notes; }
                     showToast('Scan notes updated', 'success');
                 } else {
                     showToast(res.error || 'Failed to update notes', 'error');
@@ -2262,6 +2443,11 @@
                     <label>Conditions <span style="color:var(--text-muted);font-weight:400">(all conditions must match)</span></label>
                     <div id="conditionsEditor"></div>
                 </div>
+                <div class="form-group">
+                    <label>Remediation <span style="color:var(--text-muted);font-weight:400">(what to do about a match, and where)</span></label>
+                    <textarea id="policyRemediation" rows="3" placeholder="e.g. Remove the assignment in Entra admin center > Roles and administrators." style="width:100%;resize:vertical"></textarea>
+                </div>
+                <div id="policyFormError" class="notice notice-warning" style="display:none"></div>
                 <div class="btn-group">
                     <button class="btn btn-primary" onclick="window.m365.savePolicy()">💾 Save</button>
                     <button class="btn btn-secondary" onclick="document.getElementById('modalOverlay').style.display='none'">Cancel</button>
@@ -2274,6 +2460,7 @@
                 document.getElementById('policyDesc').value = policy.description || '';
                 document.getElementById('policySeverity').value = policy.severity;
                 document.getElementById('policyCat').value = policy.categoryFilter || '';
+                document.getElementById('policyRemediation').value = policy.remediation || '';
                 policyConditions = (policy.conditions || []).map(c => ({...c}));
                 if (policyConditions.length === 0) policyConditions.push({ field: 'principal_type', operator: 'equals', value: '' });
             } else {
@@ -2307,7 +2494,13 @@
 
         async togglePolicy(id, enabled) {
             try {
-                const res = await api.put(`/policies/${id}`, { enabled });
+                // Send the full definition (the server also merges missing properties).
+                const current = policyCache.find(p => p.id === id);
+                const body = current
+                    ? { name: current.name, description: current.description, severity: current.severity, categoryFilter: current.categoryFilter,
+                        conditions: current.conditions, remediation: current.remediation, enabled }
+                    : { enabled };
+                const res = await api.put(`/policies/${id}`, body);
                 if (res.success) await loadPolicies();
                 else showToast(res.error || 'Toggle failed', 'error');
             } catch (e) { showToast('Error: ' + e.message, 'error'); }
@@ -2315,13 +2508,16 @@
 
         async savePolicy() {
             const id = document.getElementById('policyId').value;
-            const conditions = collectConditions().filter(c => c.value.trim() !== '');
+            const existing = id ? policyCache.find(p => p.id === Number(id)) : null;
+            const conditions = collectConditions().filter(c => c.value.trim() !== '' || /^not/i.test(c.operator));
             const policy = {
                 name: document.getElementById('policyName').value,
                 description: document.getElementById('policyDesc').value,
-                enabled: true,
+                // Keep the current state when editing; new policies start enabled. isDefault is server-owned.
+                enabled: existing ? existing.enabled : true,
                 severity: document.getElementById('policySeverity').value,
                 categoryFilter: document.getElementById('policyCat').value,
+                remediation: document.getElementById('policyRemediation').value,
                 conditions: conditions
             };
             if (!policy.name) { showToast('Policy name is required', 'error'); return; }
@@ -2335,11 +2531,14 @@
                     res = await api.post('/policies', policy);
                 }
                 if (res.success) {
-                    showToast(id ? 'Policy updated' : 'Policy created', 'success');
+                    showToast(id ? 'Policy updated. Re-score a scan to apply it to stored results.' : 'Policy created. Re-score a scan to apply it to stored results.', 'success', 6000);
                     closeModal();
                     await loadPolicies();
                 } else {
-                    showToast(res.error || 'Save failed', 'error');
+                    // Validation errors (unknown field, bad regex, severity) are shown in the form.
+                    const errEl = document.getElementById('policyFormError');
+                    if (errEl) { errEl.textContent = res.error || 'Save failed'; errEl.style.display = ''; }
+                    else showToast(res.error || 'Save failed', 'error');
                 }
             } catch (e) {
                 showToast('Error: ' + e.message, 'error');
@@ -2378,92 +2577,96 @@
         },
 
         async evaluatePolicies() {
+            const scanId = document.getElementById('evalScanSelect')?.value;
+            if (!scanId) { showToast('No completed scan to evaluate', 'error'); return; }
             const btn = document.getElementById('evalPoliciesBtn');
             if (btn) {
                 btn.disabled = true;
                 btn.innerHTML = '<span class="btn-spinner"></span> Evaluating...';
             }
             try {
-                const scans = await api.get('/scans' + tenantQuery());
-                if (!scans.success || scans.data.length === 0) {
-                    showToast('No scans available to evaluate', 'error');
-                    return;
-                }
-                const latest = scans.data.find(s => s.status === 'Completed');
-                if (!latest) { showToast('No completed scans found', 'error'); return; }
-
-                const res = await api.post('/policies/evaluate', { scanId: latest.id });
+                const res = await api.post('/policies/evaluate', { scanId: Number(scanId), maxViolations: 500 });
                 if (!res.success) { showToast(res.error || 'Evaluation failed', 'error'); return; }
 
-                const violations = res.data.violations || {};
-                lastEvalEntries = res.data.entries || {};
-
+                const r = res.data;
+                lastEvalRows = r.violations || [];
                 const card = document.getElementById('violationsCard');
                 const table = document.getElementById('violationsTable');
                 card.style.display = '';
+                document.getElementById('violationsTitle').textContent = `Policy Violations in Scan #${r.scanId}`;
 
-                const vEntries = Object.entries(violations);
-                if (vEntries.length === 0) {
-                    table.innerHTML = '<div class="empty-state"><p>✅ No policy violations found in the latest scan</p></div>';
-                    showToast('Evaluation complete — no violations', 'success');
+                const warnings = (r.warnings || []).length
+                    ? `<div class="notice notice-warning">These policies can't match anything: ${r.warnings.map(escapeHtml).join('; ')}</div>` : '';
+                document.getElementById('violationsSummary').innerHTML = `${warnings}
+                    <p style="color:var(--text-muted);font-size:0.9em">${r.entriesWithViolations.toLocaleString()} of ${r.entriesEvaluated.toLocaleString()} rows match at least one policy.</p>
+                    ${(r.perPolicy || []).length ? `<table class="data-table" style="margin-bottom:16px">
+                        <thead><tr><th>Severity</th><th>Policy</th><th style="text-align:right">Matches</th></tr></thead>
+                        <tbody>${r.perPolicy.map(c => `<tr>
+                            <td><span class="risk-badge risk-${escapeAttr((c.severity || 'high').toLowerCase())}">${escapeHtml(c.severity)}</span></td>
+                            <td>${escapeHtml(c.policyName)}</td>
+                            <td style="text-align:right">${c.count.toLocaleString()}</td>
+                        </tr>`).join('')}</tbody>
+                    </table>` : ''}`;
+
+                if (lastEvalRows.length === 0) {
+                    table.innerHTML = '<div class="empty-state"><p>✅ No policy violations found in this scan</p></div>';
+                    showToast('Evaluation complete: no violations', 'success');
                     return;
                 }
 
-                const rows = vEntries.flatMap(([idx, viols]) =>
-                    viols.map(v => {
-                        const entry = lastEvalEntries[idx];
-                        const principal = entry ? (entry.principalEntraUpn || entry.principalSysName || '') : '';
-                        const target = entry ? entry.targetPath || '' : '';
-                        return `<tr class="clickable-row" onclick="window.m365.showViolationDetail(${idx})">
-                            <td><span class="risk-badge risk-${(v.severity || 'high').toLowerCase()}">${escapeHtml(v.severity)}</span></td>
-                            <td>${escapeHtml(v.policyName)}</td>
-                            <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeAttr(target)}">${escapeHtml(target)}</td>
-                            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeAttr(principal)}">${escapeHtml(principal)}</td>
-                            <td>${escapeHtml(entry ? entry.principalRole || '' : '')}</td>
-                        </tr>`;
-                    })
-                );
                 table.innerHTML = `<table>
                     <thead><tr><th>Severity</th><th>Policy</th><th>Target</th><th>Principal</th><th>Role</th></tr></thead>
-                    <tbody>${rows.join('')}</tbody>
+                    <tbody>${lastEvalRows.map((row, idx) => {
+                        const e = row.entry || {};
+                        const top = (row.violations || [])[0] || {};
+                        const more = (row.violations || []).length > 1 ? ` <span style="color:var(--text-muted)">+${row.violations.length - 1}</span>` : '';
+                        const principal = e.principalEntraUpn || e.principalSysName || '';
+                        return `<tr class="clickable-row" onclick="window.m365.showViolationDetail(${idx})">
+                            <td><span class="risk-badge risk-${escapeAttr((top.severity || 'high').toLowerCase())}">${escapeHtml(top.severity || '')}</span></td>
+                            <td>${escapeHtml(top.policyName || '')}${more}</td>
+                            <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeAttr(e.targetPath || '')}">${escapeHtml(e.targetPath || '')}</td>
+                            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeAttr(principal)}">${escapeHtml(principal)}</td>
+                            <td>${escapeHtml(e.principalRole || '')}</td>
+                        </tr>`;
+                    }).join('')}</tbody>
                 </table>
-                <p style="margin-top:8px;font-size:0.85em;color:var(--text-muted)">${vEntries.length} entries with violations in scan #${latest.id}</p>`;
-                showToast(`Evaluation complete — ${vEntries.length} violations found`, 'success');
+                <p style="margin-top:8px;font-size:0.85em;color:var(--text-muted)">${r.truncated
+                    ? `Showing the ${lastEvalRows.length.toLocaleString()} most severe of ${r.entriesWithViolations.toLocaleString()} rows with violations.`
+                    : `${lastEvalRows.length.toLocaleString()} rows with violations.`}</p>`;
+                showToast(`Evaluation complete: ${r.entriesWithViolations.toLocaleString()} rows with violations`, 'success');
             } catch (e) {
                 showToast('Evaluation failed: ' + e.message, 'error');
             } finally {
                 if (btn) {
                     btn.disabled = false;
-                    btn.innerHTML = '▶ Evaluate Latest Scan';
+                    btn.innerHTML = '▶ Evaluate Scan';
                 }
             }
         },
 
+        async rescoreScan() {
+            const scanId = document.getElementById('evalScanSelect')?.value;
+            if (!scanId) { showToast('No completed scan to re-score', 'error'); return; }
+            if (!confirm(`Re-apply the current enabled policies to every row of scan #${scanId}? This replaces the stored risk levels of that scan.`)) return;
+            const btn = document.getElementById('rescoreBtn');
+            if (btn) { btn.disabled = true; btn.innerHTML = '<span class="btn-spinner"></span> Re-scoring...'; }
+            try {
+                const res = await api.post(`/scans/${scanId}/rescore`, {});
+                if (!res.success) { showToast(res.error || 'Re-score failed', 'error'); return; }
+                const r = res.data;
+                const summary = ['Critical', 'High', 'Medium', 'Low', 'Info'].map(l => `${l} ${(r.riskSummary[l] || 0).toLocaleString()}`).join(', ');
+                showToast(`Scan #${r.scanId} re-scored: ${r.entriesChanged.toLocaleString()} of ${r.entriesScored.toLocaleString()} rows changed. ${summary}`, 'success', 10000);
+            } catch (e) {
+                showToast('Re-score failed: ' + e.message, 'error');
+            } finally {
+                if (btn) { btn.disabled = false; btn.innerHTML = '♻ Re-score this scan'; }
+            }
+        },
+
         showViolationDetail(idx) {
-            const entry = lastEvalEntries[idx];
-            if (!entry) { showToast('Entry details not available', 'error'); return; }
-            const fields = [
-                ['Category', entry.category],
-                ['Target Path', entry.targetPath],
-                ['Target Type', entry.targetType],
-                ['Target ID', entry.targetId],
-                ['Principal UPN', entry.principalEntraUpn],
-                ['Principal Name', entry.principalSysName],
-                ['Principal Type', entry.principalType],
-                ['Principal Entra ID', entry.principalEntraId],
-                ['Role', entry.principalRole],
-                ['Through', entry.through],
-                ['Access Type', entry.accessType],
-                ['Tenure', entry.tenure],
-                ['Risk Level', entry.riskLevel],
-                ['Risk Reason', entry.riskReason],
-            ].filter(([, v]) => v);
-            const html = `<table class="detail-table">
-                <tbody>${fields.map(([label, value]) =>
-                    `<tr><td class="detail-label">${escapeHtml(label)}</td><td>${escapeHtml(value)}</td></tr>`
-                ).join('')}</tbody>
-            </table>`;
-            showModal('Permission Entry Detail', html);
+            const row = lastEvalRows[idx];
+            if (!row || !row.entry) { showToast('Entry details not available', 'error'); return; }
+            showDetailPanel(row.entry);
         },
 
         toggleColumnPicker() {
@@ -2498,8 +2701,24 @@
             });
         },
 
+        async deleteScan(scanId) {
+            if (!confirm(`Delete scan #${scanId} and all its results? This can't be undone.`)) return;
+            try {
+                const res = await api.del(`/scans/${scanId}`);
+                if (res.success) {
+                    showToast(`Scan #${scanId} deleted`, 'success');
+                    navigate();
+                } else {
+                    showToast(res.error || 'Delete failed', 'error');
+                }
+            } catch (e) {
+                showToast('Delete failed: ' + e.message, 'error');
+            }
+        },
+
         loadResults,
         showGroupMembers,
+        showSharePointGroupMembers,
         searchUserPerms
     };
 
@@ -2517,8 +2736,8 @@
             return;
         }
 
-        // Ctrl+E or Cmd+E to export
-        if ((e.ctrlKey || e.metaKey) && e.key === 'e') {
+        // Ctrl+E or Cmd+E to export (Results page only)
+        if ((e.ctrlKey || e.metaKey) && e.key === 'e' && document.getElementById('scanSelect')) {
             e.preventDefault();
             window.m365.exportResults();
             return;
@@ -2565,8 +2784,18 @@
     }
 
     // ── Init ────────────────────────────────────────────────────
+    // Footer copyright year: rewrite only the year text node, leaving the footer markup as is.
+    function updateFooterYear() {
+        const span = document.querySelector('.site-footer span');
+        const node = span && Array.from(span.childNodes).find(n => n.nodeType === Node.TEXT_NODE && /\d{4}/.test(n.textContent));
+        if (node) node.textContent = node.textContent.replace(/\d{4}/, String(new Date().getFullYear()));
+        const cloudLink = document.getElementById('footerCloudLink');
+        if (cloudLink) cloudLink.href = window.M365Cloud.link('/', 'footer');
+    }
+
     async function init() {
         initTheme();
+        updateFooterYear();
         await refreshStatus();
         window.addEventListener('hashchange', navigate);
         navigate();

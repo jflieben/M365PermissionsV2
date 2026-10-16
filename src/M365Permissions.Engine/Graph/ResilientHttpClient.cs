@@ -13,30 +13,45 @@ namespace M365Permissions.Engine.Graph;
 /// </summary>
 public sealed class ResilientHttpClient : IDisposable
 {
-    private readonly HttpClient _http = new();
+    private readonly HttpClient _http = new() { Timeout = RetryPolicy.HttpTimeout };
     private readonly DelegatedAuth _auth;
     private const int MaxRetries = 5;
 
     public ResilientHttpClient(DelegatedAuth auth) => _auth = auth;
 
     /// <summary>
-    /// Send a request with retry on 429 (honouring Retry-After) and transient 5xx errors.
-    /// The factory must build a fresh <see cref="HttpRequestMessage"/> each attempt because a
-    /// sent request cannot be reused.
+    /// Send a request with retry on 429 (honouring Retry-After), transient 5xx errors, network
+    /// failures and HttpClient timeouts. The factory must build a fresh <see cref="HttpRequestMessage"/>
+    /// each attempt because a sent request cannot be reused.
     /// </summary>
-    public async Task<HttpResponseMessage> SendAsync(Func<HttpRequestMessage> requestFactory, CancellationToken ct)
+    public Task<HttpResponseMessage> SendAsync(Func<HttpRequestMessage> requestFactory, CancellationToken ct)
+        => SendAsync(_ => Task.FromResult(requestFactory()), ct);
+
+    /// <summary>As <see cref="SendAsync(Func{HttpRequestMessage}, CancellationToken)"/> with an async factory (fresh token per attempt).</summary>
+    public async Task<HttpResponseMessage> SendAsync(Func<CancellationToken, Task<HttpRequestMessage>> requestFactory, CancellationToken ct)
     {
         for (int attempt = 0; ; attempt++)
         {
             ct.ThrowIfCancellationRequested();
-            using var req = requestFactory();
-            var resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
+            var last = attempt >= MaxRetries - 1;
+            HttpResponseMessage resp;
+            try
+            {
+                using var req = await requestFactory(ct).ConfigureAwait(false);
+                resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!last && (RetryPolicy.IsTimeout(ex, ct) || ex is HttpRequestException { StatusCode: null }))
+            {
+                await Task.Delay(RetryPolicy.Backoff(attempt), ct).ConfigureAwait(false);
+                continue;
+            }
 
             var isThrottled = resp.StatusCode == (HttpStatusCode)429;
             var isTransient = (int)resp.StatusCode >= 500;
-            if ((isThrottled || isTransient) && attempt < MaxRetries - 1)
+            if ((isThrottled || isTransient) && !last)
             {
-                var delay = resp.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
+                var delay = RetryPolicy.RetryAfter(resp.Headers.RetryAfter)
+                    ?? (isThrottled ? RetryPolicy.ThrottleBackoff(attempt) : RetryPolicy.Backoff(attempt));
                 resp.Dispose();
                 await Task.Delay(delay, ct).ConfigureAwait(false);
                 continue;
@@ -52,9 +67,10 @@ public sealed class ResilientHttpClient : IDisposable
     /// </summary>
     public async Task<JsonElement?> GetJsonAsync(string url, string resourceKey, CancellationToken ct)
     {
-        var token = await _auth.GetAccessTokenAsync(resourceKey, ct).ConfigureAwait(false);
-        using var resp = await SendAsync(() =>
+        // Token per attempt: a long throttle wait can outlive the token acquired before it.
+        using var resp = await SendAsync(async tok =>
         {
+            var token = await _auth.GetAccessTokenAsync(resourceKey, tok).ConfigureAwait(false);
             var r = new HttpRequestMessage(HttpMethod.Get, url);
             r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             return r;

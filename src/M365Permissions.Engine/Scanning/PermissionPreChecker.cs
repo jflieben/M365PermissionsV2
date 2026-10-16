@@ -139,7 +139,7 @@ public sealed class PermissionPreChecker
         }
         catch
         {
-            // If we can't enumerate roles, we'll skip role checks silently — the API-level checks still run
+            // If we can't enumerate roles, we'll skip role checks silently; the API-level checks still run
         }
         return roleIds;
     }
@@ -161,9 +161,10 @@ public sealed class PermissionPreChecker
 
     private async Task CheckEntraAsync(List<string> issues, CancellationToken ct)
     {
-        await RunCheck(issues, "Directory.Read.All",
-            "Entra directory role enumeration",
-            async () => await _graphClient.GetAsync("directoryRoles?$select=id", ct: ct));
+        await RunCheck(issues, "RoleManagement.Read.Directory",
+            "Entra role definition and assignment enumeration",
+            // No $top: roleManagement lists reject page sizes below 20 (Request_UnsupportedQuery).
+            async () => await _graphClient.GetAsync("roleManagement/directory/roleDefinitions?$select=id", ct: ct));
 
         await RunCheck(issues, "Application.Read.All",
             "app registration scanning",
@@ -173,17 +174,32 @@ public sealed class PermissionPreChecker
             "group membership scanning",
             async () => await _graphClient.GetAsync("groups?$top=1&$select=id", ct: ct));
 
-        // Optional: Subscription.Read.All for webhook subscription enumeration
-        await RunCheck(issues, "Subscription.Read.All",
-            "Graph webhook subscription scanning (subscription scanning will be skipped without this)",
-            async () => await _graphClient.GetAsync("subscriptions", ct: ct),
-            optional: true);
+        // PIM reads: assignment schedules tell activated roles from permanent ones, eligibility lists eligible admins.
+        await CheckPimAsync(issues, "roleManagement/directory/roleAssignmentScheduleInstances?$select=id",
+            "PIM assignment schedules (without them PIM-activated and time-bound roles are reported as Permanent)", ct);
+        await CheckPimAsync(issues, "roleManagement/directory/roleEligibilityScheduleInstances?$select=id",
+            "PIM eligible role assignments (they will be missing)", ct);
+    }
 
-        // PIM is optional — not all tenants have it
-        await RunCheck(issues, "RoleEligibilitySchedule.Read.Directory",
-            "PIM eligible role assignments (PIM scanning will be skipped without this)",
-            async () => await _graphClient.GetAsync("roleManagement/directory/roleEligibilityScheduleInstances?$top=1", ct: ct),
-            optional: true);
+    /// <summary>Probe a PIM endpoint: 401/403 means PIM data will be missing from the scan.</summary>
+    private async Task CheckPimAsync(List<string> issues, string url, string purpose, CancellationToken ct)
+    {
+        try
+        {
+            await _graphClient.GetAsync(url, maxRetries: 2, ct: ct);
+        }
+        catch (HttpRequestException ex) when (EntraScanner.IsLicensingError(ex))
+        {
+            // No Entra ID P2 licence: then no PIM assignments exist and nothing is lost.
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode is System.Net.HttpStatusCode.Forbidden or System.Net.HttpStatusCode.Unauthorized)
+        {
+            issues.Add($"Cannot read {purpose}: HTTP {(int)ex.StatusCode!}. Needs consent for RoleManagement.Read.Directory and a role that can read PIM (e.g. Global Reader, Security Reader or Privileged Role Administrator).");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            issues.Add($"Could not verify access to {purpose}: {ex.Message}");
+        }
     }
 
     private async Task CheckExchangeAsync(List<string> issues, CancellationToken ct)
@@ -332,7 +348,7 @@ public sealed class PermissionPreChecker
         {
             issues.Add("Cannot acquire PowerApps token. PowerApps and connector scanning will be skipped.");
         }
-        catch { /* Non-critical — PowerApps scanning is optional */ }
+        catch { /* Non-critical: PowerApps scanning is optional */ }
     }
 
     private async Task CheckAzureAsync(List<string> issues, CancellationToken ct)
@@ -345,15 +361,33 @@ public sealed class PermissionPreChecker
                 "https://management.azure.com/subscriptions?api-version=2022-12-01&$top=1");
             req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
 
-            var resp = await http.SendAsync(req, ct);
+            using var resp = await http.SendAsync(req, ct);
             if (resp.StatusCode == System.Net.HttpStatusCode.Forbidden)
             {
                 issues.Add("Missing permission: Reader role on Azure subscriptions (needed for RBAC role assignment scanning)");
+            }
+            else if (resp.IsSuccessStatusCode && IsEmptyValueList(await resp.Content.ReadAsStringAsync(ct)))
+            {
+                issues.Add("No Azure subscriptions are visible to this account: the Azure scan will find nothing. Grant it Reader on the subscriptions (or management groups) to audit.");
             }
         }
         catch (InvalidOperationException)
         {
             issues.Add("Cannot acquire Azure Management token. Ensure the user has access to Azure subscriptions.");
+        }
+    }
+
+    /// <summary>True for a JSON body whose "value" array is empty.</summary>
+    public static bool IsEmptyValueList(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.TryGetProperty("value", out var v) && v.ValueKind == JsonValueKind.Array && v.GetArrayLength() == 0;
+        }
+        catch (JsonException)
+        {
+            return false;
         }
     }
 
@@ -399,7 +433,7 @@ public sealed class PermissionPreChecker
         }
         catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Unauthorized)
         {
-            issues.Add($"Unauthorized: {permissionName} — token may lack consent or be expired (needed for {purpose})");
+            issues.Add($"Unauthorized: {permissionName}: token may lack consent or be expired (needed for {purpose})");
         }
         catch (HttpRequestException ex) when (optional)
         {
@@ -501,7 +535,7 @@ public sealed class PermissionPreChecker
                 JsonSerializer.Serialize(body), System.Text.Encoding.UTF8, "application/json");
 
             var response = await http.SendAsync(request, ct);
-            // 302 redirect is expected (regional discovery) — that means the endpoint is reachable
+            // 302 redirect is expected (regional discovery), which means the endpoint is reachable
             if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
             {
                 issues.Add("Cannot access Purview Compliance role groups (HTTP 403). Exchange Administrator or Compliance Administrator role is required.");

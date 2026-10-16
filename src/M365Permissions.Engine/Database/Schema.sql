@@ -116,3 +116,13 @@ CREATE TABLE IF NOT EXISTS policies (
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Coverage facts a scan measured but did not itemize (sharing links, item-level grants, partial sources).
+-- Drives the coverage notes in the GUI and exports.
+CREATE TABLE IF NOT EXISTS scan_insights (
+    scan_id             INTEGER NOT NULL,
+    category            TEXT NOT NULL DEFAULT '',
+    key                 TEXT NOT NULL DEFAULT '',
+    value               INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (scan_id, category, key)
+);

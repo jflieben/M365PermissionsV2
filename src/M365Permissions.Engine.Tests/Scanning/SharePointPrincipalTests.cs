@@ -13,7 +13,10 @@ public sealed class SharePointPrincipalTests
     [InlineData("c:0(.s|true", "Everyone")]
     [InlineData("c:0-.f|rolemanager|spo-grid-all-users/1a2b3c4d-0000-0000-0000-000000000000", "Everyone")]
     [InlineData("c:0t.c|tenant|1a2b3c4d-0000-0000-0000-000000000000", "SecurityGroup")]
-    [InlineData("c:0o.c|federateddirectoryclaimprovider|1a2b3c4d-0000-0000-0000-000000000000_o", "SecurityGroup")]
+    [InlineData("c:0o.c|federateddirectoryclaimprovider|1a2b3c4d-0000-0000-0000-000000000000_o", "M365Group")]
+    [InlineData("c:0o.c|federateddirectoryclaimprovider|1a2b3c4d-0000-0000-0000-000000000000", "M365Group")]
+    [InlineData("i:0i.t|ms.sp.ext|6a2b3c4d-0000-0000-0000-000000000000@7a2b3c4d-0000-0000-0000-000000000000", "Application")]
+    [InlineData("i:0#.f|membership|urn%3aspo%3aanon#abc", "Anonymous")]
     [InlineData("SHAREPOINT\\system", "Unknown")]
     [InlineData("", "Unknown")]
     public void DetermineType_ClassifiesLoginNames(string loginName, string expected)

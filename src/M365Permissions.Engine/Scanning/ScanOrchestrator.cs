@@ -16,6 +16,7 @@ public sealed class ScanOrchestrator
     private readonly PermissionRepository _permRepo;
     private readonly PolicyRepository _policyRepo;
     private readonly LogRepository _logRepo;
+    private readonly InsightRepository? _insightRepo;
     private readonly List<IScanProvider> _providers = new();
 
     // Max log level to persist to the DB, derived from config.LogLevel. -1 = persist nothing.
@@ -39,8 +40,10 @@ public sealed class ScanOrchestrator
     public bool IsScanning => _scanTask is { IsCompleted: false };
     public long ActiveScanId => _activeScanId;
 
-    public ScanOrchestrator(SqliteDb db, ScanRepository scanRepo, PermissionRepository permRepo, PolicyRepository policyRepo, LogRepository logRepo)
+    public ScanOrchestrator(SqliteDb db, ScanRepository scanRepo, PermissionRepository permRepo, PolicyRepository policyRepo, LogRepository logRepo,
+        InsightRepository? insightRepo = null)
     {
+        _insightRepo = insightRepo;
         _db = db;
         _scanRepo = scanRepo;
         _permRepo = permRepo;
@@ -79,6 +82,13 @@ public sealed class ScanOrchestrator
         _timeoutMinutes = context.Config?.DefaultTimeoutMinutes ?? 0;
         _scanStartUtc = DateTimeOffset.UtcNow;
 
+        // Normalise to the provider's spelling and drop duplicates: Category drives DB joins
+        // ("Entra"), and "Entra,entra" would otherwise run the provider twice.
+        scanTypes = scanTypes
+            .Select(t => _providers.FirstOrDefault(p => p.Category.Equals(t, StringComparison.OrdinalIgnoreCase))?.Category ?? t)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
         // Initialize progress entries for each requested type
         foreach (var type in scanTypes)
         {
@@ -108,7 +118,7 @@ public sealed class ScanOrchestrator
 
                 // R1: if any category failed or was skipped, the dataset is partial — surface that
                 // instead of a green "Completed" that hides missing data.
-                var problem = _progress.Values.FirstOrDefault(p => p.Status is "Failed" or "Skipped");
+                var problem = _progress.Values.FirstOrDefault(p => p.Status is "Failed" or "Skipped" or "CompletedWithErrors");
                 var status = problem != null ? ScanStatus.CompletedWithErrors : ScanStatus.Completed;
                 var errorMsg = problem != null
                     ? $"One or more categories did not complete (e.g. {problem.Category}: {problem.Status}). Results are partial."
@@ -214,6 +224,11 @@ public sealed class ScanOrchestrator
             if (provider == null)
             {
                 AddLog($"Unknown scan type: {scanType}", 2);
+                if (_progress.TryGetValue(scanType, out var unknown))
+                {
+                    unknown.Status = "Skipped";
+                    PersistProgress(scanType);
+                }
                 continue;
             }
 
@@ -235,6 +250,8 @@ public sealed class ScanOrchestrator
 
         AddLog($"Starting {scanType} scan...", 3, scanType);
 
+        int partialCount = 0;
+        var insights = new ConcurrentDictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         var catContext = new ScanContext
         {
             ScanId = context.ScanId,
@@ -263,6 +280,13 @@ public sealed class ScanOrchestrator
             {
                 if (_progress.TryGetValue(scanType, out var p))
                     lock (_progressLock) { p.FailedTargets++; }
+            },
+            AddInsight = (key, delta) => insights.AddOrUpdate(key, delta, (_, v) => v + delta),
+            MarkPartial = reason =>
+            {
+                Interlocked.Increment(ref partialCount);
+                insights.AddOrUpdate(InsightKeys.PartialReasons, 1, (_, v) => v + 1);
+                AddLog($"[{scanType}] Incomplete: {reason}", 2, scanType);
             }
         };
 
@@ -276,11 +300,12 @@ public sealed class ScanOrchestrator
         var effectiveCt = timeoutCts?.Token ?? ct;
 
         var batch = new List<PermissionEntry>();
-        var policies = _policyRepo.GetEnabled();
+        List<Policy> policies = new();
         var finalStatus = "Completed";
 
         try
         {
+            policies = _policyRepo.GetEnabled();
             await foreach (var entry in provider.ScanAsync(catContext, effectiveCt))
             {
                 entry.ScanId = context.ScanId;
@@ -300,10 +325,12 @@ public sealed class ScanOrchestrator
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            // Category timed out (linked timeout token fired, but the user did not cancel).
-            // Mark it failed and let other categories continue (R2).
+            // Category timed out (linked timeout token fired, but the user did not cancel), or a single
+            // HTTP request hit HttpClient's own timeout. Mark it failed and let other categories continue (R2).
             finalStatus = "Failed";
-            AddLog($"[{scanType}] Timed out after {_timeoutMinutes} min — results for this category are partial.", 1, scanType);
+            AddLog(timeoutCts?.IsCancellationRequested == true
+                ? $"[{scanType}] Timed out after {_timeoutMinutes} min. Results for this category are partial."
+                : $"[{scanType}] Failed: a request to the service timed out. Results for this category are partial.", 1, scanType);
         }
         catch (OperationCanceledException)
         {
@@ -340,18 +367,30 @@ public sealed class ScanOrchestrator
                 }
                 catch (Exception flushEx)
                 {
+                    finalStatus = finalStatus == "Cancelled" ? finalStatus : "Failed";
                     AddLog($"[{scanType}] Failed to flush {batch.Count} remaining entries: {flushEx.Message}", 1);
                 }
             }
+
+            try { _insightRepo?.Save(context.ScanId, scanType, insights); }
+            catch (Exception ex) { AddLog($"[{scanType}] Could not save coverage counters: {ex.Message}", 2, scanType); }
+
+            // Failed targets or a scanner-reported fallback mean the data is partial, not complete.
+            if (_progress.TryGetValue(scanType, out var progressFinal))
+            {
+                if (finalStatus == "Completed" && (progressFinal.FailedTargets > 0 || partialCount > 0))
+                {
+                    finalStatus = "CompletedWithErrors";
+                    if (progressFinal.FailedTargets > 0)
+                        AddLog($"[{scanType}] {progressFinal.FailedTargets} target(s) could not be read; results for this category are partial.", 2, scanType);
+                }
+                progressFinal.Status = finalStatus;
+                PersistProgress(scanType);
+            }
         }
 
-        if (_progress.TryGetValue(scanType, out var progressFinal))
-        {
-            progressFinal.Status = finalStatus;
-            PersistProgress(scanType);
-        }
-
-        AddLog($"{(finalStatus == "Completed" ? "Completed" : finalStatus)} {scanType} scan.", finalStatus == "Completed" ? 3 : 2, scanType);
+        AddLog(finalStatus == "CompletedWithErrors" ? $"Completed {scanType} scan with errors." : $"{finalStatus} {scanType} scan.",
+            finalStatus == "Completed" ? 3 : 2, scanType);
     }
 
     /// <summary>Persist a category's current progress row so the GUI survives an engine restart (B15).</summary>

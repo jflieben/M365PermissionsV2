@@ -69,7 +69,7 @@ public sealed class ScanRepository
         cmd.CommandText = @"
             UPDATE scans SET
                 status = @status,
-                completed_at = CASE WHEN @status IN ('Completed','CompletedWithErrors','Failed','Cancelled') THEN datetime('now') ELSE completed_at END,
+                completed_at = CASE WHEN @status IN ('Completed','CompletedWithErrors','Failed','Cancelled') THEN strftime('%Y-%m-%dT%H:%M:%SZ','now') ELSE completed_at END,
                 error_message = COALESCE(@error, error_message),
                 total_permissions = COALESCE(@total, total_permissions)
             WHERE id = @id";
@@ -80,13 +80,37 @@ public sealed class ScanRepository
         cmd.ExecuteNonQuery();
     }
 
-    public void Delete(long id)
+    /// <summary>Delete a scan and everything stored for it. Returns false when the scan doesn't exist.</summary>
+    public bool Delete(long id)
+    {
+        using var conn = _db.CreateConnection();
+        using var tx = conn.BeginTransaction();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = @"
+            DELETE FROM permissions WHERE scan_id = @id;
+            DELETE FROM scan_progress WHERE scan_id = @id;
+            DELETE FROM scan_insights WHERE scan_id = @id;
+            DELETE FROM logs WHERE scan_id = @id;
+            DELETE FROM comparisons WHERE old_scan_id = @id OR new_scan_id = @id;
+            DELETE FROM scans WHERE id = @id;
+            SELECT changes();";
+        cmd.Parameters.AddWithValue("@id", id);
+        var deleted = Convert.ToInt64(cmd.ExecuteScalar()) > 0;
+        tx.Commit();
+        return deleted;
+    }
+
+    /// <summary>Latest Completed/CompletedWithErrors scan, optionally of one tenant.</summary>
+    public ScanInfo? GetLatestCompleted(string? tenantId = null)
     {
         using var conn = _db.CreateConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM scans WHERE id = @id";
-        cmd.Parameters.AddWithValue("@id", id);
-        cmd.ExecuteNonQuery();
+        var tenantWhere = string.IsNullOrEmpty(tenantId) ? "" : "AND tenant_id = @tid ";
+        cmd.CommandText = $"SELECT * FROM scans WHERE status IN ('Completed','CompletedWithErrors') {tenantWhere}ORDER BY id DESC LIMIT 1";
+        if (!string.IsNullOrEmpty(tenantId)) cmd.Parameters.AddWithValue("@tid", tenantId);
+        using var reader = cmd.ExecuteReader();
+        return reader.Read() ? MapScan(reader) : null;
     }
 
     /// <summary>
@@ -101,7 +125,7 @@ public sealed class ScanRepository
         cmd.CommandText = @"
             UPDATE scans
             SET status = 'Failed',
-                completed_at = datetime('now'),
+                completed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),
                 error_message = CASE WHEN error_message = '' THEN 'Interrupted — engine restarted while scan was running' ELSE error_message END
             WHERE status IN ('Running','Pending')";
         return cmd.ExecuteNonQuery();
@@ -175,14 +199,16 @@ public sealed class ScanRepository
     }
 
     /// <summary>Get risk level distribution for a scan.</summary>
-    public Dictionary<string, int> GetRiskSummary(long scanId)
+    public Dictionary<string, int> GetRiskSummary(long scanId, string? category = null)
     {
         using var conn = _db.CreateConnection();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT risk_level, COUNT(*) as cnt FROM permissions
-            WHERE scan_id = @scan_id AND risk_level != '' GROUP BY risk_level ORDER BY
+        var catWhere = string.IsNullOrEmpty(category) ? "" : "AND category = @category ";
+        cmd.CommandText = $@"SELECT risk_level, COUNT(*) as cnt FROM permissions
+            WHERE scan_id = @scan_id AND risk_level != '' {catWhere}GROUP BY risk_level ORDER BY
             CASE risk_level WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 WHEN 'Low' THEN 4 ELSE 5 END";
         cmd.Parameters.AddWithValue("@scan_id", scanId);
+        if (!string.IsNullOrEmpty(category)) cmd.Parameters.AddWithValue("@category", category);
         var result = new Dictionary<string, int>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -202,7 +228,7 @@ public sealed class ScanRepository
             (SELECT COUNT(*) FROM permissions p WHERE p.scan_id = s.id AND p.risk_level = 'Medium') as medium,
             (SELECT COUNT(*) FROM permissions p WHERE p.scan_id = s.id AND p.risk_level = 'Low') as low,
             (SELECT COUNT(*) FROM permissions p WHERE p.scan_id = s.id AND p.risk_level = 'Info') as info
-            FROM scans s WHERE s.status = 'Completed' {tenantWhere}ORDER BY s.id DESC LIMIT @limit";
+            FROM scans s WHERE s.status IN ('Completed','CompletedWithErrors') {tenantWhere}ORDER BY s.id DESC LIMIT @limit";
         if (!string.IsNullOrEmpty(tenantId))
             cmd.Parameters.AddWithValue("@tid", tenantId);
         cmd.Parameters.AddWithValue("@limit", limit);
@@ -213,7 +239,7 @@ public sealed class ScanRepository
             result.Add(new TrendDataPoint
             {
                 ScanId = reader.GetInt64(0),
-                StartedAt = reader.GetString(1),
+                StartedAt = NormalizeUtc(reader.GetString(1)),
                 TotalPermissions = reader.GetInt64(2),
                 TenantDomain = reader.GetString(3),
                 Critical = reader.GetInt32(4),
@@ -234,8 +260,8 @@ public sealed class ScanRepository
         TenantDomain = reader.GetString(reader.GetOrdinal("tenant_domain")),
         Status = Enum.Parse<ScanStatus>(reader.GetString(reader.GetOrdinal("status"))),
         ScanTypes = reader.GetString(reader.GetOrdinal("scan_types")),
-        StartedAt = reader.GetString(reader.GetOrdinal("started_at")),
-        CompletedAt = reader.GetString(reader.GetOrdinal("completed_at")),
+        StartedAt = NormalizeUtc(reader.GetString(reader.GetOrdinal("started_at"))),
+        CompletedAt = NormalizeUtc(reader.GetString(reader.GetOrdinal("completed_at"))),
         StartedBy = reader.GetString(reader.GetOrdinal("started_by")),
         TotalPermissions = reader.GetInt64(reader.GetOrdinal("total_permissions")),
         ConfigSnapshot = reader.GetString(reader.GetOrdinal("config_snapshot")),
@@ -244,4 +270,18 @@ public sealed class ScanRepository
         Notes = reader.GetString(reader.GetOrdinal("notes")),
         Tags = reader.GetString(reader.GetOrdinal("tags"))
     };
+
+    /// <summary>
+    /// Timestamps are stored as ISO "O" strings (started_at) or by older versions as SQLite
+    /// "yyyy-MM-dd HH:mm:ss" UTC without a zone (completed_at). Return ISO 8601 UTC with Z so
+    /// clients don't parse them as local time.
+    /// </summary>
+    public static string NormalizeUtc(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return value;
+        if (DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var dt))
+            return dt.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", System.Globalization.CultureInfo.InvariantCulture);
+        return value;
+    }
 }

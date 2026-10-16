@@ -1,26 +1,31 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using M365Permissions.Engine.Auth;
-using M365Permissions.Engine.Graph;
 using M365Permissions.Engine.Models;
 
 namespace M365Permissions.Engine.Scanning;
 
 /// <summary>
 /// Scans Power BI workspaces for access permissions.
-/// Uses the Power BI REST API via Graph proxy (users can access via delegated Graph token).
+/// Uses the Power BI admin API (all workspaces) and falls back to the caller's own workspaces
+/// when the account is not a Fabric/Power BI administrator.
 /// </summary>
 public sealed class PowerBIScanner : IScanProvider
 {
     public string Category => "PowerBI";
 
+    private const string ApiBase = "https://api.powerbi.com/v1.0/myorg";
+    private const int MaxRetries = 5;
+
     private readonly DelegatedAuth _auth;
-    private readonly ResilientHttpClient _http;
+
+    // admin/groups?$expand=users with 5000 workspaces per page can exceed HttpClient's default 100 s.
+    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromMinutes(5) };
 
     public PowerBIScanner(DelegatedAuth auth)
     {
         _auth = auth;
-        _http = new ResilientHttpClient(auth);
     }
 
     public async IAsyncEnumerable<PermissionEntry> ScanAsync(
@@ -29,150 +34,230 @@ public sealed class PowerBIScanner : IScanProvider
     {
         context.ReportProgress("Enumerating Power BI workspaces...", 3);
 
-        // Try the Power BI admin API first for full workspace enumeration
+        // Admin API first for full workspace enumeration. Throttling and server errors are retried and
+        // then fail the category; only an authorization failure falls back to the user-scoped API.
         var pbiWorkspaces = new List<JsonElement>();
+        var useFallback = false;
         const int pageSize = 5000; // admin/groups requires $top and caps it at 5000; page with $skip
         for (int skip = 0; ; skip += pageSize)
         {
-            HttpResponseMessage resp;
-            try
+            using var resp = await GetAsync($"{ApiBase}/admin/groups?$top={pageSize}&$skip={skip}&$expand=users", ct);
+
+            if (!resp.IsSuccessStatusCode)
             {
-                var token = await _auth.GetAccessTokenAsync("powerbi", ct);
-                resp = await _http.SendAsync(() =>
+                if (skip == 0 && resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
                 {
-                    var req = new HttpRequestMessage(HttpMethod.Get,
-                        $"https://api.powerbi.com/v1.0/myorg/admin/groups?$top={pageSize}&$skip={skip}&$expand=users");
-                    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                    return req;
-                }, ct);
-            }
-            catch (Exception ex) when (skip == 0 && ex is not OperationCanceledException and not ResourcePrincipalNotFoundException)
-            {
-                context.ReportProgress($"Power BI Admin API failed: {ex.Message}. Falling back to user-scoped.", 3);
-                break;
+                    useFallback = true;
+                    break;
+                }
+                throw new InvalidOperationException(
+                    $"Power BI Admin API returned HTTP {(int)resp.StatusCode} after {skip} workspaces; results would be incomplete.");
             }
 
-            using (resp)
+            using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            var count = 0;
+            if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
             {
-                if (!resp.IsSuccessStatusCode)
+                foreach (var ws in val.EnumerateArray())
                 {
-                    if (skip == 0)
-                    {
-                        context.ReportProgress("Power BI Admin API not available (may need Power BI admin role). Falling back to user-scoped enumeration.", 3);
-                        break;
-                    }
-                    // A later page failing would silently truncate the workspace list.
-                    throw new InvalidOperationException($"Power BI Admin API returned HTTP {(int)resp.StatusCode} after {skip} workspaces; results would be incomplete.");
+                    pbiWorkspaces.Add(ws.Clone());
+                    count++;
                 }
-
-                using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-                var count = 0;
-                if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var ws in val.EnumerateArray())
-                    {
-                        pbiWorkspaces.Add(ws.Clone());
-                        count++;
-                    }
-                }
-                if (count < pageSize) break;
             }
+            if (count < pageSize) break;
         }
 
-        if (pbiWorkspaces.Count > 0)
+        if (useFallback)
         {
-            context.SetTotalTargets(pbiWorkspaces.Count);
-            context.ReportProgress($"Found {pbiWorkspaces.Count} Power BI workspaces via Admin API.", 3);
-
-            foreach (var ws in pbiWorkspaces)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var wsId = ws.TryGetProperty("id", out var wid) ? wid.GetString() ?? "" : "";
-                var wsName = ws.TryGetProperty("name", out var wn) ? wn.GetString() ?? "" : "";
-
-                if (ws.TryGetProperty("users", out var users) && users.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var user in users.EnumerateArray())
-                    {
-                        var entry = MapPbiWorkspaceUser(user, wsName, wsId);
-                        if (entry != null) yield return entry;
-                    }
-                }
-
-                context.CompleteTarget();
-            }
+            context.MarkPartial("Power BI admin API not available (needs Fabric/Power BI Administrator); only workspaces the signed-in account belongs to were scanned");
+            await foreach (var entry in ScanUserWorkspacesAsync(context, ct))
+                yield return entry;
+            context.ReportProgress("Completed Power BI scan.", 3);
+            yield break;
         }
-        else
+
+        var active = pbiWorkspaces.Where(IsActive).ToList();
+        if (active.Count < pbiWorkspaces.Count)
+            context.ReportProgress($"Skipped {pbiWorkspaces.Count - active.Count} deleted or removing Power BI workspace(s).", 4);
+
+        context.SetTotalTargets(active.Count);
+        context.ReportProgress($"Found {active.Count} active Power BI workspaces via Admin API.", 3);
+
+        var orphaned = 0;
+        foreach (var ws in active)
         {
-            // Fallback: enumerate user's own workspaces (non-admin)
-            var fallbackEntries = new List<PermissionEntry>();
-            try
-            {
-                var token = await _auth.GetAccessTokenAsync("powerbi", ct);
-                using var resp = await _http.SendAsync(() =>
-                {
-                    var req = new HttpRequestMessage(HttpMethod.Get,
-                        "https://api.powerbi.com/v1.0/myorg/groups?$expand=users");
-                    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                    return req;
-                }, ct);
-                if (resp.IsSuccessStatusCode)
-                {
-                    var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-                    if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
-                    {
-                        context.SetTotalTargets(val.GetArrayLength());
-                        foreach (var ws in val.EnumerateArray())
-                        {
-                            var wsId = ws.TryGetProperty("id", out var wid) ? wid.GetString() ?? "" : "";
-                            var wsName = ws.TryGetProperty("name", out var wn) ? wn.GetString() ?? "" : "";
+            ct.ThrowIfCancellationRequested();
 
-                            if (ws.TryGetProperty("users", out var users) && users.ValueKind == JsonValueKind.Array)
-                            {
-                                foreach (var user in users.EnumerateArray())
-                                {
-                                    var entry = MapPbiWorkspaceUser(user, wsName, wsId);
-                                    if (entry != null) fallbackEntries.Add(entry);
-                                }
-                            }
+            var wsId = GetString(ws, "id");
+            var wsName = GetString(ws, "name");
+            var users = ws.TryGetProperty("users", out var u) && u.ValueKind == JsonValueKind.Array
+                ? u.EnumerateArray().ToList()
+                : new List<JsonElement>();
 
-                            context.CompleteTarget();
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
+            var targetType = WorkspaceTargetType(GetString(ws, "type"), users);
+            if (targetType == OrphanedWorkspace) orphaned++;
+
+            foreach (var user in users)
             {
-                context.ReportProgress($"Failed to enumerate user Power BI workspaces: {ex.Message}", 2);
+                var entry = MapWorkspaceUser(user, wsName, wsId, targetType);
+                if (entry != null) yield return entry;
             }
 
-            foreach (var e in fallbackEntries) yield return e;
+            context.CompleteTarget();
         }
+
+        if (orphaned > 0)
+            context.ReportProgress($"{orphaned} Power BI workspace(s) have no Admin (orphaned); reported with target type {OrphanedWorkspace}.", 2);
 
         context.ReportProgress("Completed Power BI scan.", 3);
     }
 
-    private static PermissionEntry? MapPbiWorkspaceUser(JsonElement user, string workspaceName, string workspaceId)
+    /// <summary>
+    /// Fallback for non-admins: the caller's own workspaces, with users read per workspace
+    /// (the non-admin groups list does not expand users).
+    /// </summary>
+    private async IAsyncEnumerable<PermissionEntry> ScanUserWorkspacesAsync(
+        ScanContext context,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        var email = user.TryGetProperty("emailAddress", out var e) ? e.GetString() ?? "" : "";
-        var displayName = user.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
-        var role = user.TryGetProperty("groupUserAccessRight", out var r) ? r.GetString() ?? "" : "";
-        var principalType = user.TryGetProperty("principalType", out var pt) ? pt.GetString() ?? "" : "";
-        var identifier = user.TryGetProperty("identifier", out var id) ? id.GetString() ?? "" : "";
+        var workspaces = await GetPagedAsync($"{ApiBase}/groups", ct);
+        var active = workspaces.Where(IsActive).ToList();
+        context.SetTotalTargets(active.Count);
+        context.ReportProgress($"Found {active.Count} Power BI workspaces the signed-in account belongs to.", 3);
 
-        if (string.IsNullOrEmpty(email) && string.IsNullOrEmpty(displayName) && string.IsNullOrEmpty(identifier))
+        var orphaned = 0;
+        foreach (var ws in active)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var wsId = GetString(ws, "id");
+            var wsName = GetString(ws, "name");
+
+            List<JsonElement> users;
+            try
+            {
+                users = await GetPagedAsync($"{ApiBase}/groups/{Uri.EscapeDataString(wsId)}/users", ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                context.ReportProgress($"Failed to read users of Power BI workspace '{wsName}': {ex.Message}", 2);
+                context.FailTarget();
+                continue;
+            }
+
+            var targetType = WorkspaceTargetType(GetString(ws, "type"), users);
+            if (targetType == OrphanedWorkspace) orphaned++;
+
+            foreach (var user in users)
+            {
+                var entry = MapWorkspaceUser(user, wsName, wsId, targetType);
+                if (entry != null) yield return entry;
+            }
+
+            context.CompleteTarget();
+        }
+
+        if (orphaned > 0)
+            context.ReportProgress($"{orphaned} Power BI workspace(s) have no Admin (orphaned); reported with target type {OrphanedWorkspace}.", 2);
+    }
+
+    /// <summary>GET a $top/$skip paged Power BI list. Throws on any non-success status.</summary>
+    private async Task<List<JsonElement>> GetPagedAsync(string url, CancellationToken ct)
+    {
+        const int pageSize = 5000;
+        var items = new List<JsonElement>();
+        var sep = url.Contains('?') ? "&" : "?";
+        for (int skip = 0; ; skip += pageSize)
+        {
+            using var resp = await GetAsync($"{url}{sep}$top={pageSize}&$skip={skip}", ct);
+            if (!resp.IsSuccessStatusCode)
+                throw new HttpRequestException($"Power BI API returned HTTP {(int)resp.StatusCode} for {url}", null, resp.StatusCode);
+
+            using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            var count = 0;
+            if (doc.RootElement.TryGetProperty("value", out var val) && val.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in val.EnumerateArray())
+                {
+                    items.Add(item.Clone());
+                    count++;
+                }
+            }
+            if (count < pageSize) return items;
+        }
+    }
+
+    /// <summary>GET with retry on 429 (honouring Retry-After) and 5xx. Returns the last response.</summary>
+    private async Task<HttpResponseMessage> GetAsync(string url, CancellationToken ct)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            var token = await _auth.GetAccessTokenAsync("powerbi", ct);
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            var resp = await _http.SendAsync(req, ct);
+
+            var retryable = resp.StatusCode == (HttpStatusCode)429 || (int)resp.StatusCode >= 500;
+            if (!retryable || attempt >= MaxRetries - 1) return resp;
+
+            var delay = resp.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
+            resp.Dispose();
+            await Task.Delay(delay, ct);
+        }
+    }
+
+    // ── Mapping helpers ─────────────────────────────────────────
+
+    internal const string OrphanedWorkspace = "OrphanedWorkspace";
+
+    /// <summary>Live workspaces: Active, Orphaned, or no state (user-scoped API). Deleted/Removing are skipped.</summary>
+    internal static bool IsActive(JsonElement ws)
+    {
+        var state = GetString(ws, "state");
+        return state.Length == 0 ||
+               state.Equals("Active", StringComparison.OrdinalIgnoreCase) ||
+               state.Equals("Orphaned", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>PersonalWorkspace for My workspaces, OrphanedWorkspace when no user holds Admin, else Workspace.</summary>
+    internal static string WorkspaceTargetType(string? workspaceType, IEnumerable<JsonElement> users)
+    {
+        if (workspaceType is not null &&
+            (workspaceType.Equals("PersonalGroup", StringComparison.OrdinalIgnoreCase) ||
+             workspaceType.Equals("Personal", StringComparison.OrdinalIgnoreCase)))
+            return "PersonalWorkspace";
+
+        var hasAdmin = users.Any(u => GetString(u, "groupUserAccessRight").Equals("Admin", StringComparison.OrdinalIgnoreCase));
+        return hasAdmin ? "Workspace" : OrphanedWorkspace;
+    }
+
+    internal static PermissionEntry? MapWorkspaceUser(JsonElement user, string workspaceName, string workspaceId, string targetType)
+    {
+        var email = GetString(user, "emailAddress");
+        var displayName = GetString(user, "displayName");
+        var role = GetString(user, "groupUserAccessRight");
+        var principalType = GetString(user, "principalType");
+        var identifier = GetString(user, "identifier");
+        var graphId = GetString(user, "graphId");
+
+        if (email.Length == 0 && displayName.Length == 0 && identifier.Length == 0)
             return null;
+
+        // For users the identifier is the UPN/email; graphId carries the Entra object id.
+        var isUser = principalType.Equals("User", StringComparison.OrdinalIgnoreCase);
+        var entraId = graphId.Length > 0 ? graphId : (isUser && identifier.Contains('@') ? "" : identifier);
+        var upn = email.Length > 0 ? email : (isUser ? identifier : "");
 
         return new PermissionEntry
         {
             TargetPath = $"PowerBI/{workspaceName}",
-            TargetType = "Workspace",
+            TargetType = targetType,
             TargetId = workspaceId,
-            PrincipalEntraUpn = email,
-            PrincipalEntraId = identifier,
-            PrincipalSysName = displayName,
-            PrincipalType = MapPrincipalType(principalType),
+            PrincipalEntraUpn = upn,
+            PrincipalEntraId = entraId,
+            PrincipalSysId = identifier,
+            PrincipalSysName = displayName.Length > 0 ? displayName : upn,
+            PrincipalType = MapPrincipalType(principalType, GetString(user, "userType")),
             PrincipalRole = role,
             Through = "WorkspaceAccess",
             AccessType = "Allow",
@@ -180,11 +265,15 @@ public sealed class PowerBIScanner : IScanProvider
         };
     }
 
-    private static string MapPrincipalType(string pbiType) => pbiType?.ToLower() switch
+    internal static string MapPrincipalType(string? pbiType, string? userType = null) => pbiType?.ToLowerInvariant() switch
     {
+        "user" when string.Equals(userType, "Guest", StringComparison.OrdinalIgnoreCase) => "Guest",
         "user" => "User",
         "group" => "SecurityGroup",
         "app" => "Application",
-        _ => "User"
+        _ => "Unknown"
     };
+
+    private static string GetString(JsonElement el, string name)
+        => el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
 }

@@ -3,7 +3,10 @@ function Start-M365Scan {
     .SYNOPSIS
         Starts a permission scan across selected Microsoft 365 services.
     .PARAMETER ScanTypes
-        Which services to scan. Default is all available: SharePoint, Entra, Exchange.
+        Which services to scan: SharePoint, Entra, Teams, Exchange, OneDrive, PowerBI,
+        PowerAutomate, Azure, AzureDevOps and/or Purview. Default: SharePoint, Entra, Exchange.
+    .PARAMETER Wait
+        Block until the scan finishes, showing a progress bar.
     .EXAMPLE
         Start-M365Scan
     .EXAMPLE

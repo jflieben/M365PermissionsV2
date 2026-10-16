@@ -136,6 +136,11 @@ public sealed class SqliteDb : IDisposable
         // Migration 6: add conditions + is_default columns to existing policies tables
         AddColumnIfMissing(conn, "policies", "conditions", "TEXT NOT NULL DEFAULT '[]'");
         AddColumnIfMissing(conn, "policies", "is_default", "INTEGER NOT NULL DEFAULT 0");
+
+        // Migration 7: built-in policy upgrade tracking + remediation advice
+        AddColumnIfMissing(conn, "policies", "default_key", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing(conn, "policies", "default_hash", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing(conn, "policies", "remediation", "TEXT NOT NULL DEFAULT ''");
     }
 
     private static void AddColumnIfMissing(SqliteConnection conn, string table, string column, string definition)
@@ -199,6 +204,7 @@ public sealed class SqliteDb : IDisposable
             cmd.CommandText = @"
                 DELETE FROM permissions;
                 DELETE FROM scan_progress;
+                DELETE FROM scan_insights;
                 DELETE FROM comparisons;
                 DELETE FROM logs;
                 DELETE FROM audit_log;

@@ -57,6 +57,10 @@ public sealed class StatusResponse
     [JsonPropertyName("refreshTokenExpiry")]
     public string? RefreshTokenExpiry { get; set; }
 
+    /// <summary>Tenant SharePoint admin center URL, once the SharePoint tenant name is known.</summary>
+    [JsonPropertyName("sharePointAdminUrl")]
+    public string? SharePointAdminUrl { get; set; }
+
     // License clarity in-product — converts the compliance-minded audience ($5).
     [JsonPropertyName("licenseNote")]
     public string LicenseNote { get; set; } = "Free for non-commercial use.";
@@ -102,6 +106,37 @@ public sealed class ComparisonResult
 
     [JsonPropertyName("changed")]
     public List<PermissionChange> Changed { get; set; } = new();
+
+    // Totals; the lists above may be capped (Truncated) when a limit was requested.
+    [JsonPropertyName("addedCount")]
+    public int AddedCount { get; set; }
+
+    [JsonPropertyName("removedCount")]
+    public int RemovedCount { get; set; }
+
+    [JsonPropertyName("changedCount")]
+    public int ChangedCount { get; set; }
+
+    [JsonPropertyName("newCriticalCount")]
+    public int NewCriticalCount { get; set; }
+
+    [JsonPropertyName("newHighCount")]
+    public int NewHighCount { get; set; }
+
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; set; }
+
+    /// <summary>Categories compared (completed in both scans).</summary>
+    [JsonPropertyName("includedCategories")]
+    public List<string> IncludedCategories { get; set; } = new();
+
+    /// <summary>Categories left out because one scan didn't cover them completely (missing, failed, skipped).</summary>
+    [JsonPropertyName("excludedCategories")]
+    public List<CategoryCoverageNote> ExcludedCategories { get; set; } = new();
+
+    /// <summary>Compared categories that completed with errors in at least one scan (differences may be partial).</summary>
+    [JsonPropertyName("flaggedCategories")]
+    public List<CategoryCoverageNote> FlaggedCategories { get; set; } = new();
 }
 
 public sealed class PermissionChange

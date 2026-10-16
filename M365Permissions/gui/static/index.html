@@ -5,8 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>M365Permissions V2</title>
     <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="cloud.css">
     <link rel="icon" type="image/png" href="logo.png">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    <script src="vendor/chart.umd.min.js"></script>
 </head>
 <body>
     <nav id="navbar">
@@ -35,11 +36,12 @@
     <main id="app"></main>
 
     <footer class="site-footer">
-        <span>© 2025 <a href="https://m365permissions.com" target="_blank" rel="noopener">m365permissions.com</a></span>
+        <span>© 2025 JSolve B.V. · <a id="footerCloudLink" href="https://m365permissions.com" target="_blank" rel="noopener">M365Permissions Cloud Edition</a>: scheduled scans, change alerts and item-level depth, in your own Azure subscription</span>
     </footer>
 
     <div id="toast-container"></div>
 
+    <script src="cloud.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

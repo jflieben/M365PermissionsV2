@@ -182,14 +182,14 @@ public static class ApiRoutes
         // Persisted per-category progress + logs (survive engine restarts / long scans).
         server.Route("GET", "/api/scans/:id/progress", async (ctx, p) =>
         {
-            var scanId = long.Parse(p["id"]);
+            if (!long.TryParse(p.GetValueOrDefault("id"), out var scanId)) { await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid scan ID")); return; }
             await WebServer.WriteJson(ctx.Response, 200,
                 ApiResponse<List<ScanProgress>>.Ok(engine.GetPersistedProgress(scanId)));
         });
 
         server.Route("GET", "/api/scans/:id/logs", async (ctx, p) =>
         {
-            var scanId = long.Parse(p["id"]);
+            if (!long.TryParse(p.GetValueOrDefault("id"), out var scanId)) { await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid scan ID")); return; }
             var q = ctx.Request.QueryString;
             int? maxLevel = int.TryParse(q["level"], out var lv) ? lv : null;
             var category = q["category"];
@@ -199,9 +199,60 @@ public static class ApiRoutes
 
         server.Route("GET", "/api/scans/:id/risk-delta", async (ctx, p) =>
         {
-            var scanId = long.Parse(p["id"]);
+            if (!long.TryParse(p.GetValueOrDefault("id"), out var scanId)) { await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid scan ID")); return; }
+            try
+            {
+                await WebServer.WriteJson(ctx.Response, 200, ApiResponse<RiskDelta>.Ok(engine.GetRiskDelta(scanId)));
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 404, ApiResponse.Fail(ex.Message));
+            }
+        });
+
+        // Re-apply the current policies to a scan's stored rows.
+        server.Route("POST", "/api/scans/:id/rescore", async (ctx, p) =>
+        {
+            if (!long.TryParse(p.GetValueOrDefault("id"), out var scanId)) { await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid scan ID")); return; }
+            try
+            {
+                await WebServer.WriteJson(ctx.Response, 200, ApiResponse<RescoreResult>.Ok(engine.RescoreScan(scanId)));
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 404, ApiResponse.Fail(ex.Message));
+            }
+            catch (InvalidOperationException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 409, ApiResponse.Fail(ex.Message));
+            }
+        });
+
+        server.Route("DELETE", "/api/scans/:id", async (ctx, p) =>
+        {
+            if (!long.TryParse(p.GetValueOrDefault("id"), out var scanId)) { await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid scan ID")); return; }
+            try
+            {
+                if (engine.DeleteScan(scanId))
+                    await WebServer.WriteJson(ctx.Response, 200, ApiResponse.Ok());
+                else
+                    await WebServer.WriteJson(ctx.Response, 404, ApiResponse.Fail("Scan not found"));
+            }
+            catch (InvalidOperationException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 409, ApiResponse.Fail(ex.Message));
+            }
+        });
+
+        server.Route("GET", "/api/scans/:id/insights", async (ctx, p) =>
+        {
+            if (!long.TryParse(p.GetValueOrDefault("id"), out var scanId))
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid scan ID"));
+                return;
+            }
             await WebServer.WriteJson(ctx.Response, 200,
-                ApiResponse<RiskDelta>.Ok(engine.GetRiskDelta(scanId)));
+                ApiResponse<Dictionary<string, Dictionary<string, long>>>.Ok(engine.GetScanInsights(scanId)));
         });
 
         server.Route("GET", "/api/version", async (ctx, _) =>
@@ -259,7 +310,8 @@ public static class ApiRoutes
         server.Route("GET", "/api/scans", async (ctx, _) =>
         {
             var tenantId = ctx.Request.QueryString["tenantId"];
-            var scans = engine.GetScans(tenantId);
+            if (!int.TryParse(ctx.Request.QueryString["limit"], out var limit) || limit < 1) limit = 50;
+            var scans = engine.GetScans(tenantId, Math.Min(limit, 1000));
             await WebServer.WriteJson(ctx.Response, 200,
                 ApiResponse<List<ScanInfo>>.Ok(scans));
         });
@@ -322,18 +374,31 @@ public static class ApiRoutes
             var format = ctx.Request.QueryString["format"] ?? "xlsx";
             var category = ctx.Request.QueryString["category"];
 
+            var started = false;
             try
             {
-                var (bytes, fileName, contentType) = engine.ExportScan(scanId, format, category);
-                ctx.Response.ContentType = contentType;
-                ctx.Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{fileName}\"");
-                ctx.Response.ContentLength64 = bytes.Length;
-                await ctx.Response.OutputStream.WriteAsync(bytes);
+                // CSV is streamed with chunked encoding; validation errors are thrown before onStart.
+                await Task.Run(() => engine.ExportScanToStream(scanId, format, category, ctx.Response.OutputStream, (fileName, contentType) =>
+                {
+                    started = true;
+                    ctx.Response.StatusCode = 200;
+                    ctx.Response.ContentType = contentType;
+                    ctx.Response.SendChunked = true;
+                    ctx.Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{fileName}\"");
+                }));
                 ctx.Response.Close();
             }
-            catch (KeyNotFoundException)
+            catch (KeyNotFoundException) when (!started)
             {
                 await WebServer.WriteJson(ctx.Response, 404, ApiResponse.Fail("Scan not found"));
+            }
+            catch (InvalidOperationException ex) when (!started)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(ex.Message));
+            }
+            catch when (started)
+            {
+                try { ctx.Response.Abort(); } catch { /* client gone */ }
             }
         });
 
@@ -373,7 +438,26 @@ public static class ApiRoutes
             var results = engine.QueryUserPermissions(scanId, user, page, pageSize,
                 sortColumn, sortDirection, columnFilters.Count > 0 ? columnFilters : null);
             await WebServer.WriteJson(ctx.Response, 200,
-                ApiResponse<PagedResult<PermissionEntry>>.Ok(results));
+                ApiResponse<UserPermissionsPage>.Ok(results));
+        });
+
+        // Members of a SharePoint group, emitted as rows with Through=SharePointGroup and ParentId=group name.
+        server.Route("GET", "/api/scans/:id/sharepoint-group-members", async (ctx, p) =>
+        {
+            if (!long.TryParse(p.GetValueOrDefault("id"), out var scanId))
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid scan ID"));
+                return;
+            }
+            var qs = ctx.Request.QueryString;
+            var group = qs["group"];
+            if (string.IsNullOrWhiteSpace(group) || (string.IsNullOrWhiteSpace(qs["targetPath"]) && string.IsNullOrWhiteSpace(qs["targetId"])))
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Specify group and targetPath or targetId"));
+                return;
+            }
+            var members = engine.GetSharePointGroupMembers(scanId, group, qs["targetPath"], qs["targetId"]);
+            await WebServer.WriteJson(ctx.Response, 200, ApiResponse<List<PermissionEntry>>.Ok(members));
         });
 
         // ── Group Members Lookup ────────────────────────────────
@@ -425,9 +509,21 @@ public static class ApiRoutes
                 return;
             }
 
-            var result = engine.CompareScans(request.OldScanId, request.NewScanId, request.Category);
-            await WebServer.WriteJson(ctx.Response, 200,
-                ApiResponse<ComparisonResult>.Ok(result));
+            try
+            {
+                // Lists are capped (default 500 each); the counts in the result are complete.
+                var limit = Math.Clamp(request.Limit ?? 500, 0, 10_000);
+                var result = engine.CompareScans(request.OldScanId, request.NewScanId, request.Category, limit);
+                await WebServer.WriteJson(ctx.Response, 200, ApiResponse<ComparisonResult>.Ok(result));
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 404, ApiResponse.Fail(ex.Message));
+            }
+            catch (ArgumentException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(ex.Message));
+            }
         });
 
         // ── Comparison Export ───────────────────────────────────
@@ -440,12 +536,23 @@ public static class ApiRoutes
                 return;
             }
 
-            var (bytes, fileName, contentType) = engine.ExportComparison(request.OldScanId, request.NewScanId, request.Category);
-            ctx.Response.ContentType = contentType;
-            ctx.Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{fileName}\"");
-            ctx.Response.ContentLength64 = bytes.Length;
-            await ctx.Response.OutputStream.WriteAsync(bytes);
-            ctx.Response.Close();
+            try
+            {
+                var (bytes, fileName, contentType) = engine.ExportComparison(request.OldScanId, request.NewScanId, request.Category);
+                ctx.Response.ContentType = contentType;
+                ctx.Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{fileName}\"");
+                ctx.Response.ContentLength64 = bytes.Length;
+                await ctx.Response.OutputStream.WriteAsync(bytes);
+                ctx.Response.Close();
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 404, ApiResponse.Fail(ex.Message));
+            }
+            catch (ArgumentException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(ex.Message));
+            }
         });
 
         // ── Risk Summary ────────────────────────────────────────
@@ -456,7 +563,7 @@ public static class ApiRoutes
                 await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid scan ID"));
                 return;
             }
-            var summary = engine.GetRiskSummary(scanId);
+            var summary = engine.GetRiskSummary(scanId, ctx.Request.QueryString["category"]);
             await WebServer.WriteJson(ctx.Response, 200,
                 ApiResponse<Dictionary<string, int>>.Ok(summary));
         });
@@ -518,17 +625,19 @@ public static class ApiRoutes
 
         server.Route("POST", "/api/policies", async (ctx, _) =>
         {
-            var policy = await WebServer.ReadJson<Policy>(ctx.Request);
-            if (policy == null || string.IsNullOrWhiteSpace(policy.Name))
+            try
             {
-                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Name is required"));
-                return;
+                var body = await ReadJsonBody(ctx);
+                var id = engine.CreatePolicy(body);
+                await WebServer.WriteJson(ctx.Response, 200, ApiResponse<object>.Ok(new { id }));
             }
-            var id = engine.CreatePolicy(policy);
-            await WebServer.WriteJson(ctx.Response, 200,
-                ApiResponse<object>.Ok(new { id }));
+            catch (PolicyValidationException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(ex.Message));
+            }
         });
 
+        // Properties missing from the body keep their stored value (PATCH semantics).
         server.Route("PUT", "/api/policies/:id", async (ctx, p) =>
         {
             if (!long.TryParse(p.GetValueOrDefault("id"), out var policyId))
@@ -536,15 +645,20 @@ public static class ApiRoutes
                 await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid policy ID"));
                 return;
             }
-            var policy = await WebServer.ReadJson<Policy>(ctx.Request);
-            if (policy == null)
+            try
             {
-                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Invalid request body"));
-                return;
+                var body = await ReadJsonBody(ctx);
+                var updated = engine.UpdatePolicy(policyId, body);
+                await WebServer.WriteJson(ctx.Response, 200, ApiResponse<Policy>.Ok(updated));
             }
-            policy.Id = policyId;
-            engine.UpdatePolicy(policy);
-            await WebServer.WriteJson(ctx.Response, 200, ApiResponse.Ok());
+            catch (PolicyValidationException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(ex.Message));
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 404, ApiResponse.Fail(ex.Message));
+            }
         });
 
         server.Route("DELETE", "/api/policies/:id", async (ctx, p) =>
@@ -558,21 +672,51 @@ public static class ApiRoutes
             await WebServer.WriteJson(ctx.Response, 200, ApiResponse.Ok());
         });
 
+        // Whole-scan evaluation: counts per policy plus the first violating rows (most severe first).
         server.Route("POST", "/api/policies/evaluate", async (ctx, _) =>
         {
-            var body = await WebServer.ReadJson<JsonElement>(ctx.Request);
-            long scanId = 0;
-            string? category = null;
-            if (body.TryGetProperty("scanId", out var sid)) scanId = sid.GetInt64();
-            if (body.TryGetProperty("category", out var cat)) category = cat.GetString();
-            if (scanId <= 0)
+            try
             {
-                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Specify scanId"));
+                var body = await ReadJsonBody(ctx);
+                long scanId = 0;
+                string? category = null;
+                int maxViolations = 500;
+                if (body.ValueKind == JsonValueKind.Object)
+                {
+                    if (body.TryGetProperty("scanId", out var sid) && sid.ValueKind == JsonValueKind.Number) scanId = sid.GetInt64();
+                    if (body.TryGetProperty("category", out var cat) && cat.ValueKind == JsonValueKind.String) category = cat.GetString();
+                    if (body.TryGetProperty("maxViolations", out var mv) && mv.ValueKind == JsonValueKind.Number) maxViolations = mv.GetInt32();
+                }
+                if (scanId <= 0)
+                {
+                    await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Specify scanId"));
+                    return;
+                }
+                var result = await Task.Run(() => engine.EvaluatePolicies(scanId, category, maxViolations));
+                await WebServer.WriteJson(ctx.Response, 200, ApiResponse<PolicyEvaluationResult>.Ok(result));
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 404, ApiResponse.Fail(ex.Message));
+            }
+            catch (PolicyValidationException ex)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail(ex.Message));
+            }
+        });
+
+        // Enabled policies a permission row matches (with remediation), for the detail panel.
+        server.Route("POST", "/api/policies/match", async (ctx, _) =>
+        {
+            PermissionEntry? entry;
+            try { entry = await WebServer.ReadJson<PermissionEntry>(ctx.Request); }
+            catch (JsonException) { entry = null; }
+            if (entry == null)
+            {
+                await WebServer.WriteJson(ctx.Response, 400, ApiResponse.Fail("Send a permission entry"));
                 return;
             }
-            var result = engine.EvaluatePolicies(scanId, category);
-            await WebServer.WriteJson(ctx.Response, 200,
-                ApiResponse<PolicyEvaluationResult>.Ok(result));
+            await WebServer.WriteJson(ctx.Response, 200, ApiResponse<List<PolicyViolation>>.Ok(engine.MatchPolicies(entry)));
         });
 
         server.Route("POST", "/api/policies/reset-defaults", async (ctx, _) =>
@@ -612,6 +756,13 @@ public static class ApiRoutes
     /// For requests sent with X-M365-Prompt: gui, hand sign-in URLs to the GUI (which opens and closes
     /// its own popup) instead of the system browser, until the returned operation is disposed.
     /// </summary>
+    /// <summary>Read the request body as JSON; malformed JSON becomes a PolicyValidationException (400).</summary>
+    private static async Task<JsonElement> ReadJsonBody(System.Net.HttpListenerContext ctx)
+    {
+        try { return await WebServer.ReadJson<JsonElement>(ctx.Request); }
+        catch (JsonException ex) { throw new PolicyValidationException(new() { $"Invalid JSON: {ex.Message}" }); }
+    }
+
     private static Auth.BrowserPrompt.GuiOperation? BeginPrompt(System.Net.HttpListenerContext ctx, Engine engine)
         => string.Equals(ctx.Request.Headers["X-M365-Prompt"], "gui", StringComparison.OrdinalIgnoreCase)
             ? engine.Prompt.BeginGuiOperation()
@@ -628,5 +779,6 @@ public static class ApiRoutes
         public long OldScanId { get; set; }
         public long NewScanId { get; set; }
         public string? Category { get; set; }
+        public int? Limit { get; set; }
     }
 }

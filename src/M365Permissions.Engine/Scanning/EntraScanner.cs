@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text.Json;
 using M365Permissions.Engine.Graph;
 using M365Permissions.Engine.Models;
@@ -14,124 +15,118 @@ public sealed class EntraScanner : IScanProvider
 
     private readonly GraphClient _graphClient;
 
+    private const int ExpandCap = 20;
+    private const string OwnerSelect = "$select=id,displayName,userPrincipalName,userType";
+    private const string MemberSelect = "$select=id,displayName,userPrincipalName,userType";
+
     public EntraScanner(GraphClient graphClient)
     {
         _graphClient = graphClient;
+    }
+
+    /// <summary>A permission resource (API) with its app roles and delegated scopes, resolved separately (N8).</summary>
+    private sealed class ResourceApi
+    {
+        public string Name = "";
+        public readonly Dictionary<string, string> AppRoles = new(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, string> Scopes = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class ServicePrincipalCache
+    {
+        public readonly Dictionary<string, ResourceApi> ByAppId = new(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, ResourceApi> ByObjectId = new(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, string> ObjectIdByAppId = new(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, string> AppIdByObjectId = new(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, string> NameByObjectId = new(StringComparer.OrdinalIgnoreCase);
+        public readonly List<JsonElement> WithOwners = new();
     }
 
     public async IAsyncEnumerable<PermissionEntry> ScanAsync(
         ScanContext context,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        // --- Directory Roles ---
-        context.ReportProgress("Scanning Entra directory roles...", 3);
+        // Phases: role assignments, app registrations, service principals, PIM eligibility, OAuth2 grants (+ groups later).
+        const int phases = 5;
+        context.SetTotalTargets(phases);
 
-        var roles = new List<JsonElement>();
-        await foreach (var role in _graphClient.GetPaginatedAsync("directoryRoles", ct: ct))
+        context.ReportProgress("Loading Entra role definitions...", 3);
+        var roleDefs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        await foreach (var rd in _graphClient.GetPaginatedAsync("roleManagement/directory/roleDefinitions?$select=id,displayName,templateId", ct: ct))
         {
-            roles.Add(role);
+            var name = Str(rd, "displayName");
+            if (Str(rd, "id") is { Length: > 0 } id) roleDefs[id] = name;
+            if (Str(rd, "templateId") is { Length: > 0 } tid) roleDefs.TryAdd(tid, name);
         }
 
-        context.ReportProgress($"Found {roles.Count} directory roles.", 3);
-
-        // We'll add to total targets as we discover groups later
-        context.SetTotalTargets(roles.Count + 3); // roles + apps phase + OAuth2 phase + groups-enum phase
-
-        foreach (var role in roles)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            var roleName = role.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
-            var roleId = role.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
-
-            if (!string.IsNullOrEmpty(roleId))
-            {
-                // Enumerate members with pagination per role. directoryRoles?$expand=members caps
-                // at ~20 members with no nextLink for the expanded collection, silently dropping
-                // members in large roles — the worst failure mode for an audit tool (B4).
-                await foreach (var member in _graphClient.GetPaginatedAsync(
-                    $"directoryRoles/{roleId}/members?$select=id,displayName,userPrincipalName,userType", ct: ct))
-                {
-                    yield return MapDirectoryRoleMember(member, roleName, roleId);
-                }
-            }
-
-            context.CompleteTarget();
-        }
-
-        // Build caches that resolve permission GUIDs → human-readable names (Mail.Read, etc.).
-        // Needed both to make requested-permission entries readable and to resolve granted
-        // app-role assignments below (A1). Without this, principal_role held raw GUIDs, so the
-        // high-risk-application-permission policy could never match a permission name.
+        // Permission GUID to name lookups (A1), names for app-scoped role assignments and OAuth2 grants, SP owners.
         context.ReportProgress("Resolving application permission definitions...", 3);
-        var (appPermsByAppId, appPermsByObjectId, spCache) = await BuildAppPermissionCachesAsync(ct);
+        var sps = await BuildServicePrincipalCacheAsync(context, ct);
 
-        // --- App Registrations: REQUESTED permissions (requiredResourceAccess) ---
-        context.ReportProgress("Scanning app registrations...", 3);
+        context.ReportProgress("Enumerating app registrations...", 3);
+        var (apps, appOwnersExpanded) = await CollectWithFallbackAsync(
+            $"applications?$select=id,displayName,appId,requiredResourceAccess&$expand=owners({OwnerSelect})",
+            "applications?$select=id,displayName,appId,requiredResourceAccess", ct);
+        if (!appOwnersExpanded)
+            context.MarkPartial("App registration owners could not be expanded; app owners are missing.");
 
-        int appCount = 0;
-        await foreach (var app in _graphClient.GetPaginatedAsync(
-            "applications?$select=id,displayName,appId,requiredResourceAccess", ct: ct))
+        // Readable names for role assignment scopes: administrative units and app-scoped assignments.
+        var scopeNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (spId, spName) in sps.NameByObjectId) scopeNames[$"/{spId}"] = $"app {spName}";
+        foreach (var app in apps)
+            if (Str(app, "id") is { Length: > 0 } appObjId) scopeNames[$"/{appObjId}"] = $"app {Str(app, "displayName")}";
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            appCount++;
-
-            var appName = app.TryGetProperty("displayName", out var dn2) ? dn2.GetString() ?? "" : "";
-            var appObjId = app.TryGetProperty("id", out var id2) ? id2.GetString() ?? "" : "";
-            var appClientId = app.TryGetProperty("appId", out var aid) ? aid.GetString() ?? "" : "";
-
-            if (app.TryGetProperty("requiredResourceAccess", out var rra) && rra.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var resource in rra.EnumerateArray())
-                {
-                    var resourceAppId = resource.TryGetProperty("resourceAppId", out var rai) ? rai.GetString() ?? "" : "";
-                    if (resource.TryGetProperty("resourceAccess", out var accesses) && accesses.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var access in accesses.EnumerateArray())
-                        {
-                            var permId = access.TryGetProperty("id", out var pid) ? pid.GetString() ?? "" : "";
-                            var permType = access.TryGetProperty("type", out var pt) ? pt.GetString() ?? "" : "";
-
-                            // Resolve the permission GUID to its name via the resource app's definitions.
-                            var permName = appPermsByAppId.TryGetValue(resourceAppId, out var rmap)
-                                && rmap.TryGetValue(permId, out var pn) ? pn : permId;
-
-                            yield return new PermissionEntry
-                            {
-                                TargetPath = $"AppRegistration/{appName}",
-                                TargetType = "Application",
-                                TargetId = appObjId,
-                                PrincipalEntraId = appClientId,
-                                PrincipalSysName = appName,
-                                PrincipalType = "Application",
-                                PrincipalRole = permName,
-                                // "Requested" ≠ "Granted": these come from the app manifest and may
-                                // never have been consented. Mark distinctly so risk policies (which
-                                // key on the granted "ApplicationPermission") don't fire on them (A1).
-                                Through = permType == "Role" ? "RequestedApplicationPermission" : "RequestedDelegatedPermission",
-                                AccessType = "Allow",
-                                Tenure = "Requested"
-                            };
-                        }
-                    }
-                }
-            }
+            await foreach (var au in _graphClient.GetPaginatedAsync("directory/administrativeUnits?$select=id,displayName", ct: ct))
+                if (Str(au, "id") is { Length: > 0 } auId) scopeNames[$"/administrativeUnits/{auId}"] = $"AU {Str(au, "displayName")}";
+        }
+        catch (HttpRequestException ex)
+        {
+            context.ReportProgress($"Administrative unit names unavailable ({ex.Message}); scoped roles show the AU id.", 4);
         }
 
-        context.ReportProgress($"Scanned {appCount} app registrations.", 3);
+        var groupMembers = new Dictionary<string, List<JsonElement>?>(StringComparer.OrdinalIgnoreCase);
 
-        // --- Service principals: GRANTED application permissions (appRoleAssignments) ---
-        // These are the permissions actually consented to an app — the real risk surface.
-        context.ReportProgress("Scanning granted application permissions...", 3);
+        // --- Active directory role assignments (N1, N2, N3) ---
+        context.ReportProgress("Scanning Entra role assignments...", 3);
+        foreach (var e in await ScanActiveRoleAssignmentsAsync(context, roleDefs, scopeNames, groupMembers, ct))
+            yield return e;
+        context.CompleteTarget();
+
+        // --- App registrations: REQUESTED permissions (requiredResourceAccess) and owners ---
+        context.ReportProgress("Scanning app registrations...", 3);
+        foreach (var app in apps)
+        {
+            ct.ThrowIfCancellationRequested();
+            foreach (var e in MapRequestedPermissions(app, sps)) yield return e;
+
+            var appObjId = Str(app, "id");
+            var target = new OwnedObject($"AppRegistration/{Str(app, "displayName")}", "Application", appObjId, "ApplicationOwner");
+            foreach (var e in await ReadOwnersAsync(app, appOwnersExpanded, $"applications/{appObjId}/owners?{OwnerSelect}", target, context, ct))
+                yield return e;
+        }
+        context.ReportProgress($"Scanned {apps.Count} app registrations.", 3);
+        context.CompleteTarget();
+
+        // --- Service principals: owners and GRANTED application permissions (appRoleAssignments) ---
+        context.ReportProgress("Scanning enterprise app owners and granted application permissions...", 3);
+        foreach (var sp in sps.WithOwners)
+        {
+            var spId = Str(sp, "id");
+            var target = new OwnedObject($"EnterpriseApp/{Str(sp, "displayName")}", "ServicePrincipal", spId, "ServicePrincipalOwner");
+            foreach (var e in await ReadOwnersAsync(sp, true, $"servicePrincipals/{spId}/owners?{OwnerSelect}", target, context, ct))
+                yield return e;
+        }
+
         int grantedPermCount = 0;
         await foreach (var sp in _graphClient.GetPaginatedAsync(
             "servicePrincipals?$select=id,appId,displayName&$expand=appRoleAssignments", ct: ct))
         {
             ct.ThrowIfCancellationRequested();
 
-            var spName = sp.TryGetProperty("displayName", out var spdn) ? spdn.GetString() ?? "" : "";
-            var spAppId = sp.TryGetProperty("appId", out var spaid) ? spaid.GetString() ?? "" : "";
-            var spId = sp.TryGetProperty("id", out var spid) ? spid.GetString() ?? "" : "";
+            var spName = Str(sp, "displayName");
+            var spAppId = Str(sp, "appId");
+            var spId = Str(sp, "id");
 
             if (!sp.TryGetProperty("appRoleAssignments", out var aras) || aras.ValueKind != JsonValueKind.Array)
                 continue;
@@ -149,16 +144,16 @@ public sealed class EntraScanner : IScanProvider
 
             foreach (var ara in assignments)
             {
-                var appRoleId = ara.TryGetProperty("appRoleId", out var arid) ? arid.GetString() ?? "" : "";
-                var resourceId = ara.TryGetProperty("resourceId", out var resId) ? resId.GetString() ?? "" : "";
-                var resourceName = ara.TryGetProperty("resourceDisplayName", out var rdn) ? rdn.GetString() ?? "" : "";
+                var appRoleId = Str(ara, "appRoleId");
+                var resourceId = Str(ara, "resourceId");
+                var resourceName = Str(ara, "resourceDisplayName");
 
-                // The all-zero GUID is the "default access" role (no specific app role) — skip it.
+                // The all-zero GUID is the "default access" role (no specific app role): skip it.
                 if (string.IsNullOrEmpty(appRoleId) || appRoleId == "00000000-0000-0000-0000-000000000000")
                     continue;
 
-                var permName = appPermsByObjectId.TryGetValue(resourceId, out var rmap2)
-                    && rmap2.TryGetValue(appRoleId, out var pn2) ? pn2 : appRoleId;
+                var permName = sps.ByObjectId.TryGetValue(resourceId, out var api)
+                    && api.AppRoles.TryGetValue(appRoleId, out var pn) ? pn : appRoleId;
 
                 grantedPermCount++;
                 yield return new PermissionEntry
@@ -166,7 +161,8 @@ public sealed class EntraScanner : IScanProvider
                     TargetPath = string.IsNullOrEmpty(resourceName) ? $"EnterpriseApp/{spName}" : $"EnterpriseApp/{spName} → {resourceName}",
                     TargetType = "ServicePrincipal",
                     TargetId = spId,
-                    PrincipalEntraId = spAppId,
+                    PrincipalEntraId = spId,
+                    PrincipalSysId = spAppId,
                     PrincipalSysName = spName,
                     PrincipalType = "Application",
                     PrincipalRole = permName,
@@ -179,265 +175,46 @@ public sealed class EntraScanner : IScanProvider
         context.ReportProgress($"Found {grantedPermCount} granted application permissions.", 3);
         context.CompleteTarget();
 
-        // --- PIM: Eligible directory role assignments ---
-        context.ReportProgress("Checking for PIM (Privileged Identity Management) eligible assignments...", 3);
-
-        bool pimAvailable = false;
-        int eligibleCount = 0;
-        var pimRoleEntries = new List<PermissionEntry>();
-        try
-        {
-            await foreach (var assignment in _graphClient.GetPaginatedAsync(
-                "roleManagement/directory/roleEligibilityScheduleInstances?$expand=principal,roleDefinition", ct: ct))
-            {
-                ct.ThrowIfCancellationRequested();
-                pimAvailable = true;
-                eligibleCount++;
-
-                var roleDef = assignment.TryGetProperty("roleDefinition", out var rd) ? rd : default;
-                var roleName = roleDef.ValueKind != JsonValueKind.Undefined &&
-                               roleDef.TryGetProperty("displayName", out var rdn) ? rdn.GetString() ?? "" : "";
-                var roleDefId = assignment.TryGetProperty("roleDefinitionId", out var rdi) ? rdi.GetString() ?? "" : "";
-
-                var principal = assignment.TryGetProperty("principal", out var pr) ? pr : default;
-                var principalId = assignment.TryGetProperty("principalId", out var pid) ? pid.GetString() ?? "" : "";
-                var principalUpn = principal.ValueKind != JsonValueKind.Undefined &&
-                                   principal.TryGetProperty("userPrincipalName", out var pupn) ? pupn.GetString() ?? "" : "";
-                var principalName = principal.ValueKind != JsonValueKind.Undefined &&
-                                    principal.TryGetProperty("displayName", out var pdn) ? pdn.GetString() ?? "" : "";
-                var principalOdataType = principal.ValueKind != JsonValueKind.Undefined &&
-                                         principal.TryGetProperty("@odata.type", out var pot) ? pot.GetString() ?? "" : "";
-
-                var startTime = assignment.TryGetProperty("startDateTime", out var st) ? st.GetString() ?? "" : "";
-                var endTime = assignment.TryGetProperty("endDateTime", out var et) ? et.GetString() ?? "" : "";
-
-                pimRoleEntries.Add(new PermissionEntry
-                {
-                    TargetPath = $"DirectoryRole/{roleName}",
-                    TargetType = "DirectoryRole",
-                    TargetId = roleDefId,
-                    PrincipalEntraId = principalId,
-                    PrincipalEntraUpn = principalUpn,
-                    PrincipalSysName = principalName,
-                    PrincipalType = MapMemberType(principalOdataType),
-                    PrincipalRole = roleName,
-                    Through = "PIM-Eligible",
-                    AccessType = "Allow",
-                    Tenure = string.IsNullOrEmpty(endTime) ? "Eligible-Permanent" : $"Eligible (until {endTime})"
-                });
-            }
-        }
-        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Forbidden ||
-                                                ex.StatusCode == System.Net.HttpStatusCode.BadRequest)
-        {
-            context.ReportProgress("PIM not available in this tenant (may require P2 license).", 3);
-        }
-        catch (Exception ex)
-        {
-            context.ReportProgress($"PIM role eligibility check failed: {ex.Message}", 3);
-        }
-
-        foreach (var e in pimRoleEntries) yield return e;
-
-        // --- PIM: Eligible group memberships ---
-        var pimGroupEntries = new List<PermissionEntry>();
-        try
-        {
-            await foreach (var assignment in _graphClient.GetPaginatedAsync(
-                "identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?$expand=principal,group", ct: ct))
-            {
-                ct.ThrowIfCancellationRequested();
-                pimAvailable = true;
-                eligibleCount++;
-
-                var group = assignment.TryGetProperty("group", out var g) ? g : default;
-                var groupName = group.ValueKind != JsonValueKind.Undefined &&
-                                group.TryGetProperty("displayName", out var gdn) ? gdn.GetString() ?? "" : "";
-                var groupId = assignment.TryGetProperty("groupId", out var gid) ? gid.GetString() ?? "" : "";
-                var accessId = assignment.TryGetProperty("accessId", out var aid2) ? aid2.GetString() ?? "" : "member";
-
-                var principal = assignment.TryGetProperty("principal", out var pr2) ? pr2 : default;
-                var principalId = assignment.TryGetProperty("principalId", out var pid2) ? pid2.GetString() ?? "" : "";
-                var principalUpn = principal.ValueKind != JsonValueKind.Undefined &&
-                                   principal.TryGetProperty("userPrincipalName", out var pupn2) ? pupn2.GetString() ?? "" : "";
-                var principalName = principal.ValueKind != JsonValueKind.Undefined &&
-                                    principal.TryGetProperty("displayName", out var pdn2) ? pdn2.GetString() ?? "" : "";
-                var principalOdataType = principal.ValueKind != JsonValueKind.Undefined &&
-                                         principal.TryGetProperty("@odata.type", out var pot2) ? pot2.GetString() ?? "" : "";
-
-                var endTime = assignment.TryGetProperty("endDateTime", out var et2) ? et2.GetString() ?? "" : "";
-
-                pimGroupEntries.Add(new PermissionEntry
-                {
-                    TargetPath = $"Group/{groupName}",
-                    TargetType = "SecurityGroup",
-                    TargetId = groupId,
-                    PrincipalEntraId = principalId,
-                    PrincipalEntraUpn = principalUpn,
-                    PrincipalSysName = principalName,
-                    PrincipalType = MapMemberType(principalOdataType),
-                    PrincipalRole = accessId == "owner" ? "Owner" : "Member",
-                    Through = "PIM-EligibleGroupAccess",
-                    AccessType = "Allow",
-                    Tenure = string.IsNullOrEmpty(endTime) ? "Eligible-Permanent" : $"Eligible (until {endTime})"
-                });
-            }
-        }
-        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Forbidden ||
-                                                ex.StatusCode == System.Net.HttpStatusCode.BadRequest)
-        {
-            // Expected if PIM for groups is not configured
-        }
-        catch (Exception ex)
-        {
-            context.ReportProgress($"PIM group eligibility check failed: {ex.Message}", 3);
-        }
-
-        foreach (var e in pimGroupEntries) yield return e;
-
-        if (pimAvailable)
-            context.ReportProgress($"PIM active: found {eligibleCount} eligible assignments.", 3);
-        else
-            context.ReportProgress("PIM not detected or not accessible in this tenant.", 3);
-
-        // --- Service Principal OAuth2 grants (delegated consent) ---
-        context.ReportProgress("Scanning OAuth2 permission grants...", 3);
-
-        int oauth2GrantCount = 0;
-        await foreach (var grant in _graphClient.GetPaginatedAsync(
-            "oauth2PermissionGrants?$select=id,clientId,consentType,principalId,resourceId,scope", ct: ct))
-        {
-            ct.ThrowIfCancellationRequested();
-            oauth2GrantCount++;
-
-            var clientId = grant.TryGetProperty("clientId", out var ci) ? ci.GetString() ?? "" : "";
-            var resourceId = grant.TryGetProperty("resourceId", out var ri) ? ri.GetString() ?? "" : "";
-            var scope = grant.TryGetProperty("scope", out var s) ? s.GetString() ?? "" : "";
-            var consentType = grant.TryGetProperty("consentType", out var ct2) ? ct2.GetString() ?? "" : "";
-            var principalId = grant.TryGetProperty("principalId", out var pi) ? pi.GetString() ?? "" : "";
-
-            // Resolve display names from cache
-            spCache.TryGetValue(clientId, out var clientName);
-            spCache.TryGetValue(resourceId, out var resourceName);
-            var targetPath = !string.IsNullOrEmpty(clientName) ? $"OAuth2PermissionGrant/{clientName}" : "OAuth2PermissionGrant";
-
-            foreach (var permission in scope.Split(' ', StringSplitOptions.RemoveEmptyEntries))
-            {
-                yield return new PermissionEntry
-                {
-                    TargetPath = targetPath,
-                    TargetType = "DelegatedConsent",
-                    TargetId = resourceId,
-                    PrincipalEntraId = clientId,
-                    PrincipalSysName = clientName ?? "",
-                    PrincipalType = consentType == "AllPrincipals" ? "AllPrincipals" : "User",
-                    PrincipalRole = permission,
-                    Through = !string.IsNullOrEmpty(resourceName) ? $"OAuth2Grant → {resourceName}" : "OAuth2Grant",
-                    ParentId = principalId,
-                    AccessType = "Allow",
-                    Tenure = "Permanent"
-                };
-            }
-        }
-
-        context.ReportProgress($"Found {oauth2GrantCount} OAuth2 grants.", 3);
-        context.CompleteTarget();
-
-        // --- Graph Subscriptions (webhook change notifications) ---
-        context.ReportProgress("Scanning Graph webhook subscriptions...", 3);
-
-        var subscriptionEntries = new List<PermissionEntry>();
-        try
-        {
-            await foreach (var sub in _graphClient.GetPaginatedAsync(
-                "subscriptions", ct: ct))
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var subId = sub.TryGetProperty("id", out var sid) ? sid.GetString() ?? "" : "";
-                var resource = sub.TryGetProperty("resource", out var res) ? res.GetString() ?? "" : "";
-                var changeType = sub.TryGetProperty("changeType", out var ctp) ? ctp.GetString() ?? "" : "";
-                var notificationUrl = sub.TryGetProperty("notificationUrl", out var nu) ? nu.GetString() ?? "" : "";
-                var expirationStr = sub.TryGetProperty("expirationDateTime", out var exp) ? exp.GetString() ?? "" : "";
-                var applicationId = sub.TryGetProperty("applicationId", out var appId) ? appId.GetString() ?? "" : "";
-                var creatorId = sub.TryGetProperty("creatorId", out var cid) ? cid.GetString() ?? "" : "";
-                var includeResourceData = sub.TryGetProperty("includeResourceData", out var ird)
-                    && ird.ValueKind == JsonValueKind.True;
-
-                // Resolve application name from SP cache if available
-                var appName = "";
-                if (!string.IsNullOrEmpty(applicationId))
-                    spCache.TryGetValue(applicationId, out appName);
-                appName ??= "";
-
-                // Determine tenure from expiration
-                var tenure = "Permanent";
-                if (!string.IsNullOrEmpty(expirationStr) && DateTimeOffset.TryParse(expirationStr, out var expDate))
-                {
-                    tenure = expDate > DateTimeOffset.UtcNow
-                        ? $"Expires {expDate:yyyy-MM-dd HH:mm} UTC"
-                        : $"Expired {expDate:yyyy-MM-dd HH:mm} UTC";
-                }
-
-                // Extract notification domain for readability
-                var notifDomain = "";
-                if (Uri.TryCreate(notificationUrl, UriKind.Absolute, out var notifUri))
-                    notifDomain = notifUri.Host;
-
-                var targetLabel = !string.IsNullOrEmpty(appName) ? appName : applicationId;
-
-                subscriptionEntries.Add(new PermissionEntry
-                {
-                    TargetPath = $"Subscription/{targetLabel}/{resource}",
-                    TargetType = "Subscription",
-                    TargetId = subId,
-                    PrincipalEntraId = applicationId,
-                    PrincipalSysId = creatorId,
-                    PrincipalSysName = !string.IsNullOrEmpty(appName) ? appName : applicationId,
-                    PrincipalType = "Application",
-                    PrincipalRole = changeType,
-                    Through = !string.IsNullOrEmpty(notifDomain) ? $"Webhook → {notifDomain}" : "Webhook",
-                    AccessType = includeResourceData ? "IncludesResourceData" : "NotificationOnly",
-                    Tenure = tenure
-                });
-            }
-        }
-        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Forbidden ||
-                                                ex.StatusCode == System.Net.HttpStatusCode.Unauthorized)
-        {
-            context.ReportProgress("Cannot list Graph subscriptions — Subscription.Read.All permission may be missing. Skipping.", 3);
-        }
-        catch (Exception ex)
-        {
-            context.ReportProgress($"Graph subscription enumeration failed: {ex.Message}", 3);
-        }
-
-        foreach (var e in subscriptionEntries) yield return e;
-        context.ReportProgress($"Found {subscriptionEntries.Count} Graph webhook subscriptions.", 3);
-
-        // --- Group memberships (security groups + M365 groups) ---
+        // Groups are listed up front: PIM for Groups needs the role-assignable ones.
         context.ReportProgress("Enumerating groups...", 3);
-
-        // First collect all groups, then set targets to include per-group progress
         var groups = new List<JsonElement>();
         await foreach (var group in _graphClient.GetPaginatedAsync(
-            "groups?$select=id,displayName,groupTypes,securityEnabled,mailEnabled", ct: ct))
+            "groups?$select=id,displayName,groupTypes,securityEnabled,mailEnabled,isAssignableToRole", ct: ct))
         {
             groups.Add(group);
         }
 
+        // --- PIM: eligible directory roles and eligible group memberships ---
+        context.ReportProgress("Checking PIM (Privileged Identity Management) eligible assignments...", 3);
+        foreach (var e in await ScanEligibleRolesAsync(context, roleDefs, scopeNames, groupMembers, ct))
+            yield return e;
+        foreach (var e in await ScanEligibleGroupMembershipsAsync(context, groups, ct))
+            yield return e;
+        context.CompleteTarget();
+
+        // --- OAuth2 permission grants (delegated consent) ---
+        context.ReportProgress("Scanning OAuth2 permission grants...", 3);
+        foreach (var e in await ScanOAuth2GrantsAsync(context, sps, ct))
+            yield return e;
+        context.CompleteTarget();
+
+        // Graph webhook subscriptions are not scanned: with delegated auth Graph lists only the calling
+        // app's own subscriptions, so third-party subscriptions were never visible (N9).
+
+        // --- Group memberships (security groups + M365 groups) ---
         context.ReportProgress($"Found {groups.Count} groups to scan for memberships.", 3);
-        // Update total: roles already completed + apps + OAuth2 + individual groups
-        context.SetTotalTargets(roles.Count + 2 + groups.Count);
+        context.SetTotalTargets(phases + groups.Count);
 
         int groupsDone = 0;
         foreach (var group in groups)
         {
             ct.ThrowIfCancellationRequested();
 
-            var groupId = group.TryGetProperty("id", out var gid) ? gid.GetString() ?? "" : "";
-            var groupName = group.TryGetProperty("displayName", out var gdn) ? gdn.GetString() ?? "" : "";
-            var secEnabled = group.TryGetProperty("securityEnabled", out var se) && se.GetBoolean();
+            var groupId = Str(group, "id");
+            var groupName = Str(group, "displayName");
+            var groupTypes = StringArray(group, "groupTypes");
+            var targetType = ClassifyGroup(groupTypes, Bool(group, "securityEnabled"), Bool(group, "mailEnabled"));
+            var memberThrough = groupTypes.Contains("DynamicMembership", StringComparer.OrdinalIgnoreCase) ? "DynamicRule" : "Direct";
 
             if (string.IsNullOrEmpty(groupId))
             {
@@ -453,57 +230,13 @@ public sealed class EntraScanner : IScanProvider
             bool memberFetchFailed = false;
             try
             {
-                await foreach (var member in _graphClient.GetPaginatedAsync(
-                    $"groups/{groupId}/members?$select=id,displayName,userPrincipalName,userType", ct: ct))
-                {
-                    var memberUpn = member.TryGetProperty("userPrincipalName", out var upn) ? upn.GetString() ?? "" : "";
-                    var memberName = member.TryGetProperty("displayName", out var mdn) ? mdn.GetString() ?? "" : "";
-                    var memberId = member.TryGetProperty("id", out var mid) ? mid.GetString() ?? "" : "";
-                    var memberType = member.TryGetProperty("@odata.type", out var ot) ? ot.GetString() ?? "" : "";
-                    var memberUserType = member.TryGetProperty("userType", out var mut) ? mut.GetString() ?? "" : "";
+                await foreach (var member in _graphClient.GetPaginatedAsync($"groups/{groupId}/members?{MemberSelect}", ct: ct))
+                    memberEntries.Add(MapPrincipalEntry(member, $"Group/{groupName}", targetType, groupId, "Member", memberThrough, "Permanent"));
 
-                    memberEntries.Add(new PermissionEntry
-                    {
-                        TargetPath = $"Group/{groupName}",
-                        TargetType = secEnabled ? "SecurityGroup" : "M365Group",
-                        TargetId = groupId,
-                        PrincipalEntraId = memberId,
-                        PrincipalEntraUpn = memberUpn,
-                        PrincipalSysName = memberName,
-                        PrincipalType = MapMemberType(memberType, memberUserType),
-                        PrincipalRole = "Member",
-                        Through = "Direct",
-                        AccessType = "Allow",
-                        Tenure = "Permanent"
-                    });
-                }
-
-                await foreach (var owner in _graphClient.GetPaginatedAsync(
-                    $"groups/{groupId}/owners?$select=id,displayName,userPrincipalName,userType", ct: ct))
-                {
-                    var ownerUpn = owner.TryGetProperty("userPrincipalName", out var oupn) ? oupn.GetString() ?? "" : "";
-                    var ownerName = owner.TryGetProperty("displayName", out var odn) ? odn.GetString() ?? "" : "";
-                    var ownerId = owner.TryGetProperty("id", out var oid) ? oid.GetString() ?? "" : "";
-                    var ownerType = owner.TryGetProperty("@odata.type", out var oot) ? oot.GetString() ?? "" : "";
-                    var ownerUserType = owner.TryGetProperty("userType", out var out2) ? out2.GetString() ?? "" : "";
-
-                    memberEntries.Add(new PermissionEntry
-                    {
-                        TargetPath = $"Group/{groupName}",
-                        TargetType = secEnabled ? "SecurityGroup" : "M365Group",
-                        TargetId = groupId,
-                        PrincipalEntraId = ownerId,
-                        PrincipalEntraUpn = ownerUpn,
-                        PrincipalSysName = ownerName,
-                        PrincipalType = MapMemberType(ownerType, ownerUserType),
-                        PrincipalRole = "Owner",
-                        Through = "Direct",
-                        AccessType = "Allow",
-                        Tenure = "Permanent"
-                    });
-                }
+                await foreach (var owner in _graphClient.GetPaginatedAsync($"groups/{groupId}/owners?{OwnerSelect}", ct: ct))
+                    memberEntries.Add(MapPrincipalEntry(owner, $"Group/{groupName}", targetType, groupId, "Owner", "Direct", "Permanent"));
             }
-            catch (Exception ex)
+            catch (Exception ex) when (IsRecoverable(ex))
             {
                 context.ReportProgress($"Failed to get members of group '{groupName}': {ex.Message}", 2);
                 memberFetchFailed = true;
@@ -512,18 +245,10 @@ public sealed class EntraScanner : IScanProvider
             // Yield whatever members we collected (even if partial due to error)
             foreach (var e in memberEntries) yield return e;
 
-            if (memberFetchFailed)
-            {
-                context.FailTarget();
-            }
-            else
-            {
-                context.CompleteTarget();
-            }
+            if (memberFetchFailed) context.FailTarget();
+            else context.CompleteTarget();
 
             groupsDone++;
-
-            // Log progress periodically
             if (groupsDone % 50 == 0)
                 context.ReportProgress($"Scanned {groupsDone}/{groups.Count} groups...", 4);
         }
@@ -531,86 +256,563 @@ public sealed class EntraScanner : IScanProvider
         context.ReportProgress($"Completed scanning {groupsDone} groups.", 3);
     }
 
-    private const int ExpandCap = 20;
+    // ---------------------------------------------------------------- role assignments
+
+    private readonly record struct Schedule(string AssignmentType, string Start, string End);
 
     /// <summary>
-    /// Enumerate service principals once and build permission-GUID → name lookups, keyed both by
-    /// the resource's appId (for resolving requiredResourceAccess) and its objectId (for resolving
-    /// appRoleAssignments), plus objectId/appId → displayName for OAuth2 grants and subscriptions.
+    /// Active role assignments from roleManagement (covers custom roles and AU/app-scoped assignments that
+    /// directoryRoles/members misses, N1), with tenure from the assignment schedule instances (N2).
     /// </summary>
-    private async Task<(Dictionary<string, Dictionary<string, string>> byAppId,
-                        Dictionary<string, Dictionary<string, string>> byObjectId,
-                        Dictionary<string, string> namesById)>
-        BuildAppPermissionCachesAsync(CancellationToken ct)
+    private async Task<List<PermissionEntry>> ScanActiveRoleAssignmentsAsync(ScanContext context,
+        Dictionary<string, string> roleDefs, Dictionary<string, string> scopeNames,
+        Dictionary<string, List<JsonElement>?> groupMembers, CancellationToken ct)
     {
-        var byAppId = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-        var byObjectId = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-        var namesById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-        await foreach (var sp in _graphClient.GetPaginatedAsync(
-            "servicePrincipals?$select=id,appId,displayName,appRoles,oauth2PermissionScopes", ct: ct))
+        var assignments = new List<JsonElement>();
+        try
         {
-            var spId = sp.TryGetProperty("id", out var i) ? i.GetString() ?? "" : "";
-            var appId = sp.TryGetProperty("appId", out var a) ? a.GetString() ?? "" : "";
-            // Keyed by object ID (OAuth2 grants) and by appId (subscriptions); GUIDs don't collide.
-            var spName = sp.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
-            if (!string.IsNullOrEmpty(spId)) namesById[spId] = spName;
-            if (!string.IsNullOrEmpty(appId)) namesById.TryAdd(appId, spName);
-
-            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            if (sp.TryGetProperty("appRoles", out var ar) && ar.ValueKind == JsonValueKind.Array)
-                foreach (var r in ar.EnumerateArray())
-                {
-                    var rid = r.TryGetProperty("id", out var ri) ? ri.GetString() ?? "" : "";
-                    var val = r.TryGetProperty("value", out var rv) ? rv.GetString() ?? "" : "";
-                    if (!string.IsNullOrEmpty(rid) && !string.IsNullOrEmpty(val)) map[rid] = val;
-                }
-            if (sp.TryGetProperty("oauth2PermissionScopes", out var sc) && sc.ValueKind == JsonValueKind.Array)
-                foreach (var s in sc.EnumerateArray())
-                {
-                    var sid = s.TryGetProperty("id", out var si) ? si.GetString() ?? "" : "";
-                    var val = s.TryGetProperty("value", out var sv) ? sv.GetString() ?? "" : "";
-                    if (!string.IsNullOrEmpty(sid) && !string.IsNullOrEmpty(val)) map[sid] = val;
-                }
-
-            if (map.Count == 0) continue;
-            if (!string.IsNullOrEmpty(appId)) byAppId[appId] = map;
-            if (!string.IsNullOrEmpty(spId)) byObjectId[spId] = map;
+            await foreach (var a in _graphClient.GetPaginatedAsync("roleManagement/directory/roleAssignments?$expand=principal", ct: ct))
+                assignments.Add(a);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.BadRequest)
+        {
+            // Some tenants require a filter on this list: read it per role definition instead.
+            assignments.Clear();
+            foreach (var roleDefId in roleDefs.Keys.Distinct(StringComparer.OrdinalIgnoreCase))
+                await foreach (var a in _graphClient.GetPaginatedAsync(
+                    $"roleManagement/directory/roleAssignments?$filter=roleDefinitionId eq '{roleDefId}'&$expand=principal", ct: ct))
+                    assignments.Add(a);
+            assignments = assignments.GroupBy(a => Str(a, "id")).Select(g => g.First()).ToList();
         }
 
-        return (byAppId, byObjectId, namesById);
+        var schedules = await LoadAssignmentSchedulesAsync(context, ct);
+
+        var entries = new List<PermissionEntry>();
+        foreach (var a in assignments)
+        {
+            var roleDefId = Str(a, "roleDefinitionId");
+            var roleName = roleDefs.TryGetValue(roleDefId, out var rn) && !string.IsNullOrEmpty(rn) ? rn : roleDefId;
+            var scopeId = Str(a, "directoryScopeId");
+            var principalId = Str(a, "principalId");
+
+            var schedule = schedules.TryGetValue(Str(a, "id"), out var s) ? s
+                : schedules.TryGetValue(ScheduleKey(principalId, roleDefId, scopeId), out var s2) ? s2
+                : default;
+            var tenure = RoleTenure.Active(schedule.AssignmentType, schedule.End);
+
+            var row = MapRolePrincipal(a, principalId, roleName, roleDefId, scopeId, scopeNames, "DirectoryRoleAssignment", tenure);
+            row.StartDateTime = schedule.Start ?? "";
+            row.EndDateTime = schedule.End ?? "";
+            entries.Add(row);
+            entries.AddRange(await ExpandGroupHolderAsync(row, context, groupMembers, ct));
+        }
+
+        context.ReportProgress($"Found {assignments.Count} active role assignments.", 3);
+        return entries;
     }
 
-    private static PermissionEntry MapDirectoryRoleMember(JsonElement member, string roleName, string roleId)
-    {
-        var upn = member.TryGetProperty("userPrincipalName", out var u) ? u.GetString() ?? "" : "";
-        var displayName = member.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
-        var memberId = member.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
-        var odataType = member.TryGetProperty("@odata.type", out var ot) ? ot.GetString() ?? "" : "";
-        var userType = member.TryGetProperty("userType", out var ut) ? ut.GetString() ?? "" : "";
+    private static string ScheduleKey(string principalId, string roleDefId, string scopeId)
+        => $"{principalId}|{roleDefId}|{(string.IsNullOrEmpty(scopeId) ? "/" : scopeId)}";
 
+    /// <summary>
+    /// Assignment schedule instances, keyed by role assignment id and by principal|role|scope. Without them an
+    /// activated PIM role looks permanent, which flags every admin who activated a role to run the scan.
+    /// </summary>
+    private async Task<Dictionary<string, Schedule>> LoadAssignmentSchedulesAsync(ScanContext context, CancellationToken ct)
+    {
+        var result = new Dictionary<string, Schedule>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            await foreach (var i in _graphClient.GetPaginatedAsync("roleManagement/directory/roleAssignmentScheduleInstances", ct: ct))
+            {
+                var schedule = new Schedule(Str(i, "assignmentType"), Str(i, "startDateTime"), Str(i, "endDateTime"));
+                var direct = Str(i, "memberType") is not { Length: > 0 } mt || mt.Equals("Direct", StringComparison.OrdinalIgnoreCase);
+                if (Str(i, "roleAssignmentOriginId") is { Length: > 0 } origin && direct)
+                    result[origin] = schedule;
+                var key = ScheduleKey(Str(i, "principalId"), Str(i, "roleDefinitionId"), Str(i, "directoryScopeId"));
+                if (direct) result[key] = schedule;
+                else result.TryAdd(key, schedule);
+            }
+        }
+        catch (HttpRequestException ex) when (IsLicensingError(ex))
+        {
+            // No PIM licence: activations and time-bound assignments cannot exist, so Permanent is accurate.
+            context.ReportProgress("PIM is not licensed in this tenant; all active role assignments are permanent.", 3);
+        }
+        catch (HttpRequestException ex)
+        {
+            context.MarkPartial($"Role assignment schedules could not be read ({DescribeGraphError(ex)}); PIM-activated and time-bound roles are reported as Permanent.");
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Members of a role-holding group hold the role too (N3). Emits one row per transitive member,
+    /// keeping the group row; same role, target and tenure, Through="GroupMember", ParentId=group.
+    /// </summary>
+    private async Task<List<PermissionEntry>> ExpandGroupHolderAsync(PermissionEntry groupRow, ScanContext context,
+        Dictionary<string, List<JsonElement>?> cache, CancellationToken ct)
+    {
+        var result = new List<PermissionEntry>();
+        if (groupRow.PrincipalType != "Group" || string.IsNullOrEmpty(groupRow.PrincipalEntraId)) return result;
+
+        if (!cache.TryGetValue(groupRow.PrincipalEntraId, out var members))
+        {
+            try
+            {
+                members = new List<JsonElement>();
+                await foreach (var m in _graphClient.GetPaginatedAsync($"groups/{groupRow.PrincipalEntraId}/transitiveMembers?{MemberSelect}", ct: ct))
+                    members.Add(m);
+            }
+            catch (HttpRequestException ex)
+            {
+                context.MarkPartial($"Members of role-holding group '{groupRow.PrincipalSysName}' could not be read ({ex.Message}).");
+                members = null;
+            }
+            cache[groupRow.PrincipalEntraId] = members;
+        }
+        if (members == null) return result;
+
+        foreach (var m in members)
+        {
+            var row = MapPrincipalEntry(m, groupRow.TargetPath, groupRow.TargetType, groupRow.TargetId,
+                groupRow.PrincipalRole, "GroupMember", groupRow.Tenure);
+            if (row.PrincipalType == "Group") continue; // nested groups are intermediates; their members are already listed
+            row.ParentId = groupRow.PrincipalEntraId;
+            row.StartDateTime = groupRow.StartDateTime;
+            row.EndDateTime = groupRow.EndDateTime;
+            result.Add(row);
+        }
+        return result;
+    }
+
+    /// <summary>"DirectoryRole/{role}", with " (scope: {id}, {name})" for AU- or app-scoped assignments.</summary>
+    public static string RoleTargetPath(string roleName, string? directoryScopeId, IReadOnlyDictionary<string, string>? scopeNames = null)
+    {
+        if (string.IsNullOrEmpty(directoryScopeId) || directoryScopeId == "/") return $"DirectoryRole/{roleName}";
+        var label = scopeNames != null && scopeNames.TryGetValue(directoryScopeId, out var n) && !string.IsNullOrEmpty(n) ? $", {n}" : "";
+        return $"DirectoryRole/{roleName} (scope: {directoryScopeId}{label})";
+    }
+
+    private static PermissionEntry MapRolePrincipal(JsonElement assignment, string principalId, string roleName, string roleDefId,
+        string scopeId, Dictionary<string, string> scopeNames, string through, string tenure)
+    {
+        var principal = assignment.TryGetProperty("principal", out var p) && p.ValueKind == JsonValueKind.Object ? p : default;
+        var row = principal.ValueKind == JsonValueKind.Object
+            ? MapPrincipalEntry(principal, RoleTargetPath(roleName, scopeId, scopeNames), "DirectoryRole", roleDefId, roleName, through, tenure)
+            : new PermissionEntry
+            {
+                TargetPath = RoleTargetPath(roleName, scopeId, scopeNames),
+                TargetType = "DirectoryRole",
+                TargetId = roleDefId,
+                PrincipalSysName = principalId,
+                PrincipalType = "Unknown",
+                PrincipalRole = roleName,
+                Through = through,
+                AccessType = "Allow",
+                Tenure = tenure
+            };
+        if (string.IsNullOrEmpty(row.PrincipalEntraId)) row.PrincipalEntraId = principalId;
+        return row;
+    }
+
+    // ---------------------------------------------------------------- PIM eligibility
+
+    private async Task<List<PermissionEntry>> ScanEligibleRolesAsync(ScanContext context,
+        Dictionary<string, string> roleDefs, Dictionary<string, string> scopeNames,
+        Dictionary<string, List<JsonElement>?> groupMembers, CancellationToken ct)
+    {
+        var entries = new List<PermissionEntry>();
+        var count = 0;
+        try
+        {
+            await foreach (var a in _graphClient.GetPaginatedAsync(
+                "roleManagement/directory/roleEligibilityScheduleInstances?$expand=principal", ct: ct))
+            {
+                ct.ThrowIfCancellationRequested();
+                count++;
+                var roleDefId = Str(a, "roleDefinitionId");
+                var roleName = roleDefs.TryGetValue(roleDefId, out var rn) && !string.IsNullOrEmpty(rn) ? rn : roleDefId;
+                var end = Str(a, "endDateTime");
+
+                var row = MapRolePrincipal(a, Str(a, "principalId"), roleName, roleDefId, Str(a, "directoryScopeId"),
+                    scopeNames, "PIM-Eligible", RoleTenure.Eligible(end));
+                row.StartDateTime = Str(a, "startDateTime");
+                row.EndDateTime = end;
+                entries.Add(row);
+                entries.AddRange(await ExpandGroupHolderAsync(row, context, groupMembers, ct));
+            }
+            context.ReportProgress($"Found {count} PIM-eligible role assignments.", 3);
+        }
+        catch (HttpRequestException ex) when (IsLicensingError(ex))
+        {
+            context.ReportProgress("PIM is not available in this tenant (requires Microsoft Entra ID P2); no eligible role assignments.", 3);
+        }
+        catch (HttpRequestException ex)
+        {
+            context.MarkPartial($"PIM eligible role assignments could not be read ({DescribeGraphError(ex)}).");
+        }
+        return entries;
+    }
+
+    /// <summary>
+    /// PIM for Groups eligibility (N4). The API requires a groupId (or principalId) filter, so it is read
+    /// per role-assignable group: those are the groups that can carry directory roles.
+    /// </summary>
+    private async Task<List<PermissionEntry>> ScanEligibleGroupMembershipsAsync(ScanContext context,
+        List<JsonElement> allGroups, CancellationToken ct)
+    {
+        var entries = new List<PermissionEntry>();
+        var groups = allGroups.Where(g => Bool(g, "isAssignableToRole")).ToList();
+
+        var raw = new List<(JsonElement Instance, JsonElement Group)>();
+        var failed = 0;
+        string? firstError = null;
+        foreach (var group in groups)
+        {
+            ct.ThrowIfCancellationRequested();
+            var groupId = Str(group, "id");
+            try
+            {
+                await foreach (var i in _graphClient.GetPaginatedAsync(
+                    $"identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?$filter=groupId eq '{groupId}'", ct: ct))
+                    raw.Add((i, group));
+            }
+            catch (HttpRequestException ex) when (IsLicensingError(ex))
+            {
+                context.ReportProgress("PIM for Groups is not available in this tenant (requires Microsoft Entra ID P2).", 3);
+                return entries;
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.Unauthorized)
+            {
+                // Same answer for every group: report once and stop.
+                context.MarkPartial($"PIM for Groups eligibility could not be read ({DescribeGraphError(ex)}). " +
+                    "Needs consent for PrivilegedEligibilitySchedule.Read.AzureADGroup and a role that can read PIM (e.g. Global Reader, Privileged Role Administrator).");
+                return entries;
+            }
+            catch (HttpRequestException ex)
+            {
+                failed++;
+                firstError ??= $"'{Str(group, "displayName")}': {ex.Message}";
+            }
+        }
+        if (failed > 0)
+            context.MarkPartial($"PIM for Groups eligibility failed for {failed} of {groups.Count} role-assignable group(s), first {firstError}.");
+
+        // Resolve principals in bulk; deleted ones are reported as such.
+        Dictionary<string, JsonElement>? principals = null;
+        try
+        {
+            principals = await _graphClient.GetDirectoryObjectsByIdsAsync(
+                raw.Select(r => Str(r.Instance, "principalId")), new[] { "user", "group", "servicePrincipal" }, ct);
+        }
+        catch (HttpRequestException ex)
+        {
+            context.ReportProgress($"PIM for Groups principals could not be resolved ({ex.Message}); rows show object ids.", 2);
+        }
+
+        foreach (var (i, group) in raw)
+        {
+            var groupId = Str(group, "id");
+            var principalId = Str(i, "principalId");
+            var end = Str(i, "endDateTime");
+            var targetType = ClassifyGroup(StringArray(group, "groupTypes"), Bool(group, "securityEnabled"), Bool(group, "mailEnabled"));
+            var role = Str(i, "accessId").Equals("owner", StringComparison.OrdinalIgnoreCase) ? "Owner" : "Member";
+
+            PermissionEntry row;
+            if (principals != null && principals.TryGetValue(principalId, out var p))
+                row = MapPrincipalEntry(p, $"Group/{Str(group, "displayName")}", targetType, groupId, role, "PIM-EligibleGroupAccess", RoleTenure.Eligible(end));
+            else
+                row = new PermissionEntry
+                {
+                    TargetPath = $"Group/{Str(group, "displayName")}",
+                    TargetType = targetType,
+                    TargetId = groupId,
+                    PrincipalEntraId = principalId,
+                    PrincipalSysName = principals != null ? $"Deleted principal ({principalId})" : principalId,
+                    PrincipalType = principals != null ? "Deleted principal" : "Unknown",
+                    PrincipalRole = role,
+                    Through = "PIM-EligibleGroupAccess",
+                    AccessType = "Allow",
+                    Tenure = RoleTenure.Eligible(end)
+                };
+            row.StartDateTime = Str(i, "startDateTime");
+            row.EndDateTime = end;
+            entries.Add(row);
+        }
+        if (entries.Count > 0)
+            context.ReportProgress($"Found {entries.Count} PIM-eligible group memberships.", 3);
+        return entries;
+    }
+
+    // ---------------------------------------------------------------- OAuth2 grants
+
+    /// <summary>
+    /// Delegated permission grants (N6). AllPrincipals grants are held by the client app for every user;
+    /// Principal grants are held by one user, who is the principal of the row.
+    /// </summary>
+    private async Task<List<PermissionEntry>> ScanOAuth2GrantsAsync(ScanContext context, ServicePrincipalCache sps, CancellationToken ct)
+    {
+        var grants = new List<JsonElement>();
+        await foreach (var grant in _graphClient.GetPaginatedAsync(
+            "oauth2PermissionGrants?$select=id,clientId,consentType,principalId,resourceId,scope", ct: ct))
+            grants.Add(grant);
+
+        var userIds = grants.Where(g => Str(g, "consentType") == "Principal").Select(g => Str(g, "principalId")).ToList();
+        Dictionary<string, JsonElement>? users = null;
+        if (userIds.Count > 0)
+        {
+            try
+            {
+                users = await _graphClient.GetDirectoryObjectsByIdsAsync(userIds, new[] { "user" }, ct);
+            }
+            catch (HttpRequestException ex)
+            {
+                context.ReportProgress($"Users holding OAuth2 grants could not be resolved ({ex.Message}); rows show object ids.", 2);
+            }
+        }
+
+        var entries = new List<PermissionEntry>();
+        foreach (var grant in grants)
+        {
+            var clientId = Str(grant, "clientId");
+            var resourceId = Str(grant, "resourceId");
+            var principalId = Str(grant, "principalId");
+            var allPrincipals = Str(grant, "consentType") == "AllPrincipals";
+
+            sps.NameByObjectId.TryGetValue(clientId, out var clientName);
+            sps.NameByObjectId.TryGetValue(resourceId, out var resourceName);
+            var targetPath = $"OAuth2PermissionGrant/{(string.IsNullOrEmpty(clientName) ? clientId : clientName)}"
+                + (string.IsNullOrEmpty(resourceName) ? "" : $" → {resourceName}");
+
+            foreach (var permission in Str(grant, "scope").Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var row = new PermissionEntry
+                {
+                    TargetPath = targetPath,
+                    TargetType = "DelegatedConsent",
+                    TargetId = clientId,
+                    PrincipalRole = permission,
+                    AccessType = "Allow",
+                    Tenure = "Permanent"
+                };
+
+                if (allPrincipals)
+                {
+                    row.PrincipalEntraId = clientId;
+                    row.PrincipalSysId = sps.AppIdByObjectId.TryGetValue(clientId, out var appId) ? appId : "";
+                    row.PrincipalSysName = clientName ?? clientId;
+                    row.PrincipalType = "Application";
+                    row.Through = "OAuth2Grant (AllPrincipals)";
+                }
+                else
+                {
+                    row.Through = "OAuth2Grant (Principal)";
+                    row.ParentId = clientId;
+                    if (users != null && users.TryGetValue(principalId, out var u))
+                    {
+                        var upn = Str(u, "userPrincipalName");
+                        row.PrincipalEntraId = principalId;
+                        row.PrincipalEntraUpn = upn;
+                        row.PrincipalSysName = Str(u, "displayName");
+                        row.PrincipalType = IsGuest(Str(u, "userType"), upn) ? "Guest" : "User";
+                    }
+                    else
+                    {
+                        row.PrincipalEntraId = principalId;
+                        row.PrincipalSysName = users != null ? $"Deleted principal ({principalId})" : principalId;
+                        row.PrincipalType = users != null ? "Deleted principal" : "User";
+                    }
+                }
+                entries.Add(row);
+            }
+        }
+
+        context.ReportProgress($"Found {grants.Count} OAuth2 grants.", 3);
+        return entries;
+    }
+
+    // ---------------------------------------------------------------- apps and owners
+
+    private readonly record struct OwnedObject(string Path, string Type, string Id, string Through);
+
+    /// <summary>Requested permissions from requiredResourceAccess; type Role resolves against appRoles, Scope against oauth2PermissionScopes (N8).</summary>
+    private static IEnumerable<PermissionEntry> MapRequestedPermissions(JsonElement app, ServicePrincipalCache sps)
+    {
+        var appName = Str(app, "displayName");
+        var appObjId = Str(app, "id");
+        var appClientId = Str(app, "appId");
+        sps.ObjectIdByAppId.TryGetValue(appClientId, out var spObjectId);
+
+        if (!app.TryGetProperty("requiredResourceAccess", out var rra) || rra.ValueKind != JsonValueKind.Array) yield break;
+        foreach (var resource in rra.EnumerateArray())
+        {
+            var resourceAppId = Str(resource, "resourceAppId");
+            sps.ByAppId.TryGetValue(resourceAppId, out var api);
+            var resourceName = !string.IsNullOrEmpty(api?.Name) ? api!.Name : resourceAppId;
+
+            if (!resource.TryGetProperty("resourceAccess", out var accesses) || accesses.ValueKind != JsonValueKind.Array) continue;
+            foreach (var access in accesses.EnumerateArray())
+            {
+                var permId = Str(access, "id");
+                var isRole = Str(access, "type") == "Role";
+                var names = isRole ? api?.AppRoles : api?.Scopes;
+                var permName = names != null && names.TryGetValue(permId, out var pn) ? pn : permId;
+
+                yield return new PermissionEntry
+                {
+                    TargetPath = $"AppRegistration/{appName} → {resourceName}",
+                    TargetType = "Application",
+                    TargetId = appObjId,
+                    PrincipalEntraId = spObjectId ?? "",
+                    PrincipalSysId = appClientId,
+                    PrincipalSysName = appName,
+                    PrincipalType = "Application",
+                    PrincipalRole = permName,
+                    // "Requested" is not "Granted": these come from the app manifest and may never have been
+                    // consented, so risk policies keyed on "ApplicationPermission" must not fire on them (A1).
+                    Through = isRole ? "RequestedApplicationPermission" : "RequestedDelegatedPermission",
+                    AccessType = "Allow",
+                    Tenure = "Requested"
+                };
+            }
+        }
+    }
+
+    /// <summary>Owner rows from an expanded owners collection, re-read in full when the expand cap was hit.</summary>
+    private async Task<List<PermissionEntry>> ReadOwnersAsync(JsonElement obj, bool expanded, string ownersUrl,
+        OwnedObject target, ScanContext context, CancellationToken ct)
+    {
+        var result = new List<PermissionEntry>();
+        if (!expanded || string.IsNullOrEmpty(target.Id)) return result;
+        if (!obj.TryGetProperty("owners", out var owners) || owners.ValueKind != JsonValueKind.Array) return result;
+
+        IEnumerable<JsonElement> list = owners.EnumerateArray().ToList();
+        if (owners.GetArrayLength() >= ExpandCap)
+        {
+            try
+            {
+                var all = new List<JsonElement>();
+                await foreach (var o in _graphClient.GetPaginatedAsync(ownersUrl, ct: ct)) all.Add(o);
+                list = all;
+            }
+            catch (HttpRequestException ex)
+            {
+                context.MarkPartial($"Owners of '{target.Path}' could not be read in full ({ex.Message}).");
+            }
+        }
+
+        foreach (var o in list)
+            result.Add(MapPrincipalEntry(o, target.Path, target.Type, target.Id, "Owner", target.Through, "Permanent"));
+        return result;
+    }
+
+    /// <summary>
+    /// Enumerate service principals once: permission definitions per resource API (by appId and object id),
+    /// names and appId/objectId maps, and the SPs that have owners.
+    /// </summary>
+    private async Task<ServicePrincipalCache> BuildServicePrincipalCacheAsync(ScanContext context, CancellationToken ct)
+    {
+        var cache = new ServicePrincipalCache();
+        const string select = "servicePrincipals?$select=id,appId,displayName,appRoles,oauth2PermissionScopes";
+        var (items, expanded) = await CollectWithFallbackAsync($"{select}&$expand=owners({OwnerSelect})", select, ct);
+        if (!expanded)
+            context.MarkPartial("Enterprise app owners could not be expanded; service principal owners are missing.");
+
+        foreach (var sp in items)
+        {
+            var spId = Str(sp, "id");
+            var appId = Str(sp, "appId");
+            var api = new ResourceApi { Name = Str(sp, "displayName") };
+            if (!string.IsNullOrEmpty(spId)) cache.NameByObjectId[spId] = api.Name;
+            if (!string.IsNullOrEmpty(spId) && !string.IsNullOrEmpty(appId))
+            {
+                cache.ObjectIdByAppId[appId] = spId;
+                cache.AppIdByObjectId[spId] = appId;
+            }
+
+            ReadPermissionNames(sp, "appRoles", api.AppRoles);
+            ReadPermissionNames(sp, "oauth2PermissionScopes", api.Scopes);
+            if (!string.IsNullOrEmpty(appId)) cache.ByAppId[appId] = api;
+            if (!string.IsNullOrEmpty(spId)) cache.ByObjectId[spId] = api;
+
+            if (sp.TryGetProperty("owners", out var o) && o.ValueKind == JsonValueKind.Array && o.GetArrayLength() > 0)
+                cache.WithOwners.Add(sp);
+        }
+        return cache;
+    }
+
+    private static void ReadPermissionNames(JsonElement sp, string property, Dictionary<string, string> map)
+    {
+        if (!sp.TryGetProperty(property, out var arr) || arr.ValueKind != JsonValueKind.Array) return;
+        foreach (var item in arr.EnumerateArray())
+            if (Str(item, "id") is { Length: > 0 } id && Str(item, "value") is { Length: > 0 } value)
+                map[id] = value;
+    }
+
+    /// <summary>Collect a paged list; when the expanded query is rejected (400), fall back to the plain one.</summary>
+    private async Task<(List<JsonElement> Items, bool UsedPrimary)> CollectWithFallbackAsync(string url, string fallbackUrl, CancellationToken ct)
+    {
+        var items = new List<JsonElement>();
+        try
+        {
+            await foreach (var i in _graphClient.GetPaginatedAsync(url, ct: ct)) items.Add(i);
+            return (items, true);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.BadRequest)
+        {
+            items.Clear();
+            await foreach (var i in _graphClient.GetPaginatedAsync(fallbackUrl, ct: ct)) items.Add(i);
+            return (items, false);
+        }
+    }
+
+    // ---------------------------------------------------------------- mapping helpers
+
+    private static PermissionEntry MapPrincipalEntry(JsonElement principal, string targetPath, string targetType, string targetId,
+        string role, string through, string tenure)
+    {
+        var upn = Str(principal, "userPrincipalName");
+        var type = MapMemberType(Str(principal, "@odata.type"), Str(principal, "userType"), upn);
+        var id = Str(principal, "id");
         return new PermissionEntry
         {
-            TargetPath = $"DirectoryRole/{roleName}",
-            TargetType = "DirectoryRole",
-            TargetId = roleId,
-            PrincipalEntraId = memberId,
+            TargetPath = targetPath,
+            TargetType = targetType,
+            TargetId = targetId,
+            PrincipalEntraId = id,
             PrincipalEntraUpn = upn,
-            PrincipalSysName = displayName,
-            PrincipalType = MapMemberType(odataType, userType),
-            PrincipalRole = roleName,
-            Through = "DirectoryRoleAssignment",
+            PrincipalSysId = type == "ServicePrincipal" ? Str(principal, "appId") : "",
+            PrincipalSysName = Str(principal, "displayName"),
+            PrincipalType = type,
+            PrincipalRole = role,
+            Through = through,
             AccessType = "Allow",
-            Tenure = "Permanent"
+            Tenure = tenure
         };
     }
 
-    private static string MapMemberType(string odataType, string userType = "")
+    /// <summary>
+    /// Group TargetType (N10): Unified = M365Group, security-enabled (mail-enabled or not) = SecurityGroup,
+    /// mail-enabled only = DistributionList.
+    /// </summary>
+    public static string ClassifyGroup(IEnumerable<string>? groupTypes, bool securityEnabled, bool mailEnabled)
     {
-        // Guests are ordinary users with userType=Guest. Surfacing them as "Guest" lets the
-        // "Guest/external user access" policy fire on Entra/role/group members, not just the
-        // SharePoint #ext# heuristic (A2).
-        if (odataType == "#microsoft.graph.user" && string.Equals(userType, "Guest", StringComparison.OrdinalIgnoreCase))
+        if (groupTypes != null && groupTypes.Contains("Unified", StringComparer.OrdinalIgnoreCase)) return "M365Group";
+        if (securityEnabled) return "SecurityGroup";
+        if (mailEnabled) return "DistributionList";
+        return "SecurityGroup";
+    }
+
+    /// <summary>Guests are users with userType Guest; B2B guests also carry #EXT# in their UPN when userType is not returned.</summary>
+    public static bool IsGuest(string? userType, string? upn)
+        => string.Equals(userType, "Guest", StringComparison.OrdinalIgnoreCase)
+           || (upn?.Contains("#EXT#", StringComparison.OrdinalIgnoreCase) ?? false);
+
+    public static string MapMemberType(string odataType, string userType = "", string upn = "")
+    {
+        // Surfacing guests as "Guest" lets the guest/external policy fire on Entra rows (A2).
+        if (odataType == "#microsoft.graph.user" && IsGuest(userType, upn))
             return "Guest";
 
         return odataType switch
@@ -622,4 +824,55 @@ public sealed class EntraScanner : IScanProvider
             _ => "Unknown"
         };
     }
+
+    /// <summary>Graph returns 400 with a licensing message when PIM (Entra ID P2) is not available.</summary>
+    internal static bool IsLicensingError(HttpRequestException ex)
+        => ex.StatusCode == HttpStatusCode.BadRequest
+           && (ex.Message.Contains("license", StringComparison.OrdinalIgnoreCase)
+               || ex.Message.Contains("AadPremium", StringComparison.OrdinalIgnoreCase)
+               || ex.Message.Contains("P2", StringComparison.Ordinal));
+
+    private static string DescribeGraphError(HttpRequestException ex) => ex.StatusCode switch
+    {
+        HttpStatusCode.Forbidden => "HTTP 403: missing consent or the signed-in account lacks a role that can read it",
+        HttpStatusCode.Unauthorized => "HTTP 401: token rejected",
+        _ => ex.Message
+    };
+
+    /// <summary>Errors a per-item loop can absorb; cancellation and exhausted retries end the category.</summary>
+    private static bool IsRecoverable(Exception ex) => ex is not OperationCanceledException and not GraphRetryExhaustedException;
+
+    private static string Str(JsonElement el, string name)
+        => el.ValueKind == JsonValueKind.Object && el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+
+    private static bool Bool(JsonElement el, string name)
+        => el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
+
+    private static List<string> StringArray(JsonElement el, string name)
+        => el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Array
+            ? v.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.String).Select(x => x.GetString() ?? "").ToList()
+            : new List<string>();
+}
+
+/// <summary>
+/// Tenure strings shared by the Entra and Azure scanners. Policies key on "Permanent" (exact) and on the
+/// "Eligible" prefix, so those two spellings must not change.
+/// </summary>
+public static class RoleTenure
+{
+    /// <summary>
+    /// Active assignment: "Permanent" (assigned, no end), "Active (until X)" (time-bound assigned) or
+    /// "Activated (PIM, until X)" (a PIM activation of an eligible assignment).
+    /// </summary>
+    public static string Active(string? assignmentType, string? endDateTime)
+    {
+        var hasEnd = !string.IsNullOrWhiteSpace(endDateTime);
+        if (string.Equals(assignmentType, "Activated", StringComparison.OrdinalIgnoreCase))
+            return hasEnd ? $"Activated (PIM, until {endDateTime})" : "Activated (PIM)";
+        return hasEnd ? $"Active (until {endDateTime})" : "Permanent";
+    }
+
+    /// <summary>Eligible assignment: "Eligible-Permanent" or "Eligible (until X)".</summary>
+    public static string Eligible(string? endDateTime)
+        => string.IsNullOrWhiteSpace(endDateTime) ? "Eligible-Permanent" : $"Eligible (until {endDateTime})";
 }

@@ -59,31 +59,32 @@ public sealed class PurviewScanner : IScanProvider
         context.ReportProgress($"Found {roleGroups.Count} Compliance role group(s). Enumerating members...", 3);
 
         // Step 3: For each role group, get its members
-        var allEntries = new List<PermissionEntry>();
+        var total = 0;
 
         foreach (var group in roleGroups)
         {
             ct.ThrowIfCancellationRequested();
-            context.ReportProgress($"Scanning role group: {group.Name}...", 4);
+            context.ReportProgress($"Scanning role group: {group.Label}...", 4);
 
+            var groupEntries = new List<PermissionEntry>();
             try
             {
-                await GetRoleGroupMembersAsync(context, complianceUrl, group, allEntries, ct);
+                await GetRoleGroupMembersAsync(context, complianceUrl, group, groupEntries, ct);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                context.ReportProgress($"Failed to enumerate members of '{group.Name}': {ex.Message}", 2);
+                context.ReportProgress($"Failed to enumerate members of '{group.Label}': {ex.Message}", 2);
                 context.FailTarget();
                 continue;
             }
 
             context.CompleteTarget();
+            total += groupEntries.Count;
+            foreach (var entry in groupEntries)
+                yield return entry;
         }
 
-        foreach (var entry in allEntries)
-            yield return entry;
-
-        context.ReportProgress($"Completed Purview scan. Found {allEntries.Count} role assignments.", 3);
+        context.ReportProgress($"Completed Purview scan. Found {total} role assignments.", 3);
     }
 
     /// <summary>
@@ -117,7 +118,7 @@ public sealed class PurviewScanner : IScanProvider
                     }
                 }), Encoding.UTF8, "application/json");
 
-            var resp = await _http.SendAsync(req, ct);
+            using var resp = await _http.SendAsync(req, ct);
 
             if (resp.StatusCode == HttpStatusCode.Redirect || resp.StatusCode == HttpStatusCode.MovedPermanently)
             {
@@ -125,7 +126,7 @@ public sealed class PurviewScanner : IScanProvider
                 if (!string.IsNullOrEmpty(location))
                 {
                     // Extract regional prefix: "https://nam12b.ps.compliance.protection.outlook.com/..."
-                    // → "nam12b"
+                    // gives "nam12b"
                     var uri = new Uri(location);
                     _regionalPrefix = uri.Host.Split('.')[0];
                     context.ReportProgress($"Discovered compliance endpoint region: {_regionalPrefix}", 4);
@@ -133,7 +134,7 @@ public sealed class PurviewScanner : IScanProvider
                 }
             }
 
-            // Some tenants may not redirect — try direct
+            // Some tenants may not redirect; try direct
             if (resp.IsSuccessStatusCode)
             {
                 context.ReportProgress("Compliance endpoint responded directly (no regional redirect).", 4);
@@ -206,7 +207,7 @@ public sealed class PurviewScanner : IScanProvider
                     req.Content = new StringContent(
                         JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
 
-                    var resp = await _http.SendAsync(req, ct);
+                    using var resp = await _http.SendAsync(req, ct);
 
                     if (!resp.IsSuccessStatusCode)
                     {
@@ -218,7 +219,7 @@ public sealed class PurviewScanner : IScanProvider
                             null, resp.StatusCode);
                     }
 
-                    var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+                    using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
                     var root = doc.RootElement;
 
                     if (root.TryGetProperty("value", out var valueArray) && valueArray.ValueKind == JsonValueKind.Array)
@@ -265,11 +266,13 @@ public sealed class PurviewScanner : IScanProvider
     {
         try
         {
-            var results = await InvokeComplianceCommandAsync(complianceUrl, "Get-RoleGroup", null, ct);
+            var results = await InvokeComplianceCommandAsync(complianceUrl, "Get-RoleGroup",
+                new Dictionary<string, object> { ["ResultSize"] = "Unlimited" }, ct);
 
             foreach (var group in results)
             {
                 var name = GetStringProp(group, "Name") ?? GetStringProp(group, "DisplayName") ?? "";
+                var displayName = GetStringProp(group, "DisplayName") ?? "";
                 var guid = GetStringProp(group, "Guid") ?? GetStringProp(group, "ExchangeObjectId") ?? "";
                 var description = GetStringProp(group, "Description") ?? "";
 
@@ -313,6 +316,7 @@ public sealed class PurviewScanner : IScanProvider
                     roleGroups.Add(new ComplianceRoleGroup
                     {
                         Name = name,
+                        DisplayName = displayName,
                         Guid = guid,
                         Description = description,
                         Roles = roles,
@@ -335,7 +339,7 @@ public sealed class PurviewScanner : IScanProvider
         ComplianceRoleGroup group, List<PermissionEntry> results, CancellationToken ct)
     {
         var members = await InvokeComplianceCommandAsync(complianceUrl, "Get-RoleGroupMember",
-            new Dictionary<string, object> { ["Identity"] = group.Name }, ct);
+            new Dictionary<string, object> { ["Identity"] = group.Name, ["ResultSize"] = "Unlimited" }, ct);
 
         foreach (var member in members)
         {
@@ -344,41 +348,51 @@ public sealed class PurviewScanner : IScanProvider
         }
     }
 
-    private static PermissionEntry? MapComplianceRoleMember(JsonElement member, ComplianceRoleGroup group)
+    internal static PermissionEntry? MapComplianceRoleMember(JsonElement member, ComplianceRoleGroup group)
     {
         var displayName = GetStringProp(member, "DisplayName") ?? GetStringProp(member, "Name") ?? "";
         var upn = GetStringProp(member, "WindowsLiveID")
                   ?? GetStringProp(member, "PrimarySmtpAddress") ?? "";
-        var recipientType = GetStringProp(member, "RecipientType") ?? "";
+        // RecipientTypeDetails is more specific (GuestMailUser, GroupMailbox); RecipientType as fallback.
+        var recipientType = GetStringProp(member, "RecipientTypeDetails") ?? GetStringProp(member, "RecipientType") ?? "";
         var guid = GetStringProp(member, "Guid") ?? GetStringProp(member, "ExchangeObjectId") ?? "";
         var externalId = GetStringProp(member, "ExternalDirectoryObjectId") ?? "";
 
         if (string.IsNullOrEmpty(displayName) && string.IsNullOrEmpty(upn))
             return null;
 
-        var principalType = recipientType?.ToLower() switch
-        {
-            "usermailbox" or "mailuser" or "user" => "User",
-            "group" or "mailuniversalsecuritygroup" or "mailuniversaldistributiongroup" => "SecurityGroup",
-            _ => "User"
-        };
-
         var targetType = group.IsBuiltIn ? "ComplianceBuiltInRole" : "ComplianceCustomRole";
 
         return new PermissionEntry
         {
-            TargetPath = $"Purview/{group.Name}",
+            TargetPath = $"Purview/{group.Label}",
             TargetType = targetType,
             TargetId = group.Guid,
             PrincipalEntraId = externalId,
             PrincipalEntraUpn = upn,
             PrincipalSysId = guid,
             PrincipalSysName = displayName,
-            PrincipalType = principalType,
-            PrincipalRole = group.Name,
+            PrincipalType = MapRecipientType(recipientType),
+            PrincipalRole = group.Label,
             Through = "RoleGroupMember",
             AccessType = "Allow",
             Tenure = "Permanent"
+        };
+    }
+
+    /// <summary>Map an Exchange/S&amp;C RecipientType(Details) to the principal types the other scanners use.</summary>
+    internal static string MapRecipientType(string? recipientType)
+    {
+        var t = recipientType?.ToLowerInvariant() ?? "";
+        if (t.Contains("serviceprincipal")) return "Application";
+        return t switch
+        {
+            "guestmailuser" => "Guest",
+            "usermailbox" or "mailuser" or "user" or "linkedmailbox" or "sharedmailbox" or "linkeduser" => "User",
+            "groupmailbox" => "M365Group",
+            "group" or "rolegroup" or "universalsecuritygroup" or "mailuniversalsecuritygroup"
+                or "mailuniversaldistributiongroup" or "mailnonuniversalgroup" or "universaldistributiongroup" => "SecurityGroup",
+            _ => "Unknown"
         };
     }
 
@@ -392,9 +406,13 @@ public sealed class PurviewScanner : IScanProvider
     private static string Truncate(string s, int max)
         => s.Length <= max ? s : s[..max] + "...";
 
-    private sealed class ComplianceRoleGroup
+    internal sealed class ComplianceRoleGroup
     {
+        /// <summary>Identity for cmdlets; usually the no-space form (OrganizationManagement).</summary>
         public string Name { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+        /// <summary>Human-readable name (Organization Management) used as role and path label.</summary>
+        public string Label => string.IsNullOrEmpty(DisplayName) ? Name : DisplayName;
         public string Guid { get; set; } = "";
         public string Description { get; set; } = "";
         public List<string> Roles { get; set; } = new();

@@ -34,7 +34,7 @@ public sealed class DelegatedAuth
         // Sites.FullControl.All: GET sites/{id}/permissions (app grants) rejects anything less.
         ["sharepoint"] = new[] { "Sites.Read.All", "Sites.FullControl.All" },
         ["onedrive"]   = new[] { "User.Read.All", "Sites.Read.All", "Files.Read.All" },
-        ["entra"]      = new[] { "Directory.Read.All", "Application.Read.All", "Group.Read.All", "GroupMember.Read.All", "RoleManagement.Read.Directory" },
+        ["entra"]      = new[] { "Directory.Read.All", "Application.Read.All", "Group.Read.All", "GroupMember.Read.All", "RoleManagement.Read.Directory", "PrivilegedEligibilitySchedule.Read.AzureADGroup" },
         ["teams"]      = new[] { "Team.ReadBasic.All", "TeamMember.Read.All", "Channel.ReadBasic.All", "ChannelMember.Read.All" },
         ["exchange"]   = new[] { "User.Read.All" },
         ["powerbi"]    = new[] { "User.Read.All" },

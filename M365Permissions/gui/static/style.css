@@ -667,3 +667,16 @@ select option {
 /* ── Clickable table rows ────────────────────────────────── */
 tr.clickable-row { cursor: pointer; }
 tr.clickable-row:hover { background: var(--accent-light); }
+
+/* Policy badges, remediation advice, comparison helpers */
+.toast.warning { background: var(--warning); }
+.policy-badge { font-size: 0.7em; background: var(--bg-input); color: var(--text-muted); padding: 1px 5px; border-radius: 4px; vertical-align: middle; }
+.policy-badge-warn { background: var(--warning); color: #fff; cursor: help; }
+.detail-policies { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--bg-input); }
+.detail-policies-title { font-weight: 700; margin-bottom: 6px; }
+.detail-policy + .detail-policy { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+.detail-policy-remediation { margin-top: 4px; font-size: 0.9em; line-height: 1.5; color: var(--text-secondary, var(--text)); }
+.delta-headline { margin: 0 0 10px; font-size: 0.95em; }
+.compare-tabs { margin: 12px 0 4px; }
+.compare-notice { font-size: 0.85em; color: var(--text-muted); margin: 4px 0 8px; }
+.btn-delete-scan { padding: 4px 8px; font-size: 0.8em; margin-left: 4px; }

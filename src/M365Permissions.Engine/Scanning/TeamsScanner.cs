@@ -65,9 +65,11 @@ public sealed class TeamsScanner : IScanProvider
             // --- Team-level members (owners / members / guests) ---
             await foreach (var member in _graphClient.GetPaginatedAsync($"teams/{teamId}/members", ct: ct))
             {
-                var entry = MapTeamMember(member, $"Team/{teamName}", "SecurityGroup", teamId, "TeamMembership");
+                var entry = MapTeamMember(member, $"Team/{teamName}", "Team", teamId, "TeamMembership", context.TenantId);
                 if (entry != null) await writer.WriteAsync(entry, ct);
             }
+
+            var channelErrors = 0;
 
             // --- Channel memberships (private & shared channels carry their own membership) ---
             await foreach (var channel in _graphClient.GetPaginatedAsync(
@@ -82,16 +84,50 @@ public sealed class TeamsScanner : IScanProvider
                 if (membershipType.Equals("standard", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(channelId))
                     continue;
 
-                await foreach (var member in _graphClient.GetPaginatedAsync(
-                    $"teams/{teamId}/channels/{channelId}/members", ct: ct))
+                var channelPath = $"Team/{teamName}/Channel/{channelName} ({membershipType})";
+                try
                 {
-                    var entry = MapTeamMember(member, $"Team/{teamName}/Channel/{channelName} ({membershipType})",
-                        "Channel", channelId, "ChannelMembership");
-                    if (entry != null) await writer.WriteAsync(entry, ct);
+                    await foreach (var member in _graphClient.GetPaginatedAsync(
+                        $"teams/{teamId}/channels/{channelId}/members", ct: ct))
+                    {
+                        var entry = MapTeamMember(member, channelPath, "Channel", channelId, "ChannelMembership", context.TenantId);
+                        if (entry != null) await writer.WriteAsync(entry, ct);
+                    }
+
+                    // Shared channels can also be shared with whole teams, whose members then have access.
+                    if (membershipType.Equals("shared", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await foreach (var shared in _graphClient.GetPaginatedAsync(
+                            $"teams/{teamId}/channels/{channelId}/sharedWithTeams", ct: ct))
+                        {
+                            var sharedId = shared.TryGetProperty("id", out var sid) ? sid.GetString() ?? "" : "";
+                            if (string.IsNullOrEmpty(sharedId) || sharedId.Equals(teamId, StringComparison.OrdinalIgnoreCase)) continue;
+                            var sharedTenant = shared.TryGetProperty("tenantId", out var stid) ? stid.GetString() ?? "" : "";
+                            await writer.WriteAsync(new PermissionEntry
+                            {
+                                TargetPath = channelPath,
+                                TargetType = "Channel",
+                                TargetId = channelId,
+                                PrincipalEntraId = sharedId,
+                                PrincipalSysName = shared.TryGetProperty("displayName", out var sdn) ? sdn.GetString() ?? "" : sharedId,
+                                PrincipalType = IsExternalTenant(sharedTenant, context.TenantId) ? "External Group" : "M365Group",
+                                PrincipalRole = "Member",
+                                Through = "SharedChannelTeam",
+                                AccessType = "Allow",
+                                Tenure = "Permanent"
+                            }, ct);
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    channelErrors++;
+                    context.ReportProgress($"Failed to read members of {channelPath}: {ex.Message}", 2);
                 }
             }
 
-            context.CompleteTarget();
+            if (channelErrors > 0) context.FailTarget();
+            else context.CompleteTarget();
         }
         catch (OperationCanceledException)
         {
@@ -105,8 +141,12 @@ public sealed class TeamsScanner : IScanProvider
     }
 
     /// <summary>Map a Graph conversationMember (aadUserConversationMember) to a permission entry.</summary>
+    private static bool IsExternalTenant(string memberTenantId, string homeTenantId)
+        => !string.IsNullOrEmpty(memberTenantId) && !string.IsNullOrEmpty(homeTenantId)
+           && !memberTenantId.Equals(homeTenantId, StringComparison.OrdinalIgnoreCase);
+
     private static PermissionEntry? MapTeamMember(JsonElement member, string targetPath, string targetType,
-        string targetId, string through)
+        string targetId, string through, string homeTenantId)
     {
         var displayName = member.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
         var userId = member.TryGetProperty("userId", out var uid) ? uid.GetString() ?? "" : "";
@@ -136,7 +176,10 @@ public sealed class TeamsScanner : IScanProvider
             PrincipalEntraId = userId,
             PrincipalEntraUpn = email,
             PrincipalSysName = displayName,
-            PrincipalType = isGuest ? "Guest" : "User",
+            // Shared channel members from other tenants (B2B direct connect) are not guests but are external.
+            PrincipalType = isGuest ? "Guest"
+                : IsExternalTenant(member.TryGetProperty("tenantId", out var mt) ? mt.GetString() ?? "" : "", homeTenantId) ? "External User"
+                : "User",
             PrincipalRole = role,
             Through = through,
             AccessType = "Allow",

@@ -2,18 +2,18 @@
 
 A PowerShell module that scans and reports on Microsoft 365 permissions across **SharePoint**, **Entra ID**, **Exchange Online**, **OneDrive**, **Power BI**, **Power Platform**, **Azure RBAC**, and **Azure DevOps**.
 
-Built on a compiled .NET 8 engine with embedded SQLite database and web-based GUI. Zero external PowerShell module dependencies — everything is bundled.
+Built on a compiled .NET 8 engine with embedded SQLite database and web-based GUI. Zero external PowerShell module dependencies: everything is bundled.
 
 ## Features
 
 - **360° permission visibility** across SharePoint, Entra ID, Exchange, OneDrive, Power BI, Power Platform, Azure RBAC, and Azure DevOps
-- **Web GUI** — opens automatically on module import with dashboard, scan progress, results viewer, comparison tool
-- **SQLite storage** — paginated queries, cross-scan comparison, persistent scan history
-- **Excel/CSV export** — styled XLSX with ClosedXML or UTF-8 CSV
-- **Scan comparison** — detect added, removed, and changed permissions between scans
-- **Delegated auth** — secure browser-based OAuth2 PKCE flow, no client secrets needed
-- **Lightweight** — no PnP.PowerShell, no Pode, no ImportExcel dependencies
-- **Cross-platform** — runs on Windows, macOS, Linux (PowerShell 7.4+)
+- **Web GUI**: opens automatically on module import with dashboard, scan progress, results viewer, comparison tool
+- **SQLite storage**: paginated queries, cross-scan comparison, persistent scan history
+- **Excel/CSV export**: styled XLSX with ClosedXML or UTF-8 CSV
+- **Scan comparison**: detect added, removed, and changed permissions between scans
+- **Delegated auth**: secure browser-based OAuth2 PKCE flow, no client secrets needed
+- **Lightweight**: no PnP.PowerShell, no Pode, no ImportExcel dependencies
+- **Cross-platform**: runs on Windows, macOS, Linux (PowerShell 7.4+)
 
 ## Installation
 
@@ -24,11 +24,11 @@ Install-PSResource -Name M365Permissions -Repository PSGallery
 ## Quick Start
 
 ```powershell
-# Import module — the GUI opens automatically in your browser
+# Import module; the GUI opens automatically in your browser
 Import-Module M365Permissions
 ```
 
-Everything happens in the browser: connect to a tenant, configure scans, view results, export reports, and compare scans. You can scan multiple tenants by disconnecting from one and connecting to another — each scan records which tenant it belongs to.
+Everything happens in the browser: connect to a tenant, configure scans, view results, export reports, and compare scans. You can scan multiple tenants by disconnecting from one and connecting to another; each scan records which tenant it belongs to.
 
 ## GUI
 
@@ -83,54 +83,62 @@ Each scan starts with an account check that reads the roles and permissions in t
 ## Scan Coverage
 
 ### SharePoint
+- Every site collection from the tenant admin list (falls back to search when the account is not SharePoint Administrator; the scan is then marked incomplete), including Teams private and shared channel sites
 - Site collection administrators
-- Web-level role assignments (inherited and unique)
-- Graph site permissions (app-only access)
-- _Item-level sharing links/grants are not scanned at the site level today (roadmap; available in the hosted version)._
-
-### Entra ID
-- Directory role memberships (fully paginated, incl. large roles)
-- App registration API permissions — both **requested** (requiredResourceAccess) and **granted** (appRoleAssignments), with permission names resolved
-- OAuth2 permission grants (delegated consent)
-- Group memberships **and owners**, with guest/external users flagged
-
-### OneDrive
-- Sharing links (anonymous / organization / direct) and direct grants
-
-### Exchange Online
-- Mailbox permissions (FullAccess)
-- Recipient permissions (SendAs)
-- SendOnBehalf grants
+- Permissions on sites, subsites, lists and libraries with unique permissions; localized role names are mapped to the English built-in names
+- SharePoint group members expanded, Entra and Microsoft 365 group claims linked to their Entra object
+- Sharing links (anonymous, organization-wide, specific people) with their recipients, from the site's sharing link groups
+- App-only grants (Graph site permissions, Sites.Selected)
+- Files and folders with unique permissions below library level are counted, not listed
 
 ### OneDrive for Business
-- OneDrive site administrators
-- Sharing permissions on personal sites
-- External sharing configuration
+- Every OneDrive from the tenant admin list, including leavers and unlicensed users
+- OneDrive administrators, libraries with unique permissions, sharing links at any depth with their recipients
+
+### Entra ID
+- Directory role assignments: permanent, time-bound, PIM-activated and PIM-eligible, including administrative unit and app scopes
+- Members of role-assignable groups listed as role holders; PIM for Groups eligibility on role-assignable groups
+- App registrations and enterprise apps: requested and granted API permissions, owners
+- OAuth2 permission grants (admin consent and per-user consent)
+- Group memberships and owners (dynamic groups marked), guests flagged
+
+### Microsoft Teams
+- Team owners, members and guests; private and shared channel members, including teams a channel is shared with and members from other tenants
+
+### Exchange Online
+- Full Access, Send As (including Deny entries) and Send on Behalf, with each trustee resolved to its Entra object
+- Shared, room and equipment mailboxes told apart; entries of deleted accounts reported as orphaned
 
 ### Power BI
-- Workspace role assignments (Admin, Member, Contributor, Viewer)
-- Workspace ownership
+- Workspace roles (Admin, Member, Contributor, Viewer); personal and orphaned workspaces marked
 
 ### Power Platform
-- Environment role assignments
-- Power Automate flow ownership and sharing
-- Power Apps ownership and sharing
-- Custom connector permissions
+- Flow owners and sharing, Power Apps owners and sharing (including apps shared with everyone), custom connectors
 
 ### Azure RBAC
-- Management group (incl. root), subscription, resource group and resource role assignments
-- PIM-eligible role assignments
+- Management group (incl. root), subscription, resource group and resource role assignments, active and PIM-eligible
+- Conditional (ABAC) assignments marked; assignments of deleted principals reported
 
 ### Azure DevOps
-- Organization membership enumeration (delegated auth only)
-- Project-level security group memberships (Contributors, Readers, Project Administrators, etc.)
-- Organization-level group memberships (Project Collection Administrators, etc.)
-- User and group resolution across organizations
+- Organizations the account belongs to, project and organization security groups with nested and Entra groups
+
+### Purview
+- Compliance role groups and their members
+
+Each scan records per category whether it completed, and what it saw but did not itemize (for example the number of sharing links and of users with item-level access). A category whose data is incomplete is shown as completed with errors.
+
+## Free module and Cloud Edition
+
+This module is free for non-commercial use and covers on-demand scans and one-off audits from your workstation. The [M365Permissions Cloud Edition](https://m365permissions.com/evaluate) runs in your own Azure subscription and adds:
+
+- Scheduled, unattended scans (continuous, daily, weekly or monthly) with managed identity, delta scans and scale-out scan nodes for large tenants
+- Every file and folder with unique permissions in SharePoint, OneDrive and Teams, sharing link details (expiry, block download, dates) and mailbox folder permissions
+- Automatic comparison of every run with first-seen and removed dates, a permission change timeline, email subscriptions and Microsoft Sentinel events
+- A risk queue that tracks each finding to closure and re-checks fixes on the next scan, plus prebuilt oversharing, guest, admin and PIM reports
+- A multi-user portal with Entra ID single sign-on, an audit trail and direct SQL access for Power BI
 
 ## License
 
-Free for non-commercial use. 
+Free for non-commercial use.
 
 Commercial use: https://jsolve.nl/commercial-use.html
-
-Audit / Enterprise version: https://www.m365permissions.com

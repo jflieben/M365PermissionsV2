@@ -38,6 +38,18 @@ public sealed class ScanContext
     /// <summary>Mark one target as completed.</summary>
     public required Action CompleteTarget { get; init; }
 
-    /// <summary>Mark one target as failed.</summary>
+    /// <summary>Mark one target as failed. Any failed target makes the category CompletedWithErrors.</summary>
     public required Action FailTarget { get; init; }
+
+    /// <summary>
+    /// Record that the category's data is incomplete (fallback to a narrower source, skipped sub-targets).
+    /// Logged as a warning and makes the category CompletedWithErrors instead of Completed.
+    /// </summary>
+    public Action<string> MarkPartial { get; init; } = _ => { };
+
+    /// <summary>
+    /// Add to a coverage counter for this category (e.g. sharing links seen but not itemized).
+    /// Stored per scan in scan_insights; see <see cref="InsightKeys"/>.
+    /// </summary>
+    public Action<string, long> AddInsight { get; init; } = (_, _) => { };
 }

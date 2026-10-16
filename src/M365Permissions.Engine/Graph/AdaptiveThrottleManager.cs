@@ -14,6 +14,7 @@ public sealed class AdaptiveThrottleManager
     // how many callers can hold a slot at once.
     private readonly SemaphoreSlim _slotAvailable = new(0, int.MaxValue);
     private int _inFlight;
+    private int _waiters;
     private int _currentMaxConcurrency;
     private readonly int _absoluteMin = 1;
     private readonly int _absoluteMax;
@@ -51,10 +52,28 @@ public sealed class AdaptiveThrottleManager
                     _inFlight++;
                     return;
                 }
+                _waiters++;
             }
-            // No slot within the current limit — wait to be signalled by a Release or an increase.
-            await _slotAvailable.WaitAsync(ct).ConfigureAwait(false);
+            // No slot within the current limit: wait to be signalled by a Release or an increase.
+            try
+            {
+                await _slotAvailable.WaitAsync(ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (_lock) { _waiters--; }
+            }
         }
+    }
+
+    /// <summary>
+    /// Signal only while a waiter has no pending signal yet. Releasing on every call let permits pile
+    /// up with nobody waiting, so later waiters woke and spun through the loop for nothing. Caller holds _lock.
+    /// </summary>
+    private void SignalWaiterLocked()
+    {
+        if (_waiters > _slotAvailable.CurrentCount)
+            _slotAvailable.Release();
     }
 
     /// <summary>Release a previously acquired slot and wake one waiter.</summary>
@@ -63,8 +82,8 @@ public sealed class AdaptiveThrottleManager
         lock (_lock)
         {
             if (_inFlight > 0) _inFlight--;
+            SignalWaiterLocked();
         }
-        _slotAvailable.Release();
     }
 
     /// <summary>Record that a request was made. Call before executing each API call.</summary>
@@ -91,7 +110,7 @@ public sealed class AdaptiveThrottleManager
                 _lastIncreaseTime = DateTimeOffset.UtcNow;
                 _requestsSinceLastThrottle = 0;
                 // Wake a waiter so the newly opened slot can be used immediately.
-                _slotAvailable.Release();
+                SignalWaiterLocked();
             }
         }
     }

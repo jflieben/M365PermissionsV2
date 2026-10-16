@@ -1,21 +1,31 @@
 function Export-M365Permissions {
     <#
     .SYNOPSIS
-        Exports scan results to XLSX or CSV file.
+        Exports scan results to an XLSX or CSV file.
+    .DESCRIPTION
+        CSV is streamed to disk, so it works for scans of any size. XLSX holds the workbook in
+        memory and is limited to 250,000 rows (per exported category); it includes an About sheet
+        with the scan's tenant, date, per-category status and risk counts.
     .PARAMETER ScanId
-        The scan ID to export. If omitted, uses the most recent scan.
+        The scan to export. Default: the latest Completed or CompletedWithErrors scan of the
+        connected tenant.
+    .PARAMETER Category
+        Export only this category.
     .PARAMETER Format
         Output format: XLSX or CSV. Default XLSX.
     .PARAMETER OutputPath
-        File path to save the export. If omitted, saves to current directory.
+        File to write. Relative paths are resolved against the current location. Default:
+        M365Permissions_<Category|All>_<ScanId>.<ext> in the current location.
     .EXAMPLE
         Export-M365Permissions
     .EXAMPLE
-        Export-M365Permissions -ScanId 3 -Format CSV -OutputPath "C:\Reports\scan.csv"
+        Export-M365Permissions -ScanId 3 -Category Exchange -Format CSV -OutputPath .\exchange.csv
     #>
     [CmdletBinding()]
     param(
         [long]$ScanId,
+        [ValidateSet('SharePoint', 'OneDrive', 'Entra', 'Teams', 'Exchange', 'PowerBI', 'PowerAutomate', 'Azure', 'AzureDevOps', 'Purview')]
+        [string]$Category,
         [ValidateSet('XLSX', 'CSV')]
         [string]$Format = 'XLSX',
         [string]$OutputPath
@@ -23,25 +33,23 @@ function Export-M365Permissions {
 
     $engine = Get-M365Engine
     if ($ScanId -eq 0) {
-        $scans = $engine.GetScans()
-        if ($scans.Count -eq 0) {
-            Write-Warning "No scans found. Run Start-M365Scan first."
+        $defaultScan = $engine.GetDefaultScanId()
+        if ($null -eq $defaultScan) {
+            Write-Warning "No completed scans found. Run Start-M365Scan first."
             return
         }
-        $ScanId = $scans[0].Id
+        $ScanId = $defaultScan
     }
 
-    # ExportScan returns a (bytes, fileName, contentType) tuple; PowerShell surfaces
-    # ValueTuple fields as Item1/Item2/Item3 (named elements are not reliably honored).
-    $result = $engine.ExportScan($ScanId, $Format.ToLower(), $null)
-    $bytes = $result.Item1
-    $ext = if ($Format -eq 'XLSX') { '.xlsx' } else { '.csv' }
-
+    $categoryArg = if ($Category) { $Category } else { $null }
     if (-not $OutputPath) {
-        $OutputPath = Join-Path (Get-Location) "M365Permissions_Scan${ScanId}${ext}"
+        $suffix = if ($Category) { $Category } else { 'All' }
+        $OutputPath = "M365Permissions_${suffix}_${ScanId}.$($Format.ToLower())"
     }
+    # .NET resolves relative paths against the process directory, not the PowerShell location.
+    $fullPath = $PSCmdlet.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
 
-    [System.IO.File]::WriteAllBytes($OutputPath, $bytes)
-    Write-Host "Exported to $OutputPath" -ForegroundColor Green
-    return $OutputPath
+    $null = $engine.ExportScanToFile($ScanId, $Format.ToLower(), $categoryArg, $fullPath)
+    Write-Host "Exported scan $ScanId to $fullPath" -ForegroundColor Green
+    return $fullPath
 }

@@ -70,6 +70,45 @@ public sealed class UserLookupTests : IDisposable
         Assert.DoesNotContain(result.Items, e => e.PrincipalEntraUpn == "bob@lieben.nu");
     }
 
+    [Fact]
+    public void UserLookup_ReportsViaGroup_AndMatchesM365GroupOwnerClaim()
+    {
+        _permRepo.BulkInsert(new List<PermissionEntry>
+        {
+            // Hans owns M365 group B; SharePoint grants the group's owners claim "<id>_o".
+            new() { ScanId = _scanId, Category = "Entra", TargetType = "M365Group", TargetPath = "Group/GroupB",
+                    TargetId = "groupB", PrincipalEntraUpn = "hans@lieben.nu", PrincipalEntraId = "hansId", PrincipalRole = "Owner" },
+            new() { ScanId = _scanId, Category = "SharePoint", TargetType = "Site", TargetPath = "https://contoso.sharepoint.com/sites/B",
+                    PrincipalEntraId = "groupB_o", PrincipalSysName = "GroupB Owners", PrincipalType = "M365Group", PrincipalRole = "Full Control" },
+            // Members of group B (Hans isn't one) get this; it must not show for Hans.
+            new() { ScanId = _scanId, Category = "SharePoint", TargetType = "Site", TargetPath = "https://contoso.sharepoint.com/sites/BMembers",
+                    PrincipalEntraId = "groupB", PrincipalSysName = "GroupB Members", PrincipalType = "M365Group", PrincipalRole = "Edit" },
+        });
+
+        var result = _permRepo.QueryUserPermissions(_scanId, "hans@lieben.nu", page: 1, pageSize: 100);
+
+        Assert.True(result.ExactMatch);
+        var ownerRow = Assert.Single(result.Items, e => e.TargetPath.EndsWith("/sites/B"));
+        Assert.Equal("GroupB", result.Via[ownerRow.Id]);
+        var hrRow = Assert.Single(result.Items, e => e.TargetPath.EndsWith("/HR"));
+        Assert.Equal("GroupA", result.Via[hrRow.Id]);
+        Assert.DoesNotContain(result.Items, e => e.TargetPath.EndsWith("/BMembers"));
+        Assert.False(result.Via.ContainsKey(result.Items.Single(e => e.TargetPath.EndsWith("/Direct")).Id));
+    }
+
+    [Fact]
+    public void UserLookup_UpnSearch_IsExact_NotSubstring()
+    {
+        _permRepo.BulkInsert(new List<PermissionEntry>
+        {
+            new() { ScanId = _scanId, Category = "SharePoint", TargetType = "Site", TargetPath = "https://contoso.sharepoint.com/sites/Johans",
+                    PrincipalEntraUpn = "johans@lieben.nu", PrincipalEntraId = "johansId", PrincipalRole = "Read" }
+        });
+
+        var result = _permRepo.QueryUserPermissions(_scanId, "hans@lieben.nu", page: 1, pageSize: 100);
+        Assert.DoesNotContain(result.Items, e => e.PrincipalEntraUpn == "johans@lieben.nu");
+    }
+
     public void Dispose()
     {
         _db.Dispose();
