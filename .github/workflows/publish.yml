@@ -187,8 +187,13 @@ jobs:
           $label = if ($type -eq 'preview') { "$new-preview" } else { $new }
           $entry = "# $label`n" + (($subjects | ForEach-Object { "- $_" }) -join "`n") + "`n`n"
           $existing = if (Test-Path "CHANGELOG.md") { Get-Content "CHANGELOG.md" -Raw } else { "" }
-          Set-Content "CHANGELOG.md" -Value ($entry + $existing) -NoNewline
-          Write-Host "Prepended CHANGELOG entry for $label"
+          # A hand-written entry for this version wins over the generated one.
+          if ($existing -match "(?m)^# $([regex]::Escape($label))\s*$") {
+            Write-Host "CHANGELOG already has an entry for $label; keeping it"
+          } else {
+            Set-Content "CHANGELOG.md" -Value ($entry + $existing) -NoNewline
+            Write-Host "Prepended CHANGELOG entry for $label"
+          }
 
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
